@@ -123,6 +123,24 @@ type = "forbidden"
 source_modules = ["gateway.application.agents"]
 forbidden_modules = ["gateway.adapters", "gateway.delivery", "gateway.config"]
 
+[[tool.importlinter.contracts]]
+# Guard A - tool consumers depend on the protocol, never on a backend. A consumer that imports a
+# concrete registry has bound itself to one implementation and the seam stops being a seam.
+name = "tool consumers depend on the ToolRegistry protocol only"
+type = "forbidden"
+source_modules = ["gateway.application.tools"]
+forbidden_modules = ["gateway.adapters"]
+
+[[tool.importlinter.contracts]]
+# Guard B - registry backends are independent. One importing another would make the pair a single
+# implementation wearing two names, and parity tests would silently stop comparing anything.
+name = "registry implementations are mutually independent"
+type = "independence"
+modules = [
+    "gateway.adapters.tools.in_memory_registry",
+    "gateway.adapters.tools.static_manifest_registry",
+]
+
 [[tool.mypy.overrides]]
 module = ["prometheus_client.*"]
 ignore_missing_imports = true

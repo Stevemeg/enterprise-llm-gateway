@@ -32,6 +32,10 @@ Write-Host "==> RoutingDecision construction guard (only AgentRuntime may build 
 uv run python ..\scripts\check_routing_decision_construction.py src\gateway
 if ($LASTEXITCODE -ne 0) { throw "RoutingDecision construction guard failed (ADR-0016 invariant 3)." }
 
+Write-Host "==> Registry construction guard (only the composition root may build one)"
+uv run python ..\scripts\check_registry_construction.py src\gateway
+if ($LASTEXITCODE -ne 0) { throw "Registry construction guard failed (ADR-0016 invariant 2)." }
+
 Write-Host "==> migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
 uv run python ..\scripts\check_migration_guardrails.py migrations\sql
 if ($LASTEXITCODE -ne 0) { throw "Tenant-table RLS guardrail failed (ADR-0002/0014)." }

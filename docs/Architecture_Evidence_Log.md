@@ -138,8 +138,66 @@ Rule 5 (a protocol may evolve only through an active consumer).
 `InMemoryToolRegistry` already forced two decisions the interface left open (newest-version
 resolution on unversioned `get()`, fail-closed `permitted()`), which is Rule 4 working as intended.
 
-### OBSERVED
-*Pending.*
+### OBSERVED *(after Gate 2, 2026-07-19)*
+
+> **Evidence strength: STRONG.** This is the first milestone whose prediction was written **before**
+> implementation. Unlike Slices 1 and 2, the result below could have come out otherwise.
+
+**Gate 2: PASS** — 252 passed, 0 skipped, 95% coverage, mypy strict clean,
+import-linter 15 kept / 0 broken.
+
+| Falsification condition | Fired? | Evidence |
+|---|---|---|
+| Second backend requires changing `ToolRegistry` ⇒ **Rule 4 wrong** | **No** | `StaticManifestToolRegistry` satisfies all four methods; `application/ports/tools.py` untouched |
+| Field added to `ToolDescriptor` without an active consumer ⇒ **Rule 5 failed** | **No** | No field added. Rule 5 not triggered |
+| Milestone ships without an ADR ⇒ classification not working | **Unevaluable** | See below — the condition was ill-specified |
+
+| Rule | Status | Evidence |
+|---|---|---|
+| Rule 4 — a seam is unproven until one real implementation exists | ✓ **strong** | One implementation *was* sufficient: a second backend with a different storage model fit unchanged, and a real consumer ran against the protocol alone |
+| Rule 5 — protocol evolves only via an active consumer | ✓ **not triggered** | `ToolCatalog` was implementable without any protocol change |
+
+### Unexpected observations
+
+**1. One of my own falsification conditions was badly written.** *"If the milestone ships without an
+ADR, the classification is not doing its job"* could not be evaluated. Tool Registry is a Foundation
+milestone but **completed** a seam that ADR-0016 already introduced — it did not create a new one, so
+no new ADR was warranted. The condition conflated *creating* a seam with *finishing* one.
+
+**A condition that cannot fire is not a falsification condition.** The two conditions that were
+concrete (protocol change, field addition) produced real evidence; the vague one produced none. When
+writing the MCP prediction, every condition must name an observable artifact and state which
+observation would count as failure.
+
+**2. Guard C needed an AST scan, not import-linter — the second occurrence of this pattern.** Guard A
+already forbids consumers *importing* implementations, but the composition root must import them
+legitimately, so the open question was *who calls the constructor*. Same shape as Guard 1
+(`RoutingDecision`) in Slice 2. Two instances now: **"which tool answers this question?" is a design
+step, not a formality.** Import graphs and AST scans answer different questions, and reaching for the
+familiar one yields a guard that passes while checking nothing.
+
+**3. Guard C currently constrains no production code.** Nothing constructs a registry yet — container
+wiring was out of scope. Its deliberate-violation proof shows it bites, so it is not theatre, but it
+becomes load-bearing only when a composition-root wiring exists. Recorded rather than glossed,
+because "passes because nothing exercises it" is the exact failure mode this project keeps finding.
+
+**4. Rule 4 paid out again, quietly.** Building the second backend forced a decision the protocol left
+open: whether a manifest-seeded registry should accept `register()`. Refusing would have been *partial
+conformance* — a backend silently not implementing part of the contract. The parity tests exist to
+catch precisely that.
+
+### Decision
+
+**No action.** ADR-0016 stands unchanged. No superseding ADR required.
+
+### Lessons
+
+- **Rule 4 holds under a genuine test.** One implementation proved the seam; the second fit unchanged.
+  This is the strongest evidence to date that the governance generalises beyond Authentication.
+- **Write falsification conditions against observable artifacts.** Two of three were usable; the third
+  was prose. Predictions are only as good as their sharpest condition.
+- **Match the enforcement tool to the question.** Second confirmation that dependency checks and
+  construction checks are different problems.
 
 ---
 
@@ -196,6 +254,7 @@ a test proving it denies on known-bad input.
 |---|---|---|---|
 | AI OS Foundation (Slice 1) | Foundation | 1, 2, 3, 4 | None |
 | Agent Runtime (Slice 2) | Foundation | 3, 4, 5 | Rule 5 triggered and satisfied; no ADR needed |
+| **Tool Registry (Slice 3)** | **Foundation** | **4, 5** | **None — first pre-registered prediction; Rule 4 held** |
 
 Both are recorded honestly as **weaker evidence**: their predictions were not written in advance,
 so ✓ reflects hindsight rather than a binding test. Slice 2 has a full record above. Tool Registry

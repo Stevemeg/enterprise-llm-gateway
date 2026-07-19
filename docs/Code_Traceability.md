@@ -180,7 +180,31 @@ No members added; no superseding ADR required. Recorded in the evidence log.
 | M2 Database Infrastructure | — | ✅ Complete | ✅ |
 | M3 Authentication | — | ✅ Complete + Security Review closed | ✅ 169 → 189 |
 | Phase 4 Slice 1 — AI OS Foundation | Foundation | ✅ Complete | ✅ 189 passed, 0 skipped |
-| **Phase 4 Slice 2 — Agent Runtime** | **Foundation** | **✅ COMPLETE** | **✅ 206 passed, 0 skipped, 95%** |
-| Tool Registry | Foundation | ⏳ Next — prediction pre-registered | — |
+| Phase 4 Slice 2 — Agent Runtime | Foundation | ✅ Complete | ✅ 206 passed, 0 skipped, 95% |
+| **Phase 4 Slice 3 — Tool Registry** | **Foundation** | **✅ COMPLETE** | **✅ 252 passed, 0 skipped, 95%** |
 | MCP Gateway | Foundation | ⏳ | — |
 | RBAC | Capability | ⏳ | — |
+
+### Slice 3 — Tool Registry — ✅ COMPLETE
+
+First milestone with a **pre-registered prediction** (written before implementation), so its result
+is genuine evidence rather than hindsight. Central question — *can `ToolRegistry` support multiple
+implementations with no protocol change?* — answered **yes**. Rule 5 **not triggered**;
+`application/ports/tools.py` unchanged.
+
+| Component | Module | Tests |
+|---|---|---|
+| Registry backend 1 | `adapters/tools/in_memory_registry.py` | parity suite |
+| Registry backend 2 (manifest-seeded) | `adapters/tools/static_manifest_registry.py` | parity suite + manifest loading |
+| First consumer | `application/tools/catalog.py` | `test_tool_catalog.py` (10, both backends) |
+| Parity / conformance | — | `test_tool_registry_parity.py` (14, both backends) |
+
+**Guards (all observed failing before being trusted):** A consumers depend on the protocol only
+(import-linter) · B registry implementations mutually independent (import-linter) · C construction
+confined to the composition root (AST scan, `scripts/check_registry_construction.py`, wired into
+`validate.ps1`).
+
+**Gate 2: PASS — 252 passed, 0 skipped, 95% coverage, mypy strict clean, import-linter 15 kept / 0 broken.**
+
+**Known limitation:** Guard C constrains no production code until a composition-root wiring exists;
+its violation proof demonstrates it bites. Recorded in the evidence log.

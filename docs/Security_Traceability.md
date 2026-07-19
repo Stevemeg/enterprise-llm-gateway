@@ -64,3 +64,7 @@ auditable.
 | Agents may not orchestrate one another | ADR-0016 inv. 4 | import-linter | ✅ `planner` → `runtime` → BROKEN |
 | Agent implementations are mutually independent | ADR-0016 inv. 4 | import-linter (independence) | ✅ `cost` → `policy` → BROKEN |
 | Agents depend on protocols/domain only | ADR-0016 inv. 4 | import-linter | ✅ `health` → `adapters` → BROKEN |
+| Tool consumers depend on the registry protocol only | ADR-0016 inv. 2 | import-linter | ✅ `catalog` → `in_memory_registry` → BROKEN |
+| Registry implementations mutually independent | ADR-0016 inv. 2 | import-linter (independence) | ✅ `static_manifest` → `in_memory` → BROKEN |
+| Registries constructed only in the composition root | ADR-0016 inv. 2 | `scripts/check_registry_construction.py` (AST), wired into `validate.ps1` | ✅ consumer construction → FAIL |
+| Tool permissions fail closed (missing permission ⇒ denied) | ADR-0016 inv. 2 | `permitted()` requires every declared permission; enforced identically across both backends | ✅ parity + catalog tests |
