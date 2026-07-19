@@ -49,3 +49,18 @@ the authentication implementation step (this milestone, pending design approval)
   land with its tests and this table updated to remove the marker.
 - Full narrative + sequence diagrams: [Authentication_Architecture.md](Authentication_Architecture.md).
 - Threat model context: [architecture/security/02-threat-model-stride.md](architecture/security/02-threat-model-stride.md).
+
+
+## 4. Phase 4 architectural enforcement (ADR-0016)
+
+Architecture-only; no new security controls. Listed here because these guards protect properties
+that security depends on later — explainable decisions are what make an authorization denial
+auditable.
+
+| Control | ADR | Enforcement | Proven to fail |
+|---|---|---|---|
+| Routing decisions are explainable by construction | ADR-0016 inv. 3 | `RoutingDecision` returned by `AgentRuntime`; `reasoning_steps` never empty | ✅ Guard 1 (AST construction scan) |
+| Only `AgentRuntime` may construct a `RoutingDecision` | ADR-0016 inv. 3 | `scripts/check_routing_decision_construction.py`, wired into `validate.ps1` | ✅ second construction site → FAIL |
+| Agents may not orchestrate one another | ADR-0016 inv. 4 | import-linter | ✅ `planner` → `runtime` → BROKEN |
+| Agent implementations are mutually independent | ADR-0016 inv. 4 | import-linter (independence) | ✅ `cost` → `policy` → BROKEN |
+| Agents depend on protocols/domain only | ADR-0016 inv. 4 | import-linter | ✅ `health` → `adapters` → BROKEN |

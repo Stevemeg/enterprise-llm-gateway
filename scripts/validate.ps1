@@ -28,6 +28,10 @@ Write-Host "==> PowerShell encoding guard (ASCII + BOM + CRLF)"
 uv run python ..\scripts\check_powershell_encoding.py ..\scripts
 if ($LASTEXITCODE -ne 0) { throw "PowerShell encoding guard failed." }
 
+Write-Host "==> RoutingDecision construction guard (only AgentRuntime may build one)"
+uv run python ..\scripts\check_routing_decision_construction.py src\gateway
+if ($LASTEXITCODE -ne 0) { throw "RoutingDecision construction guard failed (ADR-0016 invariant 3)." }
+
 Write-Host "==> migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
 uv run python ..\scripts\check_migration_guardrails.py migrations\sql
 if ($LASTEXITCODE -ne 0) { throw "Tenant-table RLS guardrail failed (ADR-0002/0014)." }

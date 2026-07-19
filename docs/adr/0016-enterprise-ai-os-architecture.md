@@ -1,6 +1,7 @@
 # ADR-0016: Evolution to an Enterprise AI Operating System
 
-- **Status:** Proposed (architecture-only; no business logic)
+- **Status:** Accepted and **FROZEN** for Phase 4. Rules 1-5 and the governance principles
+  below may not be amended - a change requires a superseding ADR, not an edit to this one.
 - **Date:** 2026-07-19
 - **Deciders:** Principal Architect, Security Architect, Platform Lead
 - **Phase:** 4 — Enterprise AI OS Foundation (Slice 1)
@@ -92,6 +93,90 @@ Milestone 3 is the evidence: `SecretsResolver` was proven by `EnvSecretsResolver
 In each case the first implementation forced a correction the interface alone had not exposed -
 most sharply when `verify_id_token` had to change from `expected_nonce` to `expected_nonce_hash`,
 because only a real adapter revealed that the raw nonce is never stored.
+
+### Rule 5 — A protocol may evolve only through an active consumer
+
+A protocol is **not** extended because a future capability might need it. It is extended only when
+its current first consumer cannot be implemented correctly without the change.
+
+Every protocol modification must identify:
+
+1. the **active consumer** requiring the change;
+2. **why the current protocol is insufficient** for it;
+3. **why the change does not belong in the consumer instead** - the most common answer is that it
+   does, and no protocol change is needed.
+
+Rules 1-4 govern a seam's birth and validation; without Rule 5 nothing governs its *growth*, which
+is where speculative fields accumulate one plausible addition at a time. Each looks harmless; the
+aggregate is an interface shaped by imagined requirements that no code reads.
+
+Worked example: `PlannerDecision` currently carries `intent`, `complexity` and
+`required_capabilities`. Latency sensitivity, streaming, tool requirement and structured-output
+flags were all considered and **deliberately excluded** - nothing consumes them yet. Adaptive
+Routing (Tier 2) becomes their active consumer, and that is when the protocol may grow.
+
+Corollary on responsibility: an agent describes its own concern and nothing else. The planner
+describes *what the request needs*; it never infers provider, cost strategy, routing strategy or
+fallback. Those belong to the cost, health and provider agents. Blurring that line duplicates
+logic across agents, which no amount of interface discipline will later untangle.
+
+## Governance principles
+
+These sit *above* Rules 1-5: the rules say what good architecture looks like, these say when the
+rules themselves may change.
+
+### GP-1 — Architecture evolves only through evidence
+
+Evidence means exactly one of:
+
+1. a completed milestone exposes a limitation;
+2. an external specification (e.g. MCP) cannot be represented without violating an existing rule;
+3. two rules conflict in practice.
+
+Nothing else justifies changing governance - least of all a hypothetical future need. This
+generalises Rule 5 from protocols to the rules themselves.
+
+### GP-2 — No rule may be weakened or reinterpreted inside a milestone
+
+If a milestone appears to require bending a rule, the milestone **stops** and a superseding ADR is
+written first. An exception is an ADR, not a patch.
+
+*Evidence for GP-2:* ADR-0013, ADR-0014 and ADR-0015 each exist because a rule would otherwise
+have been quietly bent - a missing credential column, a superuser bypassing RLS, a tenant table
+outside RLS. In every case, stopping to write the ADR surfaced a defect that a patch would have
+buried. The most severe finding of the project (the runtime role bypassing RLS entirely) came from
+refusing to make a failing test pass.
+
+### Deliberately not a rule
+
+No Rule 6. Governance that accumulates a rule per milestone becomes a subsystem needing its own
+maintenance. New lessons are recorded as **observed evidence** below, not as new rules.
+
+## Observed evidence
+
+Recorded after each Foundation milestone. This is the experiment: five rules were induced from a
+single subsystem (Authentication), so whether they generalise is genuinely unknown. Tool Registry
+tests Rules 4 and 5 (multiple registry backends, one unchanged protocol); MCP Gateway tests Rule 1
+(if MCP forces a registry-interface change, Rule 1 was wrong); RBAC tests the Type A/Type B split
+(a Capability milestone introducing new ports means a foundational seam is missing).
+
+| Milestone | Type | Rules exercised | Exceptions | Resolution |
+|---|---|---|---|---|
+| AI OS Foundation (Slice 1) | Foundation | 1, 2, 3, 4 | None | - |
+| Agent Runtime (Slice 2) | Foundation | 1, 3, 4, 5 | None | - |
+| _Tool Registry_ | Foundation | _pending_ | | |
+| _MCP Gateway_ | Foundation | _pending_ | | |
+| _RBAC_ | Capability | _pending_ | | |
+
+## Milestone classification
+
+Every milestone declares its type, which determines the expected artifacts:
+
+- **Foundation** - creates an extension point. ADR -> protocol -> validation implementation -> CI
+  enforcement -> first consumer -> Gate 1 -> Gate 2 -> commit. A Foundation milestone with no ADR
+  is suspect.
+- **Capability** - consumes existing seams. No protocol changes unless Rule 5 is triggered, in
+  which case the milestone stops. A Capability milestone shipping an ADR is a Rule 5 trigger.
 
 ## Two tiers
 

@@ -121,7 +121,7 @@ Test-type coverage per subsystem (✅ present · — not applicable yet · ⏳ p
 | **Auth — token/session logic** | ✅ | — | ✅ (reuse/expired/revoked/wrong-secret) | ✅ (constant-time, reuse detection) | ✅ (stateless issue) |
 | **Auth — verify/middleware** | ✅ | ✅ (TestClient) | ✅ (invalid/expired/malformed) | ✅ (fail-closed, rotation) | ✅ (stateless verify) |
 | **Auth — repositories** | — | ✅ (SQLite; PG in CI) | ✅ (rollback) | ✅ (RLS test, hashed storage) | ✅ (UoW tx) |
-| **Auth — OIDC/wiring** | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ |
+| **Auth — OIDC/wiring** | ✅ | ✅ (state store, PG) | ✅ (replay, expiry, tamper) | ✅ (single-use consume, HMAC state) | ✅ (bounded timeouts, 0 retries) |
 
 Targets for Authentication (M3 implementation): **100% of the authentication code path** covered by
 unit + failure-mode + security tests, with performance notes on stateless JWT validation (hot path)
@@ -131,3 +131,56 @@ and constant-time comparison.
 - **DB connection / pool:** `test_engine.py`. **Session/transaction lifecycle:** `test_uow_sqlite.py`.
 - **RLS propagation:** `test_rls.py`. **Alembic:** `test_alembic_config.py`. **Failure modes:**
   `test_db_health.py`. All gates green (ruff, mypy --strict, pytest, import-linter ×5).
+
+
+## Phase 4 — Enterprise AI OS Foundation
+
+Architecture-only milestones. **No business logic, no schema changes, no API changes.** Governed by
+[ADR-0016](adr/0016-enterprise-ai-os-architecture.md); empirical results in
+[Architecture_Evidence_Log.md](Architecture_Evidence_Log.md).
+
+### Slice 1 — AI OS Foundation — ✅ COMPLETE
+
+| Seam (Tier-1 invariant) | Protocol | Validation implementation (Rule 4) | Enforcement |
+|---|---|---|---|
+| MCP-compatible execution | `application/ports/mcp.py` | `adapters/mcp/null_gateway.py` | ports carry no transport |
+| Tool Registry | `application/ports/tools.py` | `adapters/tools/in_memory_registry.py` | seam adapters independent |
+| Explainable routing | `domain/routing/models.py` | — (consumed in Slice 2) | construction guard (Slice 2) |
+| Agent lifecycle | `application/ports/agents.py` | `adapters/agents/skeleton.py` | protocol conformance tests |
+| Pipeline stage | `application/ports/pipeline.py` | `adapters/pipeline/noop_stage.py` | protocol conformance tests |
+
+Contracts added: domain is innermost · ports declare contracts only · seam adapters independent.
+Each observed failing on a deliberate violation. **Gate 2: 189 passed, 0 skipped, 95%.**
+
+### Slice 2 — Agent Runtime — ✅ COMPLETE
+
+| Component | Module | Tests | Enforcement |
+|---|---|---|---|
+| AgentRuntime (sole `RoutingDecision` construction site) | `application/agents/runtime.py` | `test_agent_runtime.py` (11) | Guard 1 — AST construction scan |
+| PlannerAgent | `application/agents/planner.py` | ✅ | Guards 2-4 |
+| Policy / Cost / Health / Provider agents (stubs) | `application/agents/{policy,cost,health,provider}.py` | ✅ | Guards 2-4 |
+| Agent scaffolding | `application/agents/base.py` | ✅ | — |
+| Pipeline integration (first consumer of the seam) | `adapters/pipeline/routing_stage.py` | `test_agent_routing_stage.py` (6) | protocol conformance |
+
+**Guards (all observed failing before being trusted):** 1 `RoutingDecision` single construction
+site (AST scan, wired into `validate.ps1`) · 2 agents may not orchestrate · 3 agent
+implementations mutually independent · 4 agents depend on protocols/domain only.
+
+**Gate 2: PASS — 206 passed, 0 skipped, 95% coverage, mypy strict clean (138 files),
+import-linter 13 kept / 0 broken.**
+
+**Rule 5 event:** `PipelineStage` gained `@runtime_checkable`, driven by its first consumer.
+No members added; no superseding ADR required. Recorded in the evidence log.
+
+## Milestone status
+
+| Milestone | Type | Status | Gate 2 |
+|---|---|---|---|
+| M1 Foundation | — | ✅ Complete | ✅ |
+| M2 Database Infrastructure | — | ✅ Complete | ✅ |
+| M3 Authentication | — | ✅ Complete + Security Review closed | ✅ 169 → 189 |
+| Phase 4 Slice 1 — AI OS Foundation | Foundation | ✅ Complete | ✅ 189 passed, 0 skipped |
+| **Phase 4 Slice 2 — Agent Runtime** | **Foundation** | **✅ COMPLETE** | **✅ 206 passed, 0 skipped, 95%** |
+| Tool Registry | Foundation | ⏳ Next — prediction pre-registered | — |
+| MCP Gateway | Foundation | ⏳ | — |
+| RBAC | Capability | ⏳ | — |

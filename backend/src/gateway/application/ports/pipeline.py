@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
 
 
@@ -53,8 +53,13 @@ class StageResult:
         return self.action is StageAction.BLOCK
 
 
+@runtime_checkable
 class PipelineStage(Protocol):
     """A pluggable interception point around a request.
+
+    ``runtime_checkable`` so conformance can be asserted structurally in tests - matching
+    ``BaseAgent``. A class that merely *looks* like a stage but omits a method would otherwise
+    import cleanly and fail at the call site.
 
     Stages must not import providers: a stage that reaches a provider directly has bypassed the
     router and the decision record (CI-enforced).

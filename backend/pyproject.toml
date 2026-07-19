@@ -88,6 +88,41 @@ modules = [
     "gateway.adapters.agents",
 ]
 
+[[tool.importlinter.contracts]]
+# Guard 2 - AgentRuntime is the sole orchestrator. An agent importing the runtime could invoke
+# the chain itself, producing decisions outside the single construction site (invariant 3).
+name = "agents may not orchestrate (only AgentRuntime sequences agents)"
+type = "forbidden"
+source_modules = [
+    "gateway.application.agents.planner",
+    "gateway.application.agents.policy",
+    "gateway.application.agents.cost",
+    "gateway.application.agents.health",
+    "gateway.application.agents.provider",
+]
+forbidden_modules = ["gateway.application.agents.runtime"]
+
+[[tool.importlinter.contracts]]
+# Guard 3 - agents depend on BaseAgent and shared scaffolding, never on each other. Direct
+# coupling would let one agent's internals dictate another's, defeating the lifecycle seam.
+name = "agent implementations are mutually independent"
+type = "independence"
+modules = [
+    "gateway.application.agents.planner",
+    "gateway.application.agents.policy",
+    "gateway.application.agents.cost",
+    "gateway.application.agents.health",
+    "gateway.application.agents.provider",
+]
+
+[[tool.importlinter.contracts]]
+# Guard 4 - agents communicate through protocol and domain objects only. Reaching into adapters
+# would bind orchestration to a concrete implementation and break Clean Architecture inward flow.
+name = "agents depend on protocols and domain only (no adapters)"
+type = "forbidden"
+source_modules = ["gateway.application.agents"]
+forbidden_modules = ["gateway.adapters", "gateway.delivery", "gateway.config"]
+
 [[tool.mypy.overrides]]
 module = ["prometheus_client.*"]
 ignore_missing_imports = true
