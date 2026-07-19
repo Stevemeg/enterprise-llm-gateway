@@ -32,7 +32,8 @@ Write-Host "==> migration guardrail (tenant tables must ENABLE+FORCE RLS + polic
 uv run python ..\scripts\check_migration_guardrails.py migrations\sql
 if ($LASTEXITCODE -ne 0) { throw "Tenant-table RLS guardrail failed (ADR-0002/0014)." }
 
-if ($env:GATEWAY_DATABASE__URL -like "postgresql*") {
+$postgresConfigured = ($env:GATEWAY_DATABASE__URL -like "postgresql*")
+if ($postgresConfigured) {
     # Runtime/DDL split (ADR-0014): migrations run as the OWNER/migrator; the app and tests
     # run as the least-privilege app_rw role so RLS is actually enforced.
     if ($env:GATEWAY_MIGRATION_DATABASE__URL) {
@@ -61,8 +62,30 @@ if ($env:GATEWAY_DATABASE__URL -like "postgresql*") {
 }
 
 Write-Host "==> pytest + coverage"
-uv run pytest --cov=src/gateway --cov-report=term-missing
-if ($LASTEXITCODE -ne 0) { throw "pytest FAILED - validation did NOT pass." }
+$pytestOutput = & uv run pytest --cov=src/gateway --cov-report=term-missing 2>&1
+$pytestOutput | ForEach-Object { Write-Host $_ }
+$pytestExit = $LASTEXITCODE
+if ($pytestExit -ne 0) { throw "pytest FAILED - validation did NOT pass." }
+
+# Three terminal states, because PASS/FAIL alone cannot express "the gate never ran".
+# A run that skips every integration test is not a pass - it is an unexecuted gate, and
+# reporting that as green is how an unverified change ships believing it was validated.
+$joined = ($pytestOutput | Out-String)
+$skipped = 0
+if ($joined -match "(\d+)\s+skipped") { $skipped = [int]$Matches[1] }
 
 Write-Host ""
-Write-Host "ALL LOCAL VALIDATION PASSED" -ForegroundColor Green
+if (-not $postgresConfigured) {
+    Write-Host "INCOMPLETE - Gate 2 did NOT run" -ForegroundColor Yellow
+    Write-Host "  Postgres was not configured, so migrations, the runtime-role check and the"
+    Write-Host "  integration tests never executed ($skipped skipped)."
+    Write-Host "  Gate 1 passed. Runtime validation is NOT verified."
+    Write-Host "  Set GATEWAY_DATABASE__URL and GATEWAY_MIGRATION_DATABASE__URL, then re-run."
+    exit 2
+}
+if ($skipped -ne 0) {
+    Write-Host "FAIL - Postgres is configured but $skipped test(s) were skipped" -ForegroundColor Red
+    Write-Host "  With Gate 2 available every test must execute. Investigate the skips."
+    exit 1
+}
+Write-Host "PASS - ALL LOCAL VALIDATION PASSED (Gate 1 + Gate 2, 0 skipped)" -ForegroundColor Green

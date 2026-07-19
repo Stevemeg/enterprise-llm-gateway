@@ -56,6 +56,38 @@ mypy_path = "src"
 packages = ["gateway"]
 plugins = ["pydantic.mypy"]
 
+[[tool.importlinter.contracts]]
+name = "domain is the innermost layer (depends on nothing else)"
+type = "forbidden"
+source_modules = ["gateway.domain"]
+forbidden_modules = [
+    "gateway.application",
+    "gateway.adapters",
+    "gateway.delivery",
+    "gateway.config",
+    "gateway.observability",
+]
+
+[[tool.importlinter.contracts]]
+# Ports declare contracts; they must not bind to a transport or framework. A port that imports
+# httpx has already chosen an implementation, which defeats the seam (ADR-0016 Rule 1).
+name = "ports declare contracts only (no transport or framework)"
+type = "forbidden"
+source_modules = ["gateway.application.ports"]
+forbidden_modules = ["httpx", "fastapi", "starlette", "sqlalchemy", "prometheus_client"]
+
+[[tool.importlinter.contracts]]
+# Phase-4 seam adapters must reach each other only through ports, never directly: a tool adapter
+# importing the MCP adapter would bypass the registry and hard-wire a capability (invariants 1-2).
+name = "phase-4 seam adapters are mutually independent"
+type = "independence"
+modules = [
+    "gateway.adapters.tools",
+    "gateway.adapters.mcp",
+    "gateway.adapters.pipeline",
+    "gateway.adapters.agents",
+]
+
 [[tool.mypy.overrides]]
 module = ["prometheus_client.*"]
 ignore_missing_imports = true

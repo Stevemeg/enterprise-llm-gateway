@@ -32,6 +32,7 @@ traceability, as mandated by the project workflow.
 | [0013](0013-service-account-credential-storage.md) | Service-account credential storage | Proposed | (schema change) |
 | [0014](0014-runtime-database-role-rls-enforcement.md) | Non-superuser runtime DB role for RLS enforcement | Accepted | (security/infra) |
 | [0015](0015-oidc-login-state-storage.md) | OIDC login-state storage & RLS bootstrapping | Accepted | (schema change) |
+| [0016](0016-enterprise-ai-os-architecture.md) | Evolution to an Enterprise AI Operating System | Proposed | (architecture) |
 
 All nine Phase-1 architecture-blocking questions are resolved by the ADRs marked in **bold**. A
 tabular cross-reference of every decision is in
