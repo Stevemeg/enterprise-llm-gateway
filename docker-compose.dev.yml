@@ -1,0 +1,48 @@
+# Local development services for Gate-2 validation and integration tests.
+# NOT the production stack — the full compose (app + Prometheus + Grafana) arrives in
+# the infrastructure milestone. Brings up PostgreSQL (with pgvector) and Redis only.
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#   # migrations run as the schema OWNER (superuser in dev):
+#   export GATEWAY_MIGRATION_DATABASE__URL="postgresql+asyncpg://gateway:gateway@localhost:5432/gateway"
+#   # the app and integration tests connect as the least-privilege runtime role (ADR-0014):
+#   export GATEWAY_DATABASE__URL="postgresql+asyncpg://app_rw:app_rw@localhost:5432/gateway"
+#
+# NOTE: the app_rw LOGIN role is created once at cluster init by ./backend/docker/initdb.
+# To re-provision from scratch (e.g. after changing the initdb script): docker compose
+# -f docker-compose.dev.yml down -v && ... up -d  (the -v drops the data volume).
+#
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    # pg_stat_statements must be preloaded for the initial migration's CREATE EXTENSION.
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
+    ports:
+      - "5432:5432"
+    volumes:
+      - gateway_pg_data:/var/lib/postgresql/data
+      # Dev-only: create the app_rw LOGIN role at first cluster init (ADR-0014). Grants are
+      # applied afterwards by migration 0003 (runs as the owner, once the tables exist).
+      - ./backend/docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  gateway_pg_data:

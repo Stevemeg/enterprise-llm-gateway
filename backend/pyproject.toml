@@ -1,0 +1,159 @@
+[project]
+name = "enterprise-llm-gateway"
+version = "0.1.0"
+description = "Enterprise LLM Gateway & Cost Router — backend"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "structlog>=24.4",
+    "prometheus-client>=0.21",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy>=2.0",
+    "asyncpg>=0.30",
+    "alembic>=1.13",
+    "pyjwt>=2.9",
+    "cryptography>=43",
+    "httpx>=0.27",          # OIDC: JWKS fetch + token exchange (adapter layer only)
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "httpx>=0.27",
+    "aiosqlite>=0.20",
+    "mypy>=1.13",
+    "ruff>=0.7",
+    "import-linter>=2.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gateway"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF", "ASYNC", "PT"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["gateway"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+mypy_path = "src"
+packages = ["gateway"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["prometheus_client.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "integration: exercises real I/O (DB); runs against SQLite locally and Postgres in CI",
+]
+
+[tool.importlinter]
+root_package = "gateway"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "shared is a leaf (imports nothing from other layers)"
+type = "forbidden"
+source_modules = ["gateway.shared"]
+forbidden_modules = [
+    "gateway.config",
+    "gateway.delivery",
+    "gateway.observability",
+    "gateway.adapters",
+    "gateway.application",
+    "gateway.domain",
+]
+
+[[tool.importlinter.contracts]]
+name = "application is framework-free and inward-only"
+type = "forbidden"
+source_modules = ["gateway.application"]
+forbidden_modules = [
+    "gateway.config",
+    "gateway.delivery",
+    "gateway.adapters",
+    "sqlalchemy",
+    "fastapi",
+    "starlette",
+    "redis",
+    "asyncpg",
+]
+
+[[tool.importlinter.contracts]]
+name = "delivery must not import the composition root"
+type = "forbidden"
+source_modules = ["gateway.delivery"]
+forbidden_modules = ["gateway.config"]
+
+[[tool.importlinter.contracts]]
+name = "observability is cross-cutting and must not depend on delivery/config"
+type = "forbidden"
+source_modules = ["gateway.observability"]
+forbidden_modules = ["gateway.config", "gateway.delivery"]
+
+[[tool.importlinter.contracts]]
+name = "adapters must not import delivery or the composition root"
+type = "forbidden"
+source_modules = ["gateway.adapters"]
+forbidden_modules = ["gateway.delivery", "gateway.config"]
+
+[[tool.importlinter.contracts]]
+name = "low-level crypto primitives only via shared.secrets"
+type = "forbidden"
+source_modules = [
+    "gateway.application",
+    "gateway.domain",
+    "gateway.delivery",
+    "gateway.config",
+    "gateway.observability",
+    "gateway.adapters",
+]
+forbidden_modules = ["secrets", "hmac", "hashlib"]
+# shared.secrets is the sanctioned importer of these primitives; ignore that edge so the
+# check only catches *direct* use elsewhere (not use *through* the boundary).
+ignore_imports = [
+    "gateway.shared.secrets -> secrets",
+    "gateway.shared.secrets -> hmac",
+    "gateway.shared.secrets -> hashlib",
+]
+
+[[tool.importlinter.contracts]]
+name = "asymmetric crypto (jwt/cryptography) never in business logic"
+type = "forbidden"
+source_modules = [
+    "gateway.application",
+    "gateway.domain",
+    "gateway.delivery",
+    "gateway.observability",
+]
+forbidden_modules = ["jwt", "cryptography"]
+
+[[tool.mypy.overrides]]
+module = ["alembic.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["cryptography.*"]
+ignore_missing_imports = true

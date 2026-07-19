@@ -1,0 +1,52 @@
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+*.code-workspace
+
+# --- Secrets / environment (NEVER commit) ---
+.env
+.env.local
+.env.*.local
+secrets/
+*.pem
+*.key
+*.crt
+*.tfvars
+!*.example.tfvars
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# --- Node / Next.js ---
+node_modules/
+.next/
+out/
+coverage/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Infra / build artifacts ---
+.terraform/
+*.tfstate
+*.tfstate.*
+*.log
+tmp/
+
+# --- Sandbox / editor artifacts ---
+*.tmp
+backend/.venv/

@@ -1,0 +1,1563 @@
+openapi: 3.1.0
+# =============================================================================
+# Enterprise LLM Gateway & Cost Router — Public + Admin API (Phase 4)
+# Status: Draft for approval. Contract only — no implementation.
+# Realizes: ADR-0001 (runtime), ADR-0003 (providers), ADR-0004 (budgets),
+#           ADR-0006/0007 (cache/embeddings), ADR-0008 (auth/RBAC/keys),
+#           ADR-0009 (errors/governance), ADR-0012 (routing).
+# Data model: docs/Schema.sql. Cross-refs: docs/API_*.md.
+# =============================================================================
+info:
+  title: Enterprise LLM Gateway & Cost Router API
+  version: "1.0.0"
+  summary: Unified, OpenAI-compatible inference plus governance, cost, and admin control plane.
+  description: |
+    One integration for every LLM provider: intelligent routing, semantic caching,
+    hierarchical budgets, governance, and observability.
+
+    * **Inference API** (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`) is
+      **OpenAI-compatible** — change base URL + key to migrate (FR-001..010).
+    * **Admin/Control-plane API** (`/v1/organizations`, `/v1/providers`, ...) manages
+      configuration; RBAC-guarded (ADR-0008).
+    * **Ops API** (`/healthz`, `/readyz`, `/livez`, `/metrics`) for operators.
+
+    Authentication: virtual **API keys** for inference; **OIDC/JWT** for admin (ADR-0008).
+    Errors follow a single machine-readable model (see `API_Error_Model.md`). Versioning,
+    deprecation, and idempotency policies are in the corresponding `API_*.md` documents.
+  contact:
+    name: Platform API Team
+    url: https://docs.example.com/llm-gateway
+  license:
+    name: Proprietary
+servers:
+  - url: https://api.llm-gateway.example.com/v1
+    description: SaaS production (per-region cell resolves via global router — ADR-0010)
+  - url: https://{host}/v1
+    description: Self-hosted (customer-provided host — ADR-0011)
+    variables:
+      host:
+        default: llm-gateway.internal
+
+tags:
+  - name: Inference
+    description: OpenAI-compatible chat, completions, embeddings (FR-001..010).
+  - name: Authentication
+    description: OIDC token exchange, refresh, logout (FR-090..093).
+  - name: Organizations
+    description: Tenant management (FR-130..134).
+  - name: Users
+    description: Users within an organization (FR-090/131).
+  - name: Projects
+    description: Project grouping (org→project→key) (FR-135).
+  - name: API Keys
+    description: Virtual inference keys (FR-094..097).
+  - name: Service Accounts
+    description: Machine principals (FR-098).
+  - name: Providers
+    description: Provider configuration (FR-020..029).
+  - name: Models
+    description: Model registry (FR-021/028/074).
+  - name: Routing Policies
+    description: Routing strategy and rules (FR-030..041).
+  - name: Prompt Templates
+    description: Server-side prompt templates & versions (FR-058).
+  - name: Semantic Cache
+    description: Cache inspection and invalidation (FR-050..058).
+  - name: Embeddings Admin
+    description: Embedding backend configuration (ADR-0007).
+  - name: Budgets
+    description: Hierarchical budgets (FR-060..069).
+  - name: Usage
+    description: Metering and usage analytics (FR-070..077/086).
+  - name: Billing
+    description: Billing accounts and invoices.
+  - name: Audit
+    description: Immutable audit log (FR-113..115).
+  - name: RBAC
+    description: Roles, permissions, memberships (FR-098..101).
+  - name: Feature Flags
+    description: Feature flag management.
+  - name: Notifications
+    description: Notification records and channels (FR-066/085).
+  - name: Webhooks
+    description: Outbound webhook subscriptions & deliveries (ADR-0011).
+  - name: Rate Limits
+    description: Rate-limit policy configuration (FR-064/065).
+  - name: Health
+    description: Liveness/readiness/health (NFR-O03).
+  - name: Metrics
+    description: Prometheus metrics endpoint (FR-081).
+
+# Default: admin JWT. Inference paths override to apiKey. Health/metrics override to none.
+security:
+  - oidcJwt: []
+
+# =============================================================================
+# PATHS
+# =============================================================================
+paths:
+
+  # -------------------------- Inference (apiKey) --------------------------
+  /chat/completions:
+    post:
+      tags: [Inference]
+      operationId: createChatCompletion
+      summary: Create a chat completion (OpenAI-compatible; supports SSE streaming)
+      description: |
+        Routed, cached, budget-enforced chat completion. `stream:true` returns SSE
+        (`text/event-stream`) — see `API_Streaming.md`. Auth: virtual key with `infer:chat`.
+      security:
+        - apiKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/TraceParent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChatCompletionRequest' }
+            examples:
+              basic: { $ref: '#/components/examples/ChatBasic' }
+      responses:
+        '200':
+          description: Completion (JSON) or SSE stream when stream=true.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/XRequestId' }
+            X-Cache: { $ref: '#/components/headers/XCache' }
+            RateLimit: { $ref: '#/components/headers/RateLimit' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChatCompletionResponse' }
+            text/event-stream:
+              schema: { $ref: '#/components/schemas/SSEChatStream' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '402': { $ref: '#/components/responses/BudgetExceeded' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502': { $ref: '#/components/responses/ProviderError' }
+        '503': { $ref: '#/components/responses/NoProviderAvailable' }
+
+  /completions:
+    post:
+      tags: [Inference]
+      operationId: createCompletion
+      summary: Create a text completion (OpenAI-compatible)
+      security: [{ apiKey: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompletionRequest' }
+      responses:
+        '200':
+          description: Completion or SSE stream.
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/CompletionResponse' } }
+            text/event-stream: { schema: { $ref: '#/components/schemas/SSEChatStream' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/BudgetExceeded' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502': { $ref: '#/components/responses/ProviderError' }
+
+  /embeddings:
+    post:
+      tags: [Inference]
+      operationId: createEmbedding
+      summary: Create embeddings (OpenAI-compatible)
+      security: [{ apiKey: [] }]
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/RequestId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmbeddingRequest' }
+      responses:
+        '200':
+          description: Embedding vectors.
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/EmbeddingResponse' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/BudgetExceeded' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /models:
+    get:
+      tags: [Inference]
+      operationId: listModels
+      summary: List models available to the caller (OpenAI-compatible)
+      security: [{ apiKey: [] }, { oidcJwt: [] }]
+      responses:
+        '200':
+          description: Available models.
+          content: { application/json: { schema: { $ref: '#/components/schemas/ModelList' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /models/{model_id}:
+    get:
+      tags: [Inference]
+      operationId: getModel
+      summary: Retrieve a model
+      security: [{ apiKey: [] }, { oidcJwt: [] }]
+      parameters: [ { $ref: '#/components/parameters/ModelId' } ]
+      responses:
+        '200': { description: Model, content: { application/json: { schema: { $ref: '#/components/schemas/Model' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # -------------------------- Authentication --------------------------
+  /auth/token:
+    post:
+      tags: [Authentication]
+      operationId: exchangeToken
+      summary: Exchange an OIDC authorization code for a gateway JWT (FR-090/091)
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TokenExchangeRequest' } } }
+      responses:
+        '200': { description: Token pair, content: { application/json: { schema: { $ref: '#/components/schemas/TokenResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/refresh:
+    post:
+      tags: [Authentication]
+      operationId: refreshToken
+      summary: Rotate a refresh token for a new access token (FR-091)
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RefreshRequest' } } }
+      responses:
+        '200': { description: New token pair, content: { application/json: { schema: { $ref: '#/components/schemas/TokenResponse' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/logout:
+    post:
+      tags: [Authentication]
+      operationId: logout
+      summary: Revoke the current session and refresh tokens
+      responses:
+        '204': { description: Logged out. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # -------------------------- Organizations --------------------------
+  /organizations:
+    get:
+      tags: [Organizations]
+      operationId: listOrganizations
+      summary: List organizations (platform-admin; tenant admins see their own)
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Sort' }, { $ref: '#/components/parameters/FilterStatus' } ]
+      responses:
+        '200': { description: Page of organizations., content: { application/json: { schema: { $ref: '#/components/schemas/OrganizationPage' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Organizations]
+      operationId: createOrganization
+      summary: Create an organization (SaaS onboarding)
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OrganizationCreate' } } } }
+      responses:
+        '201': { description: Created., headers: { Location: { $ref: '#/components/headers/Location' } }, content: { application/json: { schema: { $ref: '#/components/schemas/Organization' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /organizations/{organization_id}:
+    parameters: [ { $ref: '#/components/parameters/OrganizationId' } ]
+    get:
+      tags: [Organizations]
+      operationId: getOrganization
+      summary: Retrieve an organization
+      responses:
+        '200': { description: Organization., content: { application/json: { schema: { $ref: '#/components/schemas/Organization' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Organizations]
+      operationId: updateOrganization
+      summary: Update an organization
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OrganizationUpdate' } } } }
+      responses:
+        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Organization' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Organizations]
+      operationId: deleteOrganization
+      summary: Delete/suspend an organization (retention-gated, FR-134)
+      responses:
+        '202': { description: Deletion scheduled. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # -------------------------- Users --------------------------
+  /users:
+    get:
+      tags: [Users]
+      operationId: listUsers
+      summary: List users in the caller's organization
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Sort' } ]
+      responses: { '200': { description: Page of users., content: { application/json: { schema: { $ref: '#/components/schemas/UserPage' } } } } }
+    post:
+      tags: [Users]
+      operationId: inviteUser
+      summary: Invite a user (creates membership) (FR-135/137)
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UserInvite' } } } }
+      responses: { '201': { description: Invited., content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /users/{user_id}:
+    parameters: [ { $ref: '#/components/parameters/UserId' } ]
+    get:
+      tags: [Users]
+      operationId: getUser
+      responses: { '200': { description: User., content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+    patch:
+      tags: [Users]
+      operationId: updateUser
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UserUpdate' } } } }
+      responses: { '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } } }
+    delete:
+      tags: [Users]
+      operationId: deleteUser
+      responses: { '204': { description: Removed. } }
+
+  # -------------------------- Projects --------------------------
+  /projects:
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Sort' } ]
+      responses: { '200': { description: Page., content: { application/json: { schema: { $ref: '#/components/schemas/ProjectPage' } } } } }
+    post:
+      tags: [Projects]
+      operationId: createProject
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Project' } } } }, '409': { $ref: '#/components/responses/Conflict' }, '422': { $ref: '#/components/responses/ValidationError' } }
+  /projects/{project_id}:
+    parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
+    get:
+      tags: [Projects]
+      operationId: getProject
+      responses: { '200': { description: Project., content: { application/json: { schema: { $ref: '#/components/schemas/Project' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+    patch:
+      tags: [Projects]
+      operationId: updateProject
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectUpdate' } } } }
+      responses: { '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Project' } } } } }
+    delete:
+      tags: [Projects]
+      operationId: deleteProject
+      responses: { '204': { description: Deleted. } }
+
+  # -------------------------- API Keys --------------------------
+  /api-keys:
+    get:
+      tags: [API Keys]
+      operationId: listApiKeys
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/FilterProjectId' } ]
+      responses: { '200': { description: Page (no secret material)., content: { application/json: { schema: { $ref: '#/components/schemas/ApiKeyPage' } } } } }
+    post:
+      tags: [API Keys]
+      operationId: createApiKey
+      summary: Issue a virtual key. Full secret returned ONCE (FR-097).
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApiKeyCreate' } } } }
+      responses:
+        '201': { description: Created; `secret` shown once., content: { application/json: { schema: { $ref: '#/components/schemas/ApiKeyCreated' } } } }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /api-keys/{api_key_id}:
+    parameters: [ { $ref: '#/components/parameters/ApiKeyId' } ]
+    get:
+      tags: [API Keys]
+      operationId: getApiKey
+      responses: { '200': { description: Key metadata., content: { application/json: { schema: { $ref: '#/components/schemas/ApiKey' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+    delete:
+      tags: [API Keys]
+      operationId: revokeApiKey
+      summary: Revoke a key
+      responses: { '204': { description: Revoked. } }
+  /api-keys/{api_key_id}/rotate:
+    parameters: [ { $ref: '#/components/parameters/ApiKeyId' } ]
+    post:
+      tags: [API Keys]
+      operationId: rotateApiKey
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      responses: { '201': { description: Rotated; new secret once., content: { application/json: { schema: { $ref: '#/components/schemas/ApiKeyCreated' } } } } }
+
+  # -------------------------- Service Accounts --------------------------
+  /service-accounts:
+    get:
+      tags: [Service Accounts]
+      operationId: listServiceAccounts
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Page., content: { application/json: { schema: { $ref: '#/components/schemas/ServiceAccountPage' } } } } }
+    post:
+      tags: [Service Accounts]
+      operationId: createServiceAccount
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ServiceAccountCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/ServiceAccount' } } } } }
+  /service-accounts/{service_account_id}:
+    parameters: [ { $ref: '#/components/parameters/ServiceAccountId' } ]
+    get:
+      tags: [Service Accounts]
+      operationId: getServiceAccount
+      responses: { '200': { description: Service account., content: { application/json: { schema: { $ref: '#/components/schemas/ServiceAccount' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+    delete:
+      tags: [Service Accounts]
+      operationId: deleteServiceAccount
+      responses: { '204': { description: Deleted. } }
+
+  /service-accounts/{service_account_id}/credentials:
+    parameters: [ { $ref: '#/components/parameters/ServiceAccountId' } ]
+    get:
+      tags: [Service Accounts]
+      operationId: listServiceAccountCredentials
+      summary: List a service account's client credentials (metadata; no secrets)
+      responses: { '200': { description: Credentials., content: { application/json: { schema: { $ref: '#/components/schemas/ServiceAccountCredentialPage' } } } } }
+    post:
+      tags: [Service Accounts]
+      operationId: issueServiceAccountCredential
+      summary: Issue a client credential. Secret returned ONCE (ADR-0013, FR-097).
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      responses: { '201': { description: Created; `client_secret` shown once., content: { application/json: { schema: { $ref: '#/components/schemas/ServiceAccountCredentialCreated' } } } } }
+  /service-accounts/{service_account_id}/credentials/{credential_id}:
+    parameters: [ { $ref: '#/components/parameters/ServiceAccountId' }, { $ref: '#/components/parameters/CredentialId' } ]
+    delete:
+      tags: [Service Accounts]
+      operationId: revokeServiceAccountCredential
+      summary: Revoke a client credential
+      responses: { '204': { description: Revoked. } }
+
+  # -------------------------- Providers --------------------------
+  /providers:
+    get:
+      tags: [Providers]
+      operationId: listProviders
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/FilterEnabled' } ]
+      responses: { '200': { description: Page., content: { application/json: { schema: { $ref: '#/components/schemas/ProviderPage' } } } } }
+    post:
+      tags: [Providers]
+      operationId: createProvider
+      summary: Register a provider (credentials by secret reference, ADR-0011)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProviderCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Provider' } } } }, '422': { $ref: '#/components/responses/ValidationError' } }
+  /providers/{provider_id}:
+    parameters: [ { $ref: '#/components/parameters/ProviderId' } ]
+    get:
+      tags: [Providers]
+      operationId: getProvider
+      responses: { '200': { description: Provider., content: { application/json: { schema: { $ref: '#/components/schemas/Provider' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+    patch:
+      tags: [Providers]
+      operationId: updateProvider
+      summary: Update provider (incl. enable/disable at runtime, FR-028)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProviderUpdate' } } } }
+      responses: { '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Provider' } } } } }
+    delete:
+      tags: [Providers]
+      operationId: deleteProvider
+      responses: { '204': { description: Deleted. } }
+  /providers/{provider_id}/health:
+    parameters: [ { $ref: '#/components/parameters/ProviderId' } ]
+    get:
+      tags: [Providers]
+      operationId: getProviderHealth
+      summary: Current health/circuit state (FR-037/038)
+      responses: { '200': { description: Health., content: { application/json: { schema: { $ref: '#/components/schemas/ProviderHealth' } } } } }
+
+  # -------------------------- Models (admin) --------------------------
+  /admin/models:
+    get:
+      tags: [Models]
+      operationId: adminListModels
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/FilterProviderId' } ]
+      responses: { '200': { description: Page., content: { application/json: { schema: { $ref: '#/components/schemas/ModelAdminPage' } } } } }
+    post:
+      tags: [Models]
+      operationId: createModel
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ModelCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/ModelAdmin' } } } } }
+  /admin/models/{model_id}:
+    parameters: [ { $ref: '#/components/parameters/ModelId' } ]
+    patch:
+      tags: [Models]
+      operationId: updateModel
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ModelUpdate' } } } }
+      responses: { '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/ModelAdmin' } } } } }
+    delete:
+      tags: [Models]
+      operationId: deleteModel
+      responses: { '204': { description: Deleted. } }
+  /admin/models/{model_id}/price-tables:
+    parameters: [ { $ref: '#/components/parameters/ModelId' } ]
+    get:
+      tags: [Models]
+      operationId: listPriceTables
+      responses: { '200': { description: Effective-dated prices., content: { application/json: { schema: { $ref: '#/components/schemas/PriceTablePage' } } } } }
+    post:
+      tags: [Models]
+      operationId: createPriceTable
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PriceTableCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/PriceTable' } } } } }
+
+  # -------------------------- Routing Policies --------------------------
+  /routing-policies:
+    get:
+      tags: [Routing Policies]
+      operationId: listRoutingPolicies
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Page., content: { application/json: { schema: { $ref: '#/components/schemas/RoutingPolicyPage' } } } } }
+    post:
+      tags: [Routing Policies]
+      operationId: createRoutingPolicy
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RoutingPolicyCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/RoutingPolicy' } } } }, '422': { $ref: '#/components/responses/ValidationError' } }
+  /routing-policies/{routing_policy_id}:
+    parameters: [ { $ref: '#/components/parameters/RoutingPolicyId' } ]
+    get:
+      tags: [Routing Policies]
+      operationId: getRoutingPolicy
+      responses: { '200': { description: Policy., content: { application/json: { schema: { $ref: '#/components/schemas/RoutingPolicy' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+    patch:
+      tags: [Routing Policies]
+      operationId: updateRoutingPolicy
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RoutingPolicyUpdate' } } } }
+      responses: { '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/RoutingPolicy' } } } } }
+    delete:
+      tags: [Routing Policies]
+      operationId: deleteRoutingPolicy
+      responses: { '204': { description: Deleted. } }
+
+  # -------------------------- Prompt Templates & Versions --------------------------
+  /prompt-templates:
+    get:
+      tags: [Prompt Templates]
+      operationId: listPromptTemplates
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Page., content: { application/json: { schema: { $ref: '#/components/schemas/PromptTemplatePage' } } } } }
+    post:
+      tags: [Prompt Templates]
+      operationId: createPromptTemplate
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PromptTemplateCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/PromptTemplate' } } } } }
+  /prompt-templates/{prompt_template_id}/versions:
+    parameters: [ { $ref: '#/components/parameters/PromptTemplateId' } ]
+    get:
+      tags: [Prompt Templates]
+      operationId: listPromptVersions
+      responses: { '200': { description: Versions., content: { application/json: { schema: { $ref: '#/components/schemas/PromptVersionPage' } } } } }
+    post:
+      tags: [Prompt Templates]
+      operationId: createPromptVersion
+      summary: Create an immutable new version (FR-058)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PromptVersionCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/PromptVersion' } } } } }
+
+  # -------------------------- Semantic Cache --------------------------
+  /cache/entries:
+    get:
+      tags: [Semantic Cache]
+      operationId: listCacheEntries
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/FilterProjectId' } ]
+      responses: { '200': { description: Page (metadata; no raw prompts unless policy allows)., content: { application/json: { schema: { $ref: '#/components/schemas/CacheEntryPage' } } } } }
+    delete:
+      tags: [Semantic Cache]
+      operationId: purgeCache
+      summary: Purge cache entries (audited config action, FR-058)
+      parameters: [ { $ref: '#/components/parameters/FilterProjectId' }, { $ref: '#/components/parameters/FilterModelId' } ]
+      responses: { '202': { description: Purge scheduled., content: { application/json: { schema: { $ref: '#/components/schemas/PurgeResult' } } } } }
+
+  # -------------------------- Embeddings Admin --------------------------
+  /admin/embedding-config:
+    get:
+      tags: [Embeddings Admin]
+      operationId: getEmbeddingConfig
+      summary: Current embedding backend config (ADR-0007)
+      responses: { '200': { description: Config., content: { application/json: { schema: { $ref: '#/components/schemas/EmbeddingConfig' } } } } }
+    put:
+      tags: [Embeddings Admin]
+      operationId: updateEmbeddingConfig
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/EmbeddingConfig' } } } }
+      responses: { '200': { description: Updated (may trigger re-embed)., content: { application/json: { schema: { $ref: '#/components/schemas/EmbeddingConfig' } } } } }
+
+  # -------------------------- Budgets --------------------------
+  /budgets:
+    get:
+      tags: [Budgets]
+      operationId: listBudgets
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/FilterScope' } ]
+      responses: { '200': { description: Page., content: { application/json: { schema: { $ref: '#/components/schemas/BudgetPage' } } } } }
+    post:
+      tags: [Budgets]
+      operationId: createBudget
+      summary: Create a hierarchical budget (FR-060..067)
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/BudgetCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Budget' } } } }, '422': { $ref: '#/components/responses/ValidationError' } }
+  /budgets/{budget_id}:
+    parameters: [ { $ref: '#/components/parameters/BudgetId' } ]
+    get:
+      tags: [Budgets]
+      operationId: getBudget
+      responses: { '200': { description: Budget with current consumption., content: { application/json: { schema: { $ref: '#/components/schemas/Budget' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+    patch:
+      tags: [Budgets]
+      operationId: updateBudget
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/BudgetUpdate' } } } }
+      responses: { '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Budget' } } } } }
+    delete:
+      tags: [Budgets]
+      operationId: deleteBudget
+      responses: { '204': { description: Deleted. } }
+
+  # -------------------------- Usage --------------------------
+  /usage:
+    get:
+      tags: [Usage]
+      operationId: queryUsage
+      summary: Query usage/cost aggregates (FR-086)
+      parameters:
+        - $ref: '#/components/parameters/FilterFrom'
+        - $ref: '#/components/parameters/FilterTo'
+        - $ref: '#/components/parameters/GroupBy'
+        - $ref: '#/components/parameters/FilterProjectId'
+        - $ref: '#/components/parameters/FilterModelId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses: { '200': { description: Usage aggregates., content: { application/json: { schema: { $ref: '#/components/schemas/UsagePage' } } } } }
+  /usage/export:
+    get:
+      tags: [Usage]
+      operationId: exportUsage
+      summary: Export raw usage records (CSV/JSON) (FR-076)
+      parameters: [ { $ref: '#/components/parameters/FilterFrom' }, { $ref: '#/components/parameters/FilterTo' }, { $ref: '#/components/parameters/ExportFormat' } ]
+      responses:
+        '200':
+          description: Export stream.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/UsageExport' } }
+            text/csv: { schema: { type: string } }
+
+  # -------------------------- Billing --------------------------
+  /billing/account:
+    get:
+      tags: [Billing]
+      operationId: getBillingAccount
+      responses: { '200': { description: Billing account., content: { application/json: { schema: { $ref: '#/components/schemas/BillingAccount' } } } } }
+  /billing/invoices:
+    get:
+      tags: [Billing]
+      operationId: listInvoices
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Invoices., content: { application/json: { schema: { $ref: '#/components/schemas/InvoicePage' } } } } }
+  /billing/invoices/{invoice_id}:
+    parameters: [ { $ref: '#/components/parameters/InvoiceId' } ]
+    get:
+      tags: [Billing]
+      operationId: getInvoice
+      responses: { '200': { description: Invoice., content: { application/json: { schema: { $ref: '#/components/schemas/Invoice' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+
+  # -------------------------- Audit --------------------------
+  /audit-events:
+    get:
+      tags: [Audit]
+      operationId: listAuditEvents
+      summary: Query the immutable audit log (read-only, FR-115)
+      parameters: [ { $ref: '#/components/parameters/FilterFrom' }, { $ref: '#/components/parameters/FilterTo' }, { $ref: '#/components/parameters/FilterAction' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Page of audit events., content: { application/json: { schema: { $ref: '#/components/schemas/AuditEventPage' } } } } }
+
+  # -------------------------- RBAC --------------------------
+  /roles:
+    get:
+      tags: [RBAC]
+      operationId: listRoles
+      responses: { '200': { description: Roles (system + custom)., content: { application/json: { schema: { $ref: '#/components/schemas/RolePage' } } } } }
+    post:
+      tags: [RBAC]
+      operationId: createRole
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RoleCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Role' } } } } }
+  /permissions:
+    get:
+      tags: [RBAC]
+      operationId: listPermissions
+      summary: The permission catalog (reference)
+      responses: { '200': { description: Permissions., content: { application/json: { schema: { $ref: '#/components/schemas/PermissionList' } } } } }
+  /memberships:
+    get:
+      tags: [RBAC]
+      operationId: listMemberships
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Memberships., content: { application/json: { schema: { $ref: '#/components/schemas/MembershipPage' } } } } }
+    post:
+      tags: [RBAC]
+      operationId: createMembership
+      summary: Assign a role to a principal (FR-098)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MembershipCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Membership' } } } } }
+  /memberships/{membership_id}:
+    parameters: [ { $ref: '#/components/parameters/MembershipId' } ]
+    delete:
+      tags: [RBAC]
+      operationId: deleteMembership
+      responses: { '204': { description: Removed. } }
+
+  # -------------------------- Rate Limits --------------------------
+  /rate-limits:
+    get:
+      tags: [Rate Limits]
+      operationId: listRateLimits
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Page., content: { application/json: { schema: { $ref: '#/components/schemas/RateLimitPolicyPage' } } } } }
+    post:
+      tags: [Rate Limits]
+      operationId: createRateLimit
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RateLimitPolicyCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/RateLimitPolicy' } } } } }
+
+  # -------------------------- Feature Flags --------------------------
+  /feature-flags:
+    get:
+      tags: [Feature Flags]
+      operationId: listFeatureFlags
+      responses: { '200': { description: Flags., content: { application/json: { schema: { $ref: '#/components/schemas/FeatureFlagPage' } } } } }
+    put:
+      tags: [Feature Flags]
+      operationId: upsertFeatureFlag
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/FeatureFlagUpsert' } } } }
+      responses: { '200': { description: Upserted., content: { application/json: { schema: { $ref: '#/components/schemas/FeatureFlag' } } } } }
+
+  # -------------------------- Notifications --------------------------
+  /notifications:
+    get:
+      tags: [Notifications]
+      operationId: listNotifications
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/FilterStatus' } ]
+      responses: { '200': { description: Page., content: { application/json: { schema: { $ref: '#/components/schemas/NotificationPage' } } } } }
+
+  # -------------------------- Webhooks --------------------------
+  /webhooks:
+    get:
+      tags: [Webhooks]
+      operationId: listWebhooks
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Page., content: { application/json: { schema: { $ref: '#/components/schemas/WebhookPage' } } } } }
+    post:
+      tags: [Webhooks]
+      operationId: createWebhook
+      summary: Subscribe a webhook (signing secret by reference, ADR-0011)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/WebhookCreate' } } } }
+      responses: { '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Webhook' } } } } }
+  /webhooks/{webhook_id}:
+    parameters: [ { $ref: '#/components/parameters/WebhookId' } ]
+    delete:
+      tags: [Webhooks]
+      operationId: deleteWebhook
+      responses: { '204': { description: Deleted. } }
+  /webhooks/{webhook_id}/deliveries:
+    parameters: [ { $ref: '#/components/parameters/WebhookId' } ]
+    get:
+      tags: [Webhooks]
+      operationId: listWebhookDeliveries
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Deliveries., content: { application/json: { schema: { $ref: '#/components/schemas/WebhookDeliveryPage' } } } } }
+
+  # -------------------------- Health & Metrics (no auth) --------------------------
+  /healthz:
+    servers: [ { url: https://api.llm-gateway.example.com } ]
+    get:
+      tags: [Health]
+      operationId: health
+      security: []
+      summary: Aggregate health (NFR-O03)
+      responses: { '200': { description: Healthy., content: { application/json: { schema: { $ref: '#/components/schemas/Health' } } } }, '503': { description: Unhealthy., content: { application/json: { schema: { $ref: '#/components/schemas/Health' } } } } }
+  /readyz:
+    servers: [ { url: https://api.llm-gateway.example.com } ]
+    get:
+      tags: [Health]
+      operationId: ready
+      security: []
+      responses: { '200': { description: Ready. }, '503': { description: Not ready. } }
+  /livez:
+    servers: [ { url: https://api.llm-gateway.example.com } ]
+    get:
+      tags: [Health]
+      operationId: live
+      security: []
+      responses: { '200': { description: Alive. } }
+  /metrics:
+    servers: [ { url: https://api.llm-gateway.example.com } ]
+    get:
+      tags: [Metrics]
+      operationId: metrics
+      security: []
+      summary: Prometheus metrics (scrape; network-restricted) (FR-081)
+      responses: { '200': { description: Prometheus exposition., content: { text/plain: { schema: { type: string } } } } }
+
+# =============================================================================
+# COMPONENTS
+# =============================================================================
+components:
+
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: elg_live_*
+      description: Virtual API key for inference. Scopes enforced (infer:chat|infer:embed). ADR-0008.
+    oidcJwt:
+      type: oauth2
+      description: Admin access via corporate OIDC → gateway JWT. RBAC-enforced. ADR-0008.
+      flows:
+        authorizationCode:
+          authorizationUrl: https://idp.example.com/authorize
+          tokenUrl: https://api.llm-gateway.example.com/v1/auth/token
+          scopes:
+            admin: Administrative access (subject to RBAC)
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Client-generated UUID to make POST safe to retry (see API_Idempotency.md).
+      schema: { type: string, format: uuid }
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Optional client correlation id; echoed back. If absent, server generates one.
+      schema: { type: string }
+    TraceParent:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C trace context (FR-083).
+      schema: { type: string }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque keyset cursor (see API_Pagination_Filtering.md).
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Sort:
+      name: sort
+      in: query
+      required: false
+      description: 'Comma-separated fields; prefix - for desc, e.g. -created_at.'
+      schema: { type: string }
+    FilterStatus: { name: status, in: query, required: false, schema: { type: string } }
+    FilterEnabled: { name: enabled, in: query, required: false, schema: { type: boolean } }
+    FilterProjectId: { name: project_id, in: query, required: false, schema: { type: string, format: uuid } }
+    FilterProviderId: { name: provider_id, in: query, required: false, schema: { type: string, format: uuid } }
+    FilterModelId: { name: model_id, in: query, required: false, schema: { type: string, format: uuid } }
+    FilterScope: { name: scope, in: query, required: false, schema: { type: string, enum: [organization, project, api_key] } }
+    FilterFrom: { name: from, in: query, required: false, schema: { type: string, format: date-time } }
+    FilterTo: { name: to, in: query, required: false, schema: { type: string, format: date-time } }
+    FilterAction: { name: action, in: query, required: false, schema: { type: string } }
+    GroupBy: { name: group_by, in: query, required: false, schema: { type: string, enum: [day, model, project, provider] } }
+    ExportFormat: { name: format, in: query, required: false, schema: { type: string, enum: [json, csv], default: json } }
+    OrganizationId: { name: organization_id, in: path, required: true, schema: { type: string, format: uuid } }
+    UserId: { name: user_id, in: path, required: true, schema: { type: string, format: uuid } }
+    ProjectId: { name: project_id, in: path, required: true, schema: { type: string, format: uuid } }
+    ApiKeyId: { name: api_key_id, in: path, required: true, schema: { type: string, format: uuid } }
+    ServiceAccountId: { name: service_account_id, in: path, required: true, schema: { type: string, format: uuid } }
+    CredentialId: { name: credential_id, in: path, required: true, schema: { type: string, format: uuid } }
+    ProviderId: { name: provider_id, in: path, required: true, schema: { type: string, format: uuid } }
+    ModelId: { name: model_id, in: path, required: true, schema: { type: string } }
+    RoutingPolicyId: { name: routing_policy_id, in: path, required: true, schema: { type: string, format: uuid } }
+    PromptTemplateId: { name: prompt_template_id, in: path, required: true, schema: { type: string, format: uuid } }
+    BudgetId: { name: budget_id, in: path, required: true, schema: { type: string, format: uuid } }
+    InvoiceId: { name: invoice_id, in: path, required: true, schema: { type: string, format: uuid } }
+    MembershipId: { name: membership_id, in: path, required: true, schema: { type: string, format: uuid } }
+    WebhookId: { name: webhook_id, in: path, required: true, schema: { type: string, format: uuid } }
+
+  headers:
+    XRequestId:
+      description: Correlation id for this request (matches logs/traces).
+      schema: { type: string }
+    XCache:
+      description: Cache disposition (miss | exact_hit | semantic_hit) (FR-052).
+      schema: { type: string, enum: [miss, exact_hit, semantic_hit] }
+    RateLimit:
+      description: RFC-style rate-limit state, e.g. "limit=1000, remaining=994, reset=12".
+      schema: { type: string }
+    Location:
+      description: URI of the created resource.
+      schema: { type: string, format: uri }
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' }, examples: { bad: { $ref: '#/components/examples/ErrBadRequest' } } } }
+    Unauthorized:
+      description: Missing/invalid credentials (fail closed, ADR-0009).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Authenticated but not authorized (RBAC deny, FR-100).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Resource not found (or not visible to tenant).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Conflict:
+      description: Uniqueness/state conflict.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    ValidationError:
+      description: Semantic validation failed.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' }, examples: { v: { $ref: '#/components/examples/ErrValidation' } } } }
+    RateLimited:
+      description: Rate limit or quota exceeded (FR-065).
+      headers:
+        Retry-After: { description: Seconds to wait., schema: { type: integer } }
+        RateLimit: { $ref: '#/components/headers/RateLimit' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    BudgetExceeded:
+      description: Hard budget exhausted; rejected before provider cost (FR-061, ADR-0004).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' }, examples: { b: { $ref: '#/components/examples/ErrBudget' } } } }
+    ProviderError:
+      description: Upstream provider error after failover attempts (normalized, ADR-0003).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NoProviderAvailable:
+      description: No eligible healthy provider (fail closed, ADR-0009 row 9).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  examples:
+    ChatBasic:
+      summary: Minimal chat request
+      value: { model: "gpt-4o", messages: [ { role: "user", content: "Hello" } ] }
+    ErrBadRequest:
+      value: { error: { type: "invalid_request_error", code: "invalid_json", message: "Request body is not valid JSON.", request_id: "req_01H...", doc_url: "https://docs.example.com/errors/invalid_json" } }
+    ErrValidation:
+      value: { error: { type: "validation_error", code: "field_invalid", message: "messages must contain at least one item.", request_id: "req_01H...", details: [ { field: "messages", issue: "min_items", message: "at least 1" } ], doc_url: "https://docs.example.com/errors/field_invalid" } }
+    ErrBudget:
+      value: { error: { type: "budget_error", code: "budget_exceeded", message: "Monthly budget for project 'search' is exhausted.", request_id: "req_01H...", retryable: false, doc_url: "https://docs.example.com/errors/budget_exceeded" } }
+
+  schemas:
+
+    # ---- Unified error model (API_Error_Model.md) ----
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, code, message, request_id]
+          additionalProperties: false
+          properties:
+            type: { $ref: '#/components/schemas/ErrorType' }
+            code: { type: string, description: Stable machine-readable code (see API_Error_Model.md). }
+            message: { type: string, description: Human-readable, non-localized message. }
+            request_id: { type: string, description: Correlation id (matches X-Request-Id). }
+            retryable: { type: boolean, description: Whether a retry may succeed. }
+            retry_after_seconds: { type: integer, nullable: true }
+            details:
+              type: array
+              items: { $ref: '#/components/schemas/ErrorDetail' }
+            doc_url: { type: string, format: uri }
+    ErrorType:
+      type: string
+      enum: [invalid_request_error, authentication_error, permission_error, not_found_error,
+             conflict_error, validation_error, rate_limit_error, budget_error,
+             provider_error, availability_error, governance_error, internal_error]
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      properties:
+        field: { type: string }
+        issue: { type: string }
+        message: { type: string }
+
+    PageMeta:
+      type: object
+      additionalProperties: false
+      required: [has_more]
+      properties:
+        has_more: { type: boolean }
+        next_cursor: { type: string, nullable: true }
+        limit: { type: integer }
+
+    # ---- Inference ----
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role: { type: string, enum: [system, user, assistant, tool] }
+        content: { type: string }
+        name: { type: string }
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model: { type: string, description: Model alias resolved by routing (FR-005). }
+        messages: { type: array, minItems: 1, items: { $ref: '#/components/schemas/ChatMessage' } }
+        temperature: { type: number, minimum: 0, maximum: 2, default: 1 }
+        top_p: { type: number, minimum: 0, maximum: 1 }
+        max_tokens: { type: integer, minimum: 1, description: Upper bound; used for budget reservation (ADR-0004). }
+        stream: { type: boolean, default: false, description: SSE when true (API_Streaming.md). }
+        stop: { type: array, items: { type: string } }
+        user: { type: string, description: Opaque end-user id for attribution/labels. }
+        metadata: { type: object, additionalProperties: true }
+    Usage:
+      type: object
+      properties:
+        prompt_tokens: { type: integer }
+        completion_tokens: { type: integer }
+        total_tokens: { type: integer }
+        cost: { type: number, description: Computed cost in account currency (FR-071). }
+    ChatChoice:
+      type: object
+      properties:
+        index: { type: integer }
+        message: { $ref: '#/components/schemas/ChatMessage' }
+        finish_reason: { type: string, enum: [stop, length, content_filter, tool_calls] }
+    ChatCompletionResponse:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, enum: [chat.completion] }
+        created: { type: integer }
+        model: { type: string }
+        choices: { type: array, items: { $ref: '#/components/schemas/ChatChoice' } }
+        usage: { $ref: '#/components/schemas/Usage' }
+        x_gateway:
+          type: object
+          description: Gateway metadata (routing/cache), additive & non-breaking.
+          properties:
+            request_id: { type: string }
+            cache: { type: string, enum: [miss, exact_hit, semantic_hit] }
+            selected_provider: { type: string }
+            selected_model: { type: string }
+            failover_count: { type: integer }
+    SSEChatStream:
+      type: string
+      description: |
+        `text/event-stream` of `data: {chunk}` lines terminating with `data: [DONE]`.
+        Each chunk mirrors OpenAI chat.completion.chunk. See API_Streaming.md.
+    CompletionRequest:
+      type: object
+      required: [model, prompt]
+      properties:
+        model: { type: string }
+        prompt: { oneOf: [ { type: string }, { type: array, items: { type: string } } ] }
+        max_tokens: { type: integer, minimum: 1 }
+        temperature: { type: number }
+        stream: { type: boolean, default: false }
+    CompletionResponse:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, enum: [text_completion] }
+        model: { type: string }
+        choices: { type: array, items: { type: object, properties: { text: { type: string }, finish_reason: { type: string } } } }
+        usage: { $ref: '#/components/schemas/Usage' }
+    EmbeddingRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model: { type: string }
+        input: { oneOf: [ { type: string }, { type: array, items: { type: string } } ] }
+        user: { type: string }
+    EmbeddingResponse:
+      type: object
+      properties:
+        object: { type: string, enum: [list] }
+        model: { type: string }
+        data: { type: array, items: { type: object, properties: { object: { type: string }, index: { type: integer }, embedding: { type: array, items: { type: number } } } } }
+        usage: { $ref: '#/components/schemas/Usage' }
+    Model:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, enum: [model] }
+        owned_by: { type: string }
+        quality_tier: { type: string, enum: [economy, standard, premium, frontier] }
+        modality: { type: string, enum: [chat, completion, embedding, multimodal] }
+        context_window: { type: integer }
+    ModelList:
+      type: object
+      properties: { object: { type: string, enum: [list] }, data: { type: array, items: { $ref: '#/components/schemas/Model' } } }
+
+    # ---- Auth ----
+    TokenExchangeRequest:
+      type: object
+      required: [code, redirect_uri]
+      properties: { code: { type: string }, redirect_uri: { type: string, format: uri }, code_verifier: { type: string } }
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties: { refresh_token: { type: string } }
+    TokenResponse:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer }
+        refresh_token: { type: string }
+
+    # ---- Organizations ----
+    Organization:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        status: { type: string, enum: [active, suspended, deleted] }
+        deployment_mode: { type: string, enum: [saas, self_hosted] }
+        home_region: { type: string }
+        created_at: { type: string, format: date-time }
+    OrganizationCreate:
+      type: object
+      required: [slug, name]
+      properties: { slug: { type: string, pattern: '^[a-z0-9][a-z0-9-]{1,62}$' }, name: { type: string }, home_region: { type: string } }
+    OrganizationUpdate:
+      type: object
+      properties: { name: { type: string }, status: { type: string, enum: [active, suspended] } }
+    OrganizationPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/Organization' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Users ----
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+    UserInvite:
+      type: object
+      required: [email, role_id]
+      properties: { email: { type: string, format: email }, role_id: { type: string, format: uuid }, display_name: { type: string } }
+    UserUpdate:
+      type: object
+      properties: { display_name: { type: string }, is_active: { type: boolean } }
+    UserPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/User' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Projects ----
+    Project:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+    ProjectCreate:
+      type: object
+      required: [slug, name]
+      properties: { slug: { type: string }, name: { type: string } }
+    ProjectUpdate:
+      type: object
+      properties: { name: { type: string }, is_active: { type: boolean } }
+    ProjectPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/Project' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- API Keys ----
+    ApiKey:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        key_prefix: { type: string }
+        project_id: { type: string, format: uuid, nullable: true }
+        scopes: { type: array, items: { type: string, enum: [infer:chat, infer:embed] } }
+        status: { type: string, enum: [active, revoked, expired] }
+        last_used_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    ApiKeyCreate:
+      type: object
+      required: [name, scopes]
+      properties:
+        name: { type: string }
+        project_id: { type: string, format: uuid }
+        scopes: { type: array, minItems: 1, items: { type: string, enum: [infer:chat, infer:embed] } }
+        expires_at: { type: string, format: date-time }
+    ApiKeyCreated:
+      allOf:
+        - $ref: '#/components/schemas/ApiKey'
+        - type: object
+          required: [secret]
+          properties:
+            secret: { type: string, description: Full key — shown ONCE, never retrievable again (FR-097). }
+    ApiKeyPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/ApiKey' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Service Accounts ----
+    ServiceAccount:
+      type: object
+      properties: { id: { type: string, format: uuid }, name: { type: string }, description: { type: string }, is_active: { type: boolean } }
+    ServiceAccountCreate:
+      type: object
+      required: [name]
+      properties: { name: { type: string }, description: { type: string } }
+    ServiceAccountPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/ServiceAccount' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+    ServiceAccountCredential:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        client_id: { type: string }
+        status: { type: string, enum: [active, revoked, expired] }
+        expires_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    ServiceAccountCredentialCreated:
+      allOf:
+        - $ref: '#/components/schemas/ServiceAccountCredential'
+        - type: object
+          required: [client_secret]
+          properties:
+            client_secret: { type: string, description: Full secret — shown ONCE, never retrievable (FR-097). }
+    ServiceAccountCredentialPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/ServiceAccountCredential' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Providers ----
+    Provider:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [openai, anthropic, google, bedrock, azure_openai, openai_compatible, self_hosted] }
+        name: { type: string }
+        base_url: { type: string, nullable: true }
+        region: { type: string, nullable: true }
+        credential_secret_ref: { type: string, format: uuid, nullable: true, description: Reference only; never the secret (ADR-0011). }
+        is_enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+    ProviderCreate:
+      type: object
+      required: [type, name]
+      properties:
+        type: { type: string, enum: [openai, anthropic, google, bedrock, azure_openai, openai_compatible, self_hosted] }
+        name: { type: string }
+        base_url: { type: string }
+        region: { type: string }
+        credential_secret_ref: { type: string, format: uuid }
+        config: { type: object, additionalProperties: true }
+    ProviderUpdate:
+      type: object
+      properties: { is_enabled: { type: boolean }, region: { type: string }, credential_secret_ref: { type: string, format: uuid }, config: { type: object, additionalProperties: true } }
+    ProviderHealth:
+      type: object
+      properties: { provider_id: { type: string, format: uuid }, state: { type: string, enum: [healthy, degraded, open, half_open] }, success_rate: { type: number }, p95_latency_ms: { type: integer }, observed_at: { type: string, format: date-time } }
+    ProviderPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/Provider' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Models (admin) ----
+    ModelAdmin:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        provider_id: { type: string, format: uuid }
+        name: { type: string }
+        alias: { type: string, nullable: true }
+        modality: { type: string, enum: [chat, completion, embedding, multimodal] }
+        quality_tier: { type: string, enum: [economy, standard, premium, frontier] }
+        context_window: { type: integer, nullable: true }
+        is_enabled: { type: boolean }
+    ModelCreate:
+      type: object
+      required: [provider_id, name, modality]
+      properties:
+        provider_id: { type: string, format: uuid }
+        name: { type: string }
+        alias: { type: string }
+        modality: { type: string, enum: [chat, completion, embedding, multimodal] }
+        quality_tier: { type: string, enum: [economy, standard, premium, frontier] }
+        context_window: { type: integer }
+    ModelUpdate:
+      type: object
+      properties: { alias: { type: string }, quality_tier: { type: string, enum: [economy, standard, premium, frontier] }, is_enabled: { type: boolean } }
+    ModelAdminPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/ModelAdmin' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+    PriceTable:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        model_id: { type: string, format: uuid }
+        currency: { type: string }
+        input_price_per_1k: { type: number }
+        output_price_per_1k: { type: number }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time, nullable: true }
+    PriceTableCreate:
+      type: object
+      required: [input_price_per_1k, output_price_per_1k, effective_from]
+      properties: { currency: { type: string, default: USD }, input_price_per_1k: { type: number, minimum: 0 }, output_price_per_1k: { type: number, minimum: 0 }, effective_from: { type: string, format: date-time } }
+    PriceTablePage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/PriceTable' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Routing ----
+    RoutingRule:
+      type: object
+      required: [priority]
+      properties:
+        priority: { type: integer }
+        model_id: { type: string, format: uuid }
+        weight: { type: integer, minimum: 0 }
+        condition: { type: object, additionalProperties: true }
+    RoutingPolicy:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        project_id: { type: string, format: uuid, nullable: true }
+        strategy: { type: string, enum: [lowest_cost, lowest_latency, quality_tier, weighted, pinned] }
+        is_active: { type: boolean }
+        constraints: { type: object, additionalProperties: true, description: 'Allowed providers/regions/models; residency (FR-032/116).' }
+        rules: { type: array, items: { $ref: '#/components/schemas/RoutingRule' } }
+    RoutingPolicyCreate:
+      type: object
+      required: [name, strategy]
+      properties:
+        name: { type: string }
+        project_id: { type: string, format: uuid }
+        strategy: { type: string, enum: [lowest_cost, lowest_latency, quality_tier, weighted, pinned] }
+        constraints: { type: object, additionalProperties: true }
+        rules: { type: array, items: { $ref: '#/components/schemas/RoutingRule' } }
+    RoutingPolicyUpdate:
+      type: object
+      properties: { strategy: { type: string, enum: [lowest_cost, lowest_latency, quality_tier, weighted, pinned] }, is_active: { type: boolean }, constraints: { type: object, additionalProperties: true }, rules: { type: array, items: { $ref: '#/components/schemas/RoutingRule' } } }
+    RoutingPolicyPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/RoutingPolicy' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Prompts ----
+    PromptTemplate:
+      type: object
+      properties: { id: { type: string, format: uuid }, name: { type: string }, description: { type: string }, project_id: { type: string, format: uuid, nullable: true }, created_at: { type: string, format: date-time } }
+    PromptTemplateCreate:
+      type: object
+      required: [name]
+      properties: { name: { type: string }, description: { type: string }, project_id: { type: string, format: uuid } }
+    PromptTemplatePage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/PromptTemplate' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+    PromptVersion:
+      type: object
+      properties: { id: { type: string, format: uuid }, version: { type: integer }, content: { type: string }, variables: { type: array, items: { type: string } }, is_published: { type: boolean }, created_at: { type: string, format: date-time } }
+    PromptVersionCreate:
+      type: object
+      required: [content]
+      properties: { content: { type: string }, variables: { type: array, items: { type: string } }, is_published: { type: boolean, default: false } }
+    PromptVersionPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/PromptVersion' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Cache & Embeddings ----
+    CacheEntry:
+      type: object
+      properties: { id: { type: string, format: uuid }, request_hash: { type: string }, model_id: { type: string, format: uuid, nullable: true }, hit_count: { type: integer }, expires_at: { type: string, format: date-time, nullable: true }, created_at: { type: string, format: date-time } }
+    CacheEntryPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/CacheEntry' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+    PurgeResult:
+      type: object
+      properties: { scheduled: { type: boolean }, estimated_entries: { type: integer } }
+    EmbeddingConfig:
+      type: object
+      properties:
+        backend: { type: string, enum: [local, external] }
+        model: { type: string }
+        version: { type: string }
+        dimension: { type: integer }
+        semantic_cache_enabled: { type: boolean }
+
+    # ---- Budgets ----
+    Budget:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string, enum: [organization, project, api_key] }
+        scope_id: { type: string, format: uuid }
+        period: { type: string, enum: [daily, weekly, monthly, custom] }
+        limit_kind: { type: string, enum: [soft, hard] }
+        amount_limit: { type: number }
+        currency: { type: string }
+        consumed_amount: { type: number, description: Current period consumption (from ledger). }
+        period_start: { type: string, format: date-time }
+        period_end: { type: string, format: date-time }
+        alert_thresholds: { type: array, items: { type: integer } }
+        is_active: { type: boolean }
+    BudgetCreate:
+      type: object
+      required: [scope, scope_id, amount_limit, period_start, period_end]
+      properties:
+        scope: { type: string, enum: [organization, project, api_key] }
+        scope_id: { type: string, format: uuid }
+        period: { type: string, enum: [daily, weekly, monthly, custom], default: monthly }
+        limit_kind: { type: string, enum: [soft, hard], default: hard }
+        amount_limit: { type: number, minimum: 0 }
+        currency: { type: string, default: USD }
+        period_start: { type: string, format: date-time }
+        period_end: { type: string, format: date-time }
+        alert_thresholds: { type: array, items: { type: integer }, default: [80, 100] }
+    BudgetUpdate:
+      type: object
+      properties: { amount_limit: { type: number, minimum: 0 }, limit_kind: { type: string, enum: [soft, hard] }, alert_thresholds: { type: array, items: { type: integer } }, is_active: { type: boolean } }
+    BudgetPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/Budget' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Usage & Billing ----
+    UsageAggregate:
+      type: object
+      properties:
+        bucket: { type: string }
+        request_count: { type: integer }
+        total_tokens: { type: integer }
+        total_cost: { type: number }
+        cache_hit_count: { type: integer }
+    UsagePage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/UsageAggregate' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+    UsageExport:
+      type: object
+      properties: { records: { type: array, items: { type: object, additionalProperties: true } } }
+    BillingAccount:
+      type: object
+      properties: { id: { type: string, format: uuid }, external_ref: { type: string, nullable: true }, currency: { type: string } }
+    Invoice:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        period_start: { type: string, format: date }
+        period_end: { type: string, format: date }
+        amount_due: { type: number }
+        currency: { type: string }
+        status: { type: string, enum: [draft, open, paid, void, uncollectible] }
+    InvoicePage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/Invoice' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Audit ----
+    AuditEvent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        actor_type: { type: string, enum: [user, service_account, api_key] }
+        actor_id: { type: string, format: uuid, nullable: true }
+        action: { type: string }
+        resource_type: { type: string, nullable: true }
+        resource_id: { type: string, format: uuid, nullable: true }
+        result: { type: string, enum: [allow, deny, success, failure] }
+        created_at: { type: string, format: date-time }
+    AuditEventPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/AuditEvent' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- RBAC ----
+    Role:
+      type: object
+      properties: { id: { type: string, format: uuid }, key: { type: string }, name: { type: string }, is_system: { type: boolean }, permissions: { type: array, items: { type: string } } }
+    RoleCreate:
+      type: object
+      required: [key, name, permissions]
+      properties: { key: { type: string }, name: { type: string }, permissions: { type: array, items: { type: string } } }
+    RolePage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/Role' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+    PermissionList:
+      type: object
+      properties: { data: { type: array, items: { type: object, properties: { key: { type: string }, description: { type: string } } } } }
+    Membership:
+      type: object
+      properties: { id: { type: string, format: uuid }, user_id: { type: string, format: uuid, nullable: true }, service_account_id: { type: string, format: uuid, nullable: true }, role_id: { type: string, format: uuid }, status: { type: string, enum: [invited, active, disabled] } }
+    MembershipCreate:
+      type: object
+      required: [role_id]
+      properties: { user_id: { type: string, format: uuid }, service_account_id: { type: string, format: uuid }, role_id: { type: string, format: uuid } }
+    MembershipPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/Membership' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Rate Limits ----
+    RateLimitPolicy:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string, enum: [organization, project, api_key] }
+        scope_id: { type: string, format: uuid }
+        requests_per_second: { type: integer, nullable: true }
+        requests_per_period: { type: integer, nullable: true }
+        tokens_per_period: { type: integer, nullable: true }
+        period: { type: string, enum: [daily, weekly, monthly, custom] }
+        is_active: { type: boolean }
+    RateLimitPolicyCreate:
+      type: object
+      required: [scope, scope_id]
+      properties:
+        scope: { type: string, enum: [organization, project, api_key] }
+        scope_id: { type: string, format: uuid }
+        requests_per_second: { type: integer, minimum: 0 }
+        requests_per_period: { type: integer, minimum: 0 }
+        tokens_per_period: { type: integer, minimum: 0 }
+        period: { type: string, enum: [daily, weekly, monthly, custom], default: monthly }
+    RateLimitPolicyPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/RateLimitPolicy' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Feature Flags ----
+    FeatureFlag:
+      type: object
+      properties: { id: { type: string, format: uuid }, key: { type: string }, is_enabled: { type: boolean }, rollout: { type: object, additionalProperties: true } }
+    FeatureFlagUpsert:
+      type: object
+      required: [key, is_enabled]
+      properties: { key: { type: string }, is_enabled: { type: boolean }, rollout: { type: object, additionalProperties: true } }
+    FeatureFlagPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/FeatureFlag' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Notifications ----
+    Notification:
+      type: object
+      properties: { id: { type: string, format: uuid }, type: { type: string }, channel: { type: string }, status: { type: string, enum: [pending, sent, failed] }, created_at: { type: string, format: date-time } }
+    NotificationPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/Notification' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Webhooks ----
+    Webhook:
+      type: object
+      properties: { id: { type: string, format: uuid }, url: { type: string, format: uri }, events: { type: array, items: { type: string } }, is_active: { type: boolean }, secret_ref: { type: string, format: uuid, nullable: true } }
+    WebhookCreate:
+      type: object
+      required: [url, events]
+      properties: { url: { type: string, format: uri, pattern: '^https://' }, events: { type: array, items: { type: string } }, secret_ref: { type: string, format: uuid } }
+    WebhookPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/Webhook' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+    WebhookDelivery:
+      type: object
+      properties: { id: { type: string, format: uuid }, event_type: { type: string }, status: { type: string, enum: [pending, delivered, failed, dead_letter] }, attempts: { type: integer }, response_code: { type: integer, nullable: true }, created_at: { type: string, format: date-time } }
+    WebhookDeliveryPage:
+      type: object
+      properties: { data: { type: array, items: { $ref: '#/components/schemas/WebhookDelivery' } }, page: { $ref: '#/components/schemas/PageMeta' } }
+
+    # ---- Health ----
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded, down] }
+        version: { type: string }
+        checks: { type: array, items: { type: object, properties: { name: { type: string }, status: { type: string } } } }
