@@ -141,7 +141,7 @@ healthz ............... {"status":"ok", ...}
 ## 11. Scripts reference
 | Script | Purpose |
 |--------|---------|
-| `scripts/validate.sh` / `.ps1` | Full gate: sync + ruff + format + mypy + import-linter + pytest+coverage |
+| `scripts/validate.sh` / `.ps1` | Full gate: sync + ruff + format + mypy + import-linter + architecture guards + migrations + pytest+coverage. **Both scripts enforce an identical set of checks**, verified by `check_validation_parity.py`, which both of them run. |
 | `scripts/test-all.sh` / `.ps1` | Verbose tests + coverage (HTML); applies migrations if Postgres configured |
 | `scripts/run-dev.sh` / `.ps1` | Migrate + run the API with `--reload` |
 

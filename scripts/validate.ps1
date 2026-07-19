@@ -28,6 +28,10 @@ Write-Host "==> PowerShell encoding guard (ASCII + BOM + CRLF)"
 uv run python ..\scripts\check_powershell_encoding.py ..\scripts
 if ($LASTEXITCODE -ne 0) { throw "PowerShell encoding guard failed." }
 
+Write-Host "==> validation parity guard (validate.sh and validate.ps1 must match)"
+uv run python ..\scripts\check_validation_parity.py ..\scripts
+if ($LASTEXITCODE -ne 0) { throw "Validation scripts have drifted." }
+
 Write-Host "==> RoutingDecision construction guard (only AgentRuntime may build one)"
 uv run python ..\scripts\check_routing_decision_construction.py src\gateway
 if ($LASTEXITCODE -ne 0) { throw "RoutingDecision construction guard failed (ADR-0016 invariant 3)." }
@@ -35,6 +39,10 @@ if ($LASTEXITCODE -ne 0) { throw "RoutingDecision construction guard failed (ADR
 Write-Host "==> Registry construction guard (only the composition root may build one)"
 uv run python ..\scripts\check_registry_construction.py src\gateway
 if ($LASTEXITCODE -ne 0) { throw "Registry construction guard failed (ADR-0016 invariant 2)." }
+
+Write-Host "==> MCP construction guard (only the composition root may build one)"
+uv run python ..\scripts\check_mcp_construction.py src\gateway
+if ($LASTEXITCODE -ne 0) { throw "MCP construction guard failed (ADR-0016 invariant 2)." }
 
 Write-Host "==> migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
 uv run python ..\scripts\check_migration_guardrails.py migrations\sql

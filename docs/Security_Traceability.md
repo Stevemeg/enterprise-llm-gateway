@@ -68,3 +68,8 @@ auditable.
 | Registry implementations mutually independent | ADR-0016 inv. 2 | import-linter (independence) | ✅ `static_manifest` → `in_memory` → BROKEN |
 | Registries constructed only in the composition root | ADR-0016 inv. 2 | `scripts/check_registry_construction.py` (AST), wired into `validate.ps1` | ✅ consumer construction → FAIL |
 | Tool permissions fail closed (missing permission ⇒ denied) | ADR-0016 inv. 2 | `permitted()` requires every declared permission; enforced identically across both backends | ✅ parity + catalog tests |
+| MCP consumers depend on the McpGateway protocol only | ADR-0016 inv. 2 | import-linter | ✅ `mcp_provisioner` → `in_memory_gateway` → BROKEN |
+| MCP adapters never import ToolRegistry implementations | ADR-0016 inv. 2 | import-linter | ✅ `in_memory_gateway` → `in_memory_registry` → BROKEN |
+| MCP gateways constructed only in the composition root | ADR-0016 inv. 2 | `scripts/check_mcp_construction.py` (AST), wired into `validate.ps1` | ✅ consumer construction → exit 1 |
+| Tool permissions are operator-declared, never server-declared | ADR-0016 inv. 2 | `InMemoryMcpGateway` never reads permission metadata from MCP | ✅ `test_required_permissions_come_only_from_deployment_configuration` |
+| MCP invocation fails closed (unknown tool / denied permission) | ADR-0009, ADR-0016 | `McpToolProvisioner` returns `McpResult(ok=False)`; denial does not name the missing permission | ✅ parity tests, both registry backends |

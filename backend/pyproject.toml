@@ -242,3 +242,20 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["cryptography.*"]
 ignore_missing_imports = true
+
+[[tool.importlinter.contracts]]
+# Guard D - MCP consumers depend on the protocol only. A consumer importing a concrete gateway
+# has chosen a transport, which is exactly what the McpGateway seam exists to prevent
+# (ADR-0016 invariant 2, Slice 4).
+name = "MCP consumers depend on the McpGateway protocol only"
+type = "forbidden"
+source_modules = ["gateway.application.tools", "gateway.application.agents"]
+forbidden_modules = ["gateway.adapters.mcp"]
+
+[[tool.importlinter.contracts]]
+# Guard E - an MCP adapter that imports a registry implementation would bind an external protocol
+# to a storage backend, so swapping either would break the other (ADR-0016 invariant 2).
+name = "MCP adapters never import ToolRegistry implementations"
+type = "forbidden"
+source_modules = ["gateway.adapters.mcp"]
+forbidden_modules = ["gateway.adapters.tools"]

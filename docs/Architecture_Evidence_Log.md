@@ -259,3 +259,71 @@ a test proving it denies on known-bad input.
 Both are recorded honestly as **weaker evidence**: their predictions were not written in advance,
 so ✓ reflects hindsight rather than a binding test. Slice 2 has a full record above. Tool Registry
 is the first milestone with a genuine, pre-registered prediction.
+
+## Evidence Record - Phase 4 Slice 4: MCP Gateway
+
+**Classification:** Foundation milestone. **Evidence strength: STRONG** - the prediction was
+registered before any MCP code existed, and MCP is a specification we do not control, so the
+seams could not have been shaped to fit it after the fact.
+
+**Pre-registered prediction.** An external protocol (MCP) can be integrated by implementing the
+existing `McpGateway` and `ToolRegistry` seams without changing either protocol.
+
+**Primary falsification condition.** If implementing MCP requires changing `McpGateway` or
+`ToolRegistry`, Rule 1 is falsified and Rule 5 is triggered.
+
+**Outcome: prediction held. Rule 1 HOLDING. Rule 5 NOT TRIGGERED.**
+`ports/mcp.py` and `ports/tools.py` are byte-identical to their Slice-1 and Slice-3 state. Two
+MCP gateway implementations (`NullMcpGateway`, `InMemoryMcpGateway`) and one consumer
+(`McpToolProvisioner`) were built against them unchanged, and the consumer works identically
+across both registry backends.
+
+### The one condition that came close
+
+The secondary condition *"MCP cannot be represented through existing `ToolDescriptor` semantics"*
+was the only one that required a judgement rather than an observation. MCP describes a tool with
+three fields; `ToolDescriptor` has six. The adapter supplies `version`, `capabilities` and
+`required_permissions` from deployment-local knowledge.
+
+Ruled **NOT TRIGGERED**: the adapter supplied deployment-specific domain metadata rather than
+exposing a protocol deficiency. Recorded explicitly because "the adapter had to invent three of
+six fields" is the kind of fact that should survive in the record even once it is ruled
+non-firing - if a later external protocol forces the same judgement again, the pattern matters
+more than either instance.
+
+### Security finding promoted out of the mapping
+
+`required_permissions` is not a defaulting decision, it is an authorization boundary. Had the
+adapter accepted permission metadata from MCP, a remote server would declare its own
+authorization bar and could lower it to nothing by omitting the field. The adapter therefore
+never reads permission metadata from the server in any spelling, and a test asserts this against
+a deliberately hostile server. This was discovered while writing the mapping documentation, not
+while designing it.
+
+The residual risk is recorded rather than solved: an **unconfigured** MCP tool receives `()`,
+which `permitted()` treats as "no permission required". Deployment safety therefore rests on the
+operator declaring requirements. A default-deny alternative was not adopted because it belongs to
+RBAC, which is out of this slice's frozen scope.
+
+### Enforcement (each violated, observed failing, restored, observed passing)
+
+| Guard | Mechanism | Violation | Observed |
+|---|---|---|---|
+| D | import-linter | consumer imports `InMemoryMcpGateway` | 14 kept / 3 broken |
+| E | import-linter | MCP adapter imports `InMemoryToolRegistry` | 15 kept / 2 broken |
+| F | AST scan | consumer constructs `InMemoryMcpGateway` | exit 1, offender named |
+
+Guard F is the **third** occurrence of import-linter being unable to express a construction
+constraint. Two occurrences were a coincidence; three is a category. Dependency questions and
+construction questions are structurally different, and every future seam should be assumed to
+need both kinds of check unless shown otherwise.
+
+### Finding: the two validation entry points have drifted
+
+`validate.sh` contains none of the Phase-4 guards - not Guard F, and not the RoutingDecision or
+registry guards from Slices 2 and 3 either. Gate 2 runs `validate.ps1`, so enforcement is real on
+the machine that matters, but a guard present in one entry point and absent from the other is
+half-enforced, and the earlier lesson of this project is that a check which cannot fail is worse
+than no check because it reports success. Not fixed here: out of frozen scope. Logged as a
+blocking item for the next slice.
+

@@ -1,52 +1,99 @@
 #!/usr/bin/env bash
-# Gate 2 — full local validation on a real developer machine (Python 3.13 via uv).
-# Mirrors the sandbox gate: format, lint, types, architecture, tests + coverage.
-set -euo pipefail
+# Gate 2 - full local validation on a real developer machine (Python 3.13 via uv).
+#
+# This script and validate.ps1 must enforce an IDENTICAL set of checks. They drifted once:
+# every Phase-4 guard existed only in the .ps1, so the same repo passed validation with three
+# architectural invariants unenforced depending on which shell you happened to use. That is the
+# project's recurring failure mode - a check that reports success while structurally unable to
+# fail - so parity is now itself a checked invariant (check_validation_parity.py, run below).
+#
+# All guards run via `uv run python`, not the system python3: on Git Bash a bare `python3` may
+# not exist, and if it does it is not the interpreter the project targets.
+set -uo pipefail
 cd "$(dirname "$0")/../backend"
 
-echo "==> uv sync (Python 3.13 + deps)"
-uv sync
+fail() { echo ""; echo "FAIL - $1"; exit 1; }
+step() { echo "==> $1"; }
 
-echo "==> ruff check (lint + imports)"
-uv run ruff check .
+step "uv sync (Python 3.13 + deps)"
+uv sync || fail "uv sync failed."
 
-echo "==> ruff format --check"
-uv run ruff format --check .
+step "ruff check (lint + imports)"
+uv run ruff check . || fail "ruff check failed."
 
-echo "==> mypy (strict)"
-uv run mypy src tests
+step "ruff format --check"
+uv run ruff format --check . || fail "ruff format check failed."
 
-echo "==> import-linter (architecture contracts)"
-uv run lint-imports
+step "mypy (strict)"
+uv run mypy src tests || fail "mypy failed."
 
-echo "==> PowerShell encoding guard (ASCII + BOM + CRLF)"
-python3 ../scripts/check_powershell_encoding.py ../scripts
+step "import-linter (architecture contracts)"
+uv run lint-imports || fail "import-linter contracts broken."
 
-echo "==> migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
-python3 ../scripts/check_migration_guardrails.py migrations/sql
+step "PowerShell encoding guard (ASCII + BOM + CRLF)"
+uv run python ../scripts/check_powershell_encoding.py ../scripts || fail "PowerShell encoding guard failed."
 
+step "validation parity guard (validate.sh and validate.ps1 must match)"
+uv run python ../scripts/check_validation_parity.py ../scripts || fail "Validation scripts have drifted."
+
+step "RoutingDecision construction guard (only AgentRuntime may build one)"
+uv run python ../scripts/check_routing_decision_construction.py src/gateway || fail "RoutingDecision construction guard failed (ADR-0016 invariant 3)."
+
+step "Registry construction guard (only the composition root may build one)"
+uv run python ../scripts/check_registry_construction.py src/gateway || fail "Registry construction guard failed (ADR-0016 invariant 2)."
+
+step "MCP construction guard (only the composition root may build one)"
+uv run python ../scripts/check_mcp_construction.py src/gateway || fail "MCP construction guard failed (ADR-0016 invariant 2)."
+
+step "migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
+uv run python ../scripts/check_migration_guardrails.py migrations/sql || fail "Tenant-table RLS guardrail failed (ADR-0002/0014)."
+
+postgres_configured=0
 if [[ "${GATEWAY_DATABASE__URL:-}" == postgresql* ]]; then
+  postgres_configured=1
   # Runtime/DDL split (ADR-0014): migrations run as the OWNER/migrator; the app + tests run
   # as the least-privilege app_rw role (GATEWAY_DATABASE__URL) so RLS is actually enforced.
   OWNER_URL="${GATEWAY_MIGRATION_DATABASE__URL:-${GATEWAY_DATABASE__URL}}"
   if [[ "${OWNER_URL}" == "${GATEWAY_DATABASE__URL}" ]]; then
     echo "   WARNING: GATEWAY_MIGRATION_DATABASE__URL not set; running migrations as the"
-    echo "            runtime role. If it is app_rw this will fail (no DDL privilege) — set"
-    echo "            GATEWAY_MIGRATION_DATABASE__URL to the owner/migrator URL (see .env.example)."
+    echo "            runtime role. If that is app_rw this fails (no DDL privilege)."
+    echo "            Set it to the owner URL - see backend/.env.example."
   fi
 
-  echo "==> alembic upgrade head (as owner/migrator)"
-  GATEWAY_DATABASE__URL="${OWNER_URL}" uv run alembic upgrade head
+  step "alembic upgrade head (as owner/migrator)"
+  GATEWAY_DATABASE__URL="${OWNER_URL}" uv run alembic upgrade head || fail "alembic upgrade failed."
   GATEWAY_DATABASE__URL="${OWNER_URL}" uv run alembic current
 
-  echo "==> Gate: runtime role must be NOSUPERUSER + NOBYPASSRLS (ADR-0014)"
-  uv run python ../scripts/check_runtime_role.py
+  step "Gate: runtime role must be NOSUPERUSER + NOBYPASSRLS (ADR-0014)"
+  uv run python ../scripts/check_runtime_role.py || fail "Bypass-containment gate failed (ADR-0014)."
 else
-  echo "==> No Postgres configured; repo layer validated against SQLite in tests"
+  step "No Postgres configured; repo layer validated against SQLite in tests"
 fi
 
-echo "==> pytest + coverage"
-uv run pytest --cov=src/gateway --cov-report=term-missing
+step "pytest + coverage"
+pytest_output=$(uv run pytest --cov=src/gateway --cov-report=term-missing 2>&1)
+pytest_exit=$?
+echo "${pytest_output}"
+if [[ ${pytest_exit} -ne 0 ]]; then fail "pytest FAILED - validation did NOT pass."; fi
+
+# Three terminal states, because PASS/FAIL alone cannot express "the gate never ran".
+# A run that skips every integration test is not a pass - it is an unexecuted gate, and
+# reporting that as green is how an unverified change ships believing it was validated.
+skipped=0
+if [[ "${pytest_output}" =~ ([0-9]+)\ skipped ]]; then skipped="${BASH_REMATCH[1]}"; fi
 
 echo ""
-echo "✅ ALL LOCAL VALIDATION PASSED"
+if [[ ${postgres_configured} -eq 0 ]]; then
+  echo "INCOMPLETE - Gate 2 did NOT run"
+  echo "  Postgres was not configured, so migrations, the runtime-role check and the"
+  echo "  integration tests never executed (${skipped} skipped)."
+  echo "  Gate 1 passed. Runtime validation is NOT verified."
+  echo "  Set GATEWAY_DATABASE__URL and GATEWAY_MIGRATION_DATABASE__URL, then re-run."
+  exit 2
+fi
+if [[ ${skipped} -ne 0 ]]; then
+  echo "FAIL - Postgres is configured but ${skipped} test(s) were skipped"
+  echo "  With Gate 2 available every test must execute. Investigate the skips."
+  exit 1
+fi
+echo "PASS - ALL LOCAL VALIDATION PASSED (Gate 1 + Gate 2, 0 skipped)"
