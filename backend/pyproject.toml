@@ -259,3 +259,24 @@ name = "MCP adapters never import ToolRegistry implementations"
 type = "forbidden"
 source_modules = ["gateway.adapters.mcp"]
 forbidden_modules = ["gateway.adapters.tools"]
+
+[[tool.importlinter.contracts]]
+# Guard G - RBAC consumers depend on the PermissionResolver port only. A stage importing a
+# concrete resolver has bound enforcement to one authorization source (ADR-0016 invariant 2).
+name = "RBAC consumers depend on the PermissionResolver port only"
+type = "forbidden"
+source_modules = ["gateway.adapters.pipeline", "gateway.application"]
+forbidden_modules = ["gateway.adapters.authorization"]
+
+[[tool.importlinter.contracts]]
+# Guard H - resolvers answer "what may this principal do" and nothing else. A resolver importing
+# the registry, MCP or the pipeline would be making enforcement decisions it cannot explain.
+name = "PermissionResolvers depend on nothing but their port"
+type = "forbidden"
+source_modules = ["gateway.adapters.authorization"]
+forbidden_modules = [
+    "gateway.adapters.tools",
+    "gateway.adapters.mcp",
+    "gateway.adapters.pipeline",
+    "gateway.delivery",
+]

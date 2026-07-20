@@ -45,6 +45,9 @@ uv run python ../scripts/check_registry_construction.py src/gateway || fail "Reg
 step "MCP construction guard (only the composition root may build one)"
 uv run python ../scripts/check_mcp_construction.py src/gateway || fail "MCP construction guard failed (ADR-0016 invariant 2)."
 
+step "Resolver construction guard (only the composition root may build one)"
+uv run python ../scripts/check_resolver_construction.py src/gateway || fail "Resolver construction guard failed (ADR-0016 invariant 2)."
+
 step "migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
 uv run python ../scripts/check_migration_guardrails.py migrations/sql || fail "Tenant-table RLS guardrail failed (ADR-0002/0014)."
 
