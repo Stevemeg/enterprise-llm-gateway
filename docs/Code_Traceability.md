@@ -182,6 +182,10 @@ No members added; no superseding ADR required. Recorded in the evidence log.
 | Phase 4 Slice 1 — AI OS Foundation | Foundation | ✅ Complete | ✅ 189 passed, 0 skipped |
 | Phase 4 Slice 2 — Agent Runtime | Foundation | ✅ Complete | ✅ 206 passed, 0 skipped, 95% |
 | **Phase 4 Slice 3 — Tool Registry** | **Foundation** | **✅ COMPLETE** | **✅ 252 passed, 0 skipped, 95%** |
+| **Phase 4 Slice 4 — MCP Gateway** | **Foundation** | **✅ COMPLETE** | **✅ 272 passed, 0 skipped, 96%** |
+| **Phase 4 Stabilization — validation parity** | Stabilization | **✅ COMPLETE** | **✅ guard sets identical in both scripts** |
+| **Phase 4 Slice 5 — RBAC Foundation** | **Capability** | **✅ COMPLETE** | **✅ 294 passed, 0 skipped, 95%** |
+| **Phase 4 Slice 6 — Routing Engine** | **Capability** | **✅ COMPLETE** | **✅ 307 passed, 0 skipped, 96%** |
 | MCP Gateway | Foundation | ⏳ | — |
 | RBAC | Capability | ⏳ | — |
 
@@ -208,3 +212,45 @@ confined to the composition root (AST scan, `scripts/check_registry_construction
 
 **Known limitation:** Guard C constrains no production code until a composition-root wiring exists;
 its violation proof demonstrates it bites. Recorded in the evidence log.
+
+### Slice 4 — MCP Gateway — ✅ COMPLETE
+
+| Component | Module | Role |
+|---|---|---|
+| MCP server simulation | `adapters/mcp/fake_server.py` | Scriptable stand-in; no networking, auth or retries |
+| MCP gateway | `adapters/mcp/in_memory_gateway.py` | Implements `McpGateway`; maps MCP -> `ToolDescriptor` |
+| First consumer | `application/tools/mcp_provisioner.py` | `discover -> register -> resolve -> invoke -> result` |
+| Guard | `scripts/check_mcp_construction.py` | Only the composition root may construct a gateway |
+
+`required_permissions` is supplied by deployment configuration and **never** read from MCP
+metadata - a remote server must not declare its own authorization bar.
+
+### Slice 5 — RBAC Foundation — ✅ COMPLETE
+
+| Component | Module | Role |
+|---|---|---|
+| Port (RBAC-owned) | `application/ports/authorization.py` | `PermissionResolver`; unknown principal -> empty set |
+| Declaration | `application/authorization/requirements.py` | Producer-owned; `declare()`, `PermissionRequirement` |
+| Enforcement | `adapters/pipeline/authorization_stage.py` | Sole interpreter of RBAC keys in `attributes` |
+| Resolvers | `adapters/authorization/{null,in_memory}_resolver.py` | Rule 4 pair |
+| Guard | `scripts/check_resolver_construction.py` | Only the composition root may construct a resolver |
+
+An undeclared requirement is denied: a route nobody classified is not a public route.
+
+### Slice 6 — Routing Engine — ✅ COMPLETE
+
+Three orchestration layers, one job each:
+
+| Component | Module | Role |
+|---|---|---|
+| Agent orchestrator | `application/agents/runtime.py` | Sequences agents; **sole** `RoutingDecision` author |
+| Routing orchestrator | `application/routing/engine.py` | Supplies candidates, resolves the selection |
+| Pipeline adapter | `adapters/pipeline/routing_stage.py` | Transports the result (refactored to depend on the engine) |
+| Port (capability-owned) | `application/ports/routing.py` | `RoutingEngine`, `RoutingExecution`, `RoutingIntegrityError` |
+| Catalog | `application/routing/catalog.py` | `ProviderCatalog` + `InMemoryProviderCatalog`, tenant-keyed |
+| Composition root | `config/container.py` | Constructs the routing graph; catalog starts empty |
+| Guards | `scripts/check_routing_engine.py` | K: construction confined · L: sole `AgentRuntime` caller |
+
+`RoutingExecution` is limited to `{decision, provider}`; `RoutingDecision` remains the only
+explanation. `RoutingIntegrityError` is an exception, never an explainable outcome.
+

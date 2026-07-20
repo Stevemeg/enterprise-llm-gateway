@@ -13,7 +13,11 @@ from gateway.application.agents.policy import PolicyAgent
 from gateway.application.agents.provider import ProviderAgent
 from gateway.application.agents.runtime import AgentRuntime
 from gateway.application.ports.pipeline import PipelineStage, StageAction, StageContext
+from gateway.application.routing.catalog import InMemoryProviderCatalog, ProviderDescriptor
+from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
 from gateway.domain.routing.models import RoutingDecision, RoutingOutcome
+
+ORG = uuid4()
 
 
 class FixedClock:
@@ -32,13 +36,12 @@ def _stage(*, policy_allow: bool = True) -> AgentRoutingStage:
         ],
         FixedClock(),
     )
-    return AgentRoutingStage(runtime)
+    catalog = InMemoryProviderCatalog({ORG: [ProviderDescriptor(name="openai", model="gpt-4o")]})
+    return AgentRoutingStage(AgentOrchestratedRoutingEngine(catalog, runtime))
 
 
 def _context(**attributes: object) -> StageContext:
-    return StageContext(
-        correlation_id="corr-1", organization_id=uuid4(), attributes=dict(attributes)
-    )
+    return StageContext(correlation_id="corr-1", organization_id=ORG, attributes=dict(attributes))
 
 
 def test_stage_satisfies_the_pipeline_stage_protocol() -> None:
@@ -46,7 +49,7 @@ def test_stage_satisfies_the_pipeline_stage_protocol() -> None:
 
 
 async def test_selection_annotates_the_pipeline_with_the_decision() -> None:
-    result = await _stage().before_request(_context(candidates=("openai",)))
+    result = await _stage().before_request(_context())
 
     assert result.action is StageAction.ANNOTATE
     assert result.blocked is False
@@ -62,7 +65,7 @@ async def test_non_selection_is_transported_not_adjudicated() -> None:
     Deciding what a non-selection means belongs to later stages (Policy, Evaluation), not to the
     seam's first consumer. Downstream therefore needs no special case for a rejected decision.
     """
-    result = await _stage(policy_allow=False).before_request(_context(candidates=("openai",)))
+    result = await _stage(policy_allow=False).before_request(_context())
 
     assert result.action is StageAction.ANNOTATE
     assert result.blocked is False

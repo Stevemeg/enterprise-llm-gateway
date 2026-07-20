@@ -73,3 +73,13 @@ auditable.
 | MCP gateways constructed only in the composition root | ADR-0016 inv. 2 | `scripts/check_mcp_construction.py` (AST), wired into `validate.ps1` | ✅ consumer construction → exit 1 |
 | Tool permissions are operator-declared, never server-declared | ADR-0016 inv. 2 | `InMemoryMcpGateway` never reads permission metadata from MCP | ✅ `test_required_permissions_come_only_from_deployment_configuration` |
 | MCP invocation fails closed (unknown tool / denied permission) | ADR-0009, ADR-0016 | `McpToolProvisioner` returns `McpResult(ok=False)`; denial does not name the missing permission | ✅ parity tests, both registry backends |
+| RBAC denies an undeclared request | ADR-0016 inv. 5 | `AuthorizationStage` blocks when no requirement is declared | ✅ `test_undeclared_requirement_blocks` |
+| RBAC permissions are tenant-scoped | ADR-0002, ADR-0016 | Resolver keyed by `(organization_id, principal_id)` | ✅ `test_known_principal_in_wrong_organization_blocks` |
+| RBAC denial does not name the missing permission | ADR-0009 | Reason is generic; detail goes to audit annotations | ✅ `test_denial_reason_never_names_the_missing_permission` |
+| Permission requirements are declared by the producer, not the enforcer | ADR-0016 inv. 5 | `application/authorization/requirements.py` owns the contract | ✅ `test_declared_requirement_is_what_the_stage_consumes` |
+| Routing decisions remain the sole explanation | ADR-0016 inv. 3 | `RoutingExecution` limited to `{decision, provider}` | ✅ `test_routing_decision_is_the_only_explanation_object` |
+| Routing engine cannot author a decision | ADR-0016 inv. 3 | `scripts/check_routing_decision_construction.py` | ✅ engine construction → exit 1 |
+| Only one application component orchestrates the runtime | ADR-0016 inv. 3 | `scripts/check_routing_engine.py` (Guard L) | ✅ second caller → exit 1 |
+| Provider catalogue is tenant-scoped | ADR-0002 | `InMemoryProviderCatalog` keyed by organization | ✅ `test_another_tenant_sees_an_empty_catalog` |
+| Engine defects cannot masquerade as denials | ADR-0016 inv. 3 | `RoutingIntegrityError` raised, never recorded | ✅ `test_catalog_disagreement_raises_instead_of_faking_a_denial` |
+

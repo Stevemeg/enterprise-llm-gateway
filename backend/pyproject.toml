@@ -280,3 +280,11 @@ forbidden_modules = [
     "gateway.adapters.pipeline",
     "gateway.delivery",
 ]
+
+[[tool.importlinter.contracts]]
+# Guard J - the routing engine is application-layer orchestration. Importing any adapter would
+# let it reach a provider client directly, bypassing the decision record (ADR-0016 invariant 3).
+name = "the routing engine depends on application and domain only"
+type = "forbidden"
+source_modules = ["gateway.application.routing"]
+forbidden_modules = ["gateway.adapters", "gateway.delivery", "gateway.config"]

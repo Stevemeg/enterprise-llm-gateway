@@ -327,3 +327,83 @@ half-enforced, and the earlier lesson of this project is that a check which cann
 than no check because it reports success. Not fixed here: out of frozen scope. Logged as a
 blocking item for the next slice.
 
+## Evidence Record - Phase 4 Slice 6: Routing Engine
+
+**Classification:** Capability milestone. **Evidence strength: STRONG** - the Rule 5 determination
+was stated in full, protocol by protocol, *before any code was written*, and the milestone was
+authorised on that basis. Slightly weaker than Slice 4's written pre-registration in that the
+prediction was recorded in the review thread rather than in this log first; it was nonetheless
+genuinely prior, not reconstructed.
+
+**Pre-registered prediction.** A production Routing Engine can be built by consuming
+`AgentRuntime`, `RoutingDecision`, `PipelineStage` and the published ports, without modifying any
+Tier-1 protocol.
+
+**Falsification condition.** If orchestration required changing `AgentRuntime.decide()`,
+`RoutingDecision`, or any Tier-1 protocol, Rule 1 is falsified and Rule 5 triggered.
+
+**Outcome: prediction held.**
+
+| Item | Result |
+|---|---|
+| Rule 5 | **NOT TRIGGERED** - contracts 19 -> 20, all kept; no Tier-1 file modified |
+| Rule 4 | Satisfied by **real implementation + stub `ProviderCatalog`** (see below) |
+| Validation | **307 passed, 0 skipped, 96% coverage** - Gate 1 + Gate 2 PASS |
+
+Three predictions were checked against the code rather than assumed, before implementing: an empty
+catalog resolves to `NO_CANDIDATE` through the runtime's existing short-circuit logic; ambiguity is
+already expressed by `ProviderAgent` via `confidence`; and an unresolvable selection is
+unreachable, because the runtime can only select from candidates the engine supplied.
+
+### Prior record (superseded framing)
+
+
+Detail of the same milestone, retained in full.
+
+### Finding: Rule 4 could not be satisfied in its usual form, and Invariant 3 is why
+
+Rule 4 asks that a new port be validated by a trivial or null implementation. **This port cannot
+have one.** Any `RoutingEngine` must return a `RoutingExecution`, which carries a
+`RoutingDecision`, and only `AgentRuntime` may construct one (Invariant 3, CI-enforced). A null
+engine would therefore have to fabricate a decision - an unexplained routing outcome, which is
+exactly what the explainability invariant exists to prevent.
+
+Rule 4 was instead satisfied with **one real implementation plus a stub `ProviderCatalog`**: the
+port's substitutability is demonstrated at the collaborator boundary rather than by a degenerate
+engine.
+
+This is the first time two ADR-0016 rules have constrained each other. Invariant 3 correctly won,
+and the useful generalisation is that **Rule 4 is subordinate to Invariant 3 wherever a port's
+return type includes a decision record.** Any future port returning a `RoutingDecision` will hit
+the same wall, and the correct response is a stub collaborator, not a fabricated decision. This is
+recorded rather than resolved by amending ADR-0016, which is frozen (GP-2).
+
+### Supporting decisions
+
+* `RoutingExecution` is limited to `{decision, provider}` - no reason, status or message. A second
+  explanation would eventually disagree with the first; a test asserts the field set.
+* `RoutingIntegrityError` is an exception, never a routing outcome. A catalog that disagrees with
+  the runtime is an engine defect, not a fact about the request, and must not enter the decision
+  record dressed as an explained denial.
+* `AgentRoutingStage` was refactored to depend on `RoutingEngine`, moving orchestration out of a
+  pipeline adapter. Guard L (sole application caller of `AgentRuntime`) exists to stop that
+  refactor silently reverting.
+
+### Enforcement
+
+| Guard | Mechanism | Violation | Observed |
+|---|---|---|---|
+| J | import-linter | engine imports an adapter | 18 kept / 2 broken |
+| K | AST scan | non-root module constructs the engine | exit 1 |
+| L | AST scan | second application caller of `AgentRuntime` | exit 1 |
+| inv. 3 | AST scan | engine constructs a `RoutingDecision` | exit 1 |
+
+**Vacuous evidence:** the "engine must not call provider adapters" guard constrains nothing - no
+provider adapter package exists. It is subsumed by Guard J (which forbids all adapters), so no
+separate contract was added naming a non-existent module. To be re-evaluated when provider
+adapters land.
+
+**No longer vacuous:** Guard K became live in this slice - the composition root now constructs the
+routing engine. The registry, MCP and resolver construction guards remain vacuous pending their
+own wiring.
+

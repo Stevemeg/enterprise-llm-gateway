@@ -16,14 +16,24 @@ from gateway.adapters.audit.logging_sink import LoggingAuthAuditSink
 from gateway.adapters.persistence.engine import create_database_engine, create_session_factory
 from gateway.adapters.persistence.health import DatabaseHealthCheck
 from gateway.adapters.persistence.uow import UnitOfWorkFactory
+from gateway.adapters.pipeline.routing_stage import AgentRoutingStage
 from gateway.adapters.secrets.env_resolver import EnvSecretsResolver
 from gateway.adapters.security.jwt import JwtService
 from gateway.adapters.security.key_provider import KeyProvider
 from gateway.adapters.security.keys import derive_public_pem
 from gateway.adapters.security.oidc_state import StateSigner
 from gateway.adapters.security.token_service import JwtTokenService
+from gateway.application.agents.cost import CostAgent
+from gateway.application.agents.health import HealthAgent
+from gateway.application.agents.planner import PlannerAgent
+from gateway.application.agents.policy import PolicyAgent
+from gateway.application.agents.provider import ProviderAgent
+from gateway.application.agents.runtime import AgentRuntime
 from gateway.application.ports.auth import AuthAuditSink
+from gateway.application.ports.routing import RoutingEngine
 from gateway.application.ports.secrets import SecretNotFoundError, SecretsResolver
+from gateway.application.routing.catalog import InMemoryProviderCatalog
+from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
 from gateway.config.settings import AuthSettings, Settings
 from gateway.delivery.http.ops.health import HealthRegistry
 from gateway.observability.logging import configure_logging, get_logger
@@ -104,6 +114,8 @@ class Container:
     token_service: JwtTokenService
     audit_sink: AuthAuditSink
     state_signer: StateSigner
+    routing_engine: RoutingEngine
+    routing_stage: AgentRoutingStage
 
     @classmethod
     def create(
@@ -141,6 +153,20 @@ class Container:
         # confines any such deployment to a single instance by construction.
         state_signer = StateSigner(_resolve_state_signing_key(auth, secrets))
 
+        # --- routing object graph (ADR-0016 Slice 6) ------------------------------------
+        # The composition root is the only place any of these may be built (Guards K and L).
+        # The catalog starts empty because no provider configuration exists yet: routing then
+        # yields NO_CANDIDATE, which is an explained refusal rather than a crash, and is the
+        # correct behaviour for a gateway with nothing to route to.
+        provider_catalog = InMemoryProviderCatalog()
+        agent_runtime = AgentRuntime(
+            [PlannerAgent(), PolicyAgent(), CostAgent(), HealthAgent(), ProviderAgent()], clock
+        )
+        routing_engine: RoutingEngine = AgentOrchestratedRoutingEngine(
+            provider_catalog, agent_runtime
+        )
+        routing_stage = AgentRoutingStage(routing_engine)
+
         health = HealthRegistry(version=settings.service_version, clock=clock)
         health.register("database", DatabaseHealthCheck(engine))
 
@@ -164,6 +190,8 @@ class Container:
             token_service=token_service,
             audit_sink=audit_sink,
             state_signer=state_signer,
+            routing_engine=routing_engine,
+            routing_stage=routing_stage,
         )
 
     async def dispose(self) -> None:

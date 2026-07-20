@@ -48,6 +48,10 @@ Write-Host "==> Resolver construction guard (only the composition root may build
 uv run python ..\scripts\check_resolver_construction.py src\gateway
 if ($LASTEXITCODE -ne 0) { throw "Resolver construction guard failed (ADR-0016 invariant 2)." }
 
+Write-Host "==> Routing engine guard (construction + sole AgentRuntime caller)"
+uv run python ..\scripts\check_routing_engine.py src\gateway
+if ($LASTEXITCODE -ne 0) { throw "Routing engine guard failed (ADR-0016 invariants 2-3)." }
+
 Write-Host "==> migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
 uv run python ..\scripts\check_migration_guardrails.py migrations\sql
 if ($LASTEXITCODE -ne 0) { throw "Tenant-table RLS guardrail failed (ADR-0002/0014)." }
