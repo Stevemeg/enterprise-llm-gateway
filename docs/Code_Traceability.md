@@ -187,6 +187,7 @@ No members added; no superseding ADR required. Recorded in the evidence log.
 | **Phase 4 Slice 5 — RBAC Foundation** | **Capability** | **✅ COMPLETE** | **✅ 294 passed, 0 skipped, 95%** |
 | **Phase 4 Slice 6 — Routing Engine** | **Capability** | **✅ COMPLETE** | **✅ 307 passed, 0 skipped, 96%** |
 | **Phase 4 Slice 7 — Provider Execution** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 315 passed, 0 skipped, 96% coverage** |
+| **Phase 4 Slice 8 — Usage Metering, Cost Accounting & Budget Enforcement** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 352 passed, 0 skipped, 96% coverage** |
 | MCP Gateway | Foundation | ⏳ | — |
 | RBAC | Capability | ⏳ | — |
 
@@ -284,4 +285,53 @@ import-linter 21 kept / 0 broken.** Alembic at head (`0005_rls_nullif_org_guc`);
 verified `app_rw`, `rolsuper=False`, `rolbypassrls=False`. All Postgres-backed integration and
 security tests (RLS isolation, OIDC state store, database role, default privileges) executed
 against real PostgreSQL 16 + pgvector, none skipped.
+
+### Slice 8 — Usage Metering, Cost Accounting & Budget Enforcement — ✅ COMPLETE
+
+Rule 5 **not triggered against Tier 1** (zero diff on `domain/`, `ports/routing.py`,
+`pipeline.py`, `tools.py`, `mcp.py`, `agents.py`, `application/agents/cost.py`). **Triggered and
+satisfied** against the Slice-7 capability-owned `ProviderResponse`: an additive
+`usage: ProviderUsage | None = None` field, consumed by the new `CostAccountant` — every Slice-7
+construction remains valid unchanged. No migration added; `docs/Schema.sql`'s `budget`,
+`reservation`, `price_table`, `usage_ledger` are documented but not yet migrated, so this slice
+proves the architecture via capability-owned in-memory ports instead, matching every prior
+capability slice's pattern.
+
+| Component | Module | Role |
+|---|---|---|
+| Port (capability-owned) | `application/ports/money.py` | `Money` — `Decimal` + ISO-4217 currency, 8dp/`ROUND_HALF_EVEN` quantization (the project's first established rounding rule) |
+| Port (capability-owned) | `application/ports/pricing.py` | `PricingPort`, `ModelPrice` — input/output price per 1k tokens, global (not tenant-scoped) |
+| Port (capability-owned) | `application/ports/budget.py` | `BudgetPort`, `BudgetSnapshot`, `BudgetUnavailableError`, `UnsupportedCurrencyError` — hard budgets only, no `limit_kind` |
+| Port (widened, Rule 5) | `application/ports/providers.py` | `ProviderUsage` added; `ProviderResponse.usage: ProviderUsage \| None` |
+| Cost orchestrator | `application/accounting/cost_accountant.py` | `CostAccountant`; usage × price → `CostRecord`; raises `MissingUsageError`/`MalformedUsageError`/`UnknownPriceError` (defects, never budget outcomes) |
+| Budget orchestrator | `application/accounting/budget_enforcer.py` | `BudgetEnforcer`; `CostRecord`'s `Money` × `BudgetSnapshot` → `BudgetDecision` (`ALLOWED`/`EXCEEDED`/`UNAVAILABLE`) |
+| Validation implementation (Rule 4) | `adapters/pricing/static_price_table.py` | `StaticPriceTable`; deterministic, seeded at construction, sole implementation |
+| Validation implementation (Rule 4) | `adapters/budget/in_memory_budget_store.py` | `InMemoryBudgetStore`; process-local, idempotent `record()` keyed by `correlation_id`, sole implementation |
+| Composition root | `config/container.py` | Constructs `pricing_port`, `budget_port`, `cost_accountant`, `budget_enforcer` (Guard 1); both adapters start empty |
+| Guard 1 (new) | `scripts/check_accounting_construction.py` | Construction of `StaticPriceTable`/`InMemoryBudgetStore`/`CostAccountant`/`BudgetEnforcer` confined to the composition root |
+| Guard B (new) | `pyproject.toml` import-linter | `gateway.application.providers` forbidden from importing `gateway.application.accounting` |
+| Guard L (reused, unchanged) | `scripts/check_routing_engine.py` | Proven a second time against a file it predates: `AgentRuntime` reference in `cost_accountant.py` caught with zero script changes |
+
+Three of six candidate enforcement properties were evaluated and **deliberately not built**:
+"executor can't import pricing/budget adapters" and "accounting depends on ports not adapters"
+are already redundant with the blanket "application is framework-free and inward-only" contract;
+"pricing/budget adapters mutually independent" is not applicable — exactly one implementation
+exists per port, so an independence contract would have nothing to be independent from. Recorded
+in [Architecture_Evidence_Log.md](Architecture_Evidence_Log.md), not silently skipped.
+
+**Documented limitations (not omissions):** `BudgetPort.snapshot()`/`.record()` are two separate
+awaits — deterministic accounting of already-incurred cost, not atomic concurrency-safe
+enforcement (ADR-0004 explicitly rejects this shape as the sole hot-path mechanism). Idempotency
+is process-local, keyed by `correlation_id` (the only stable per-execution identifier the
+architecture provides today) — prevents double-charging on retry within one process; does not
+survive a restart or coordinate across replicas.
+
+Tests: `test_money.py` (6), `test_cost_accountant.py` (11), `test_budget_enforcer.py` (10),
+`test_in_memory_budget_store.py` (4), plus `test_provider_executor.py` (+2) and
+`test_container.py` (+1) for the widened/wired seams.
+
+**Gate 1 + Gate 2: PASS — 352 passed, 0 skipped, 96% coverage, mypy strict clean (181 files),
+import-linter 22 kept / 0 broken.** Alembic at head (`0005_rls_nullif_org_guc`); runtime role
+verified `app_rw`, `rolsuper=False`, `rolbypassrls=False`. All Postgres-backed integration and
+security tests executed against real PostgreSQL 16 + pgvector, none skipped.
 

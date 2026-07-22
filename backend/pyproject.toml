@@ -300,3 +300,15 @@ modules = [
     "gateway.adapters.providers.in_memory_client",
     "gateway.adapters.providers.fake_client",
 ]
+
+[[tool.importlinter.contracts]]
+# Guard B - ProviderExecutor must not depend on accounting (ADR-0016 Slice 8). Not redundant with
+# "application is framework-free and inward-only": that contract only forbids application ->
+# adapters/frameworks, and says nothing about one application module importing a sibling.
+# Without this, nothing stops a future edit from having the executor compute cost, update a
+# budget, or write a ledger entry itself - exactly the responsibility blur this slice exists to
+# prevent structurally rather than by review.
+name = "provider execution does not depend on accounting"
+type = "forbidden"
+source_modules = ["gateway.application.providers"]
+forbidden_modules = ["gateway.application.accounting"]

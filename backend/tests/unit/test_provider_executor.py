@@ -112,6 +112,29 @@ async def test_in_memory_client_always_succeeds_and_echoes_the_payload() -> None
     assert response.content == {"provider": "openai", "model": "gpt-4o", "echo": {"prompt": "hi"}}
 
 
+async def test_in_memory_client_reports_usage_for_downstream_accounting() -> None:
+    """Slice 8: usage must accompany a successful call, never be fabricated for a failed one."""
+    executor = ProviderExecutor(InMemoryProviderClient())
+    execution = RoutingExecution(
+        decision=_decision(RoutingOutcome.SELECTED, "openai"), provider=OPENAI
+    )
+
+    response = await executor.execute(execution, _request(prompt="hi"))
+
+    assert response.usage is not None
+    assert response.usage.prompt_tokens > 0
+    assert response.usage.total_tokens == (
+        response.usage.prompt_tokens + response.usage.completion_tokens
+    )
+
+
+async def test_fake_client_reports_no_usage_by_default() -> None:
+    """A response with no scripted usage must not silently invent any."""
+    client = FakeProviderClient()
+    response = await client.invoke(OPENAI, _request())
+    assert response.usage is None
+
+
 # ------------------------------------------------------------------ Rule 4: both clients satisfy
 
 

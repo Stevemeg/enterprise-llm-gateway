@@ -13,10 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from gateway.adapters.audit.composite_sink import CompositeAuthAuditSink
 from gateway.adapters.audit.logging_sink import LoggingAuthAuditSink
+from gateway.adapters.budget.in_memory_budget_store import InMemoryBudgetStore
 from gateway.adapters.persistence.engine import create_database_engine, create_session_factory
 from gateway.adapters.persistence.health import DatabaseHealthCheck
 from gateway.adapters.persistence.uow import UnitOfWorkFactory
 from gateway.adapters.pipeline.routing_stage import AgentRoutingStage
+from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.in_memory_client import InMemoryProviderClient
 from gateway.adapters.secrets.env_resolver import EnvSecretsResolver
 from gateway.adapters.security.jwt import JwtService
@@ -24,6 +26,8 @@ from gateway.adapters.security.key_provider import KeyProvider
 from gateway.adapters.security.keys import derive_public_pem
 from gateway.adapters.security.oidc_state import StateSigner
 from gateway.adapters.security.token_service import JwtTokenService
+from gateway.application.accounting.budget_enforcer import BudgetEnforcer
+from gateway.application.accounting.cost_accountant import CostAccountant
 from gateway.application.agents.cost import CostAgent
 from gateway.application.agents.health import HealthAgent
 from gateway.application.agents.planner import PlannerAgent
@@ -31,6 +35,8 @@ from gateway.application.agents.policy import PolicyAgent
 from gateway.application.agents.provider import ProviderAgent
 from gateway.application.agents.runtime import AgentRuntime
 from gateway.application.ports.auth import AuthAuditSink
+from gateway.application.ports.budget import BudgetPort
+from gateway.application.ports.pricing import PricingPort
 from gateway.application.ports.providers import ProviderClient
 from gateway.application.ports.routing import RoutingEngine
 from gateway.application.ports.secrets import SecretNotFoundError, SecretsResolver
@@ -121,6 +127,10 @@ class Container:
     routing_stage: AgentRoutingStage
     provider_client: ProviderClient
     provider_executor: ProviderExecutor
+    pricing_port: PricingPort
+    budget_port: BudgetPort
+    cost_accountant: CostAccountant
+    budget_enforcer: BudgetEnforcer
 
     @classmethod
     def create(
@@ -179,6 +189,16 @@ class Container:
         provider_client: ProviderClient = InMemoryProviderClient()
         provider_executor = ProviderExecutor(provider_client)
 
+        # --- usage/cost accounting object graph (ADR-0016 Slice 8) -----------------------
+        # The composition root is the only place any of these may be built (Guard 1). Both
+        # adapters start empty: no price list and no budgets are configured yet, so accounting
+        # would raise UnknownPriceError and enforcement would allow (unbounded) - the same
+        # "nothing configured yet" posture as the routing catalog above, not a defect.
+        pricing_port: PricingPort = StaticPriceTable()
+        budget_port: BudgetPort = InMemoryBudgetStore()
+        cost_accountant = CostAccountant(pricing_port)
+        budget_enforcer = BudgetEnforcer(budget_port)
+
         health = HealthRegistry(version=settings.service_version, clock=clock)
         health.register("database", DatabaseHealthCheck(engine))
 
@@ -206,6 +226,10 @@ class Container:
             routing_stage=routing_stage,
             provider_client=provider_client,
             provider_executor=provider_executor,
+            pricing_port=pricing_port,
+            budget_port=budget_port,
+            cost_accountant=cost_accountant,
+            budget_enforcer=budget_enforcer,
         )
 
     async def dispose(self) -> None:

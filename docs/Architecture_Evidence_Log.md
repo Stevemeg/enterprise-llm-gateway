@@ -494,3 +494,157 @@ registry/MCP/resolver construction guards, which remain vacuous pending their ow
   redundant guard "to be safe," produced sharper evidence than either silence or duplication
   would have.
 
+## Evidence Record - Phase 4 Slice 8: Usage Metering, Cost Accounting & Budget Enforcement
+
+**Classification:** Capability milestone. **Evidence strength: STRONG** - the falsification
+conditions below, the estimate/actual boundary, the money representation, and which of the six
+candidate guards would be genuinely new vs. redundant vs. vacuous were all determined and stated
+in full before any accounting code was written.
+
+**Pre-registered prediction.** Provider usage can be converted into deterministic monetary cost
+and evaluated against a tenant budget by consuming the existing routing/execution seams and one
+additive, backward-compatible widening of the Slice-7 `ProviderResponse` port, without changing
+any Tier-1 protocol and without `CostAgent`, `ProviderExecutor`, or `RoutingDecision` acquiring any
+monetary responsibility.
+
+**Falsification conditions**
+
+- If accounting required widening `RoutingDecision`, `RoutingExecution`, `PipelineStage`,
+  `BaseAgent`, `ToolRegistry` or `McpGateway`, **Rule 1 was falsified and Rule 5 triggered against
+  Tier 1**.
+- If `ProviderResponse` could not represent provider-reported usage without a change, and that
+  change could not be justified as a capability-owned Rule 5 event (active consumer named, why
+  insufficient, why not in the consumer instead), the milestone would stop.
+- If `ProviderExecutor` ended up computing cost, updating a budget, or writing a ledger entry,
+  the responsibility separation this slice exists to enforce had already failed.
+- If distinguishing a configuration defect (unknown price, malformed usage) from a business
+  outcome (budget exceeded) required conflating them into one return type, that would be recorded
+  as a design defect, not smoothed over.
+
+**Outcome: prediction held on every condition.**
+
+| Item | Result |
+|---|---|
+| Rule 5 against Tier 1 | **NOT TRIGGERED** - zero diff on `domain/`, `application/ports/routing.py`, `pipeline.py`, `tools.py`, `mcp.py`, `agents.py`, and `application/agents/cost.py` (verified by `git diff --stat`, not by inspection alone) |
+| Rule 5 against `ProviderResponse` (capability-owned) | **TRIGGERED and satisfied** - additive `usage: ProviderUsage \| None = None` field; active consumer `CostAccountant`; every Slice-7 construction remains valid unchanged |
+| Rule 4 | Satisfied by one real implementation per new port (`StaticPriceTable`, `InMemoryBudgetStore`) - no null variant for either, for the same reason Slice 6's `RoutingEngine` had none: a fabricated price or budget would misrepresent "unconfigured" as "free" or "unlimited" |
+| Validation | **Gate 1 + Gate 2: 352 passed, 0 skipped, 96% coverage** - full pass, including every Postgres-backed RLS/integration/security test |
+
+### The estimate/actual boundary, held under test
+
+`CostAgent` (routing-time affordability estimate, unchanged) and `CostAccountant` (post-execution
+actual cost) were kept as two different concepts on purpose - the falsification condition was that
+merging them, or having `CostAccountant` mutate `RoutingDecision`, would indicate the boundary
+was never real. Neither occurred: `CostAccountant` never imports `domain.routing.models`, and
+`BudgetEnforcer.evaluate()` runs entirely after `ProviderExecutor.execute()` returns, over data
+`RoutingDecision` never carries.
+
+### Finding: the only new Rule-5 event is additive, and the reasoning generalises from Slice 2
+
+Widening `ProviderResponse` with `usage: ProviderUsage | None = None` is the same shape as
+`PipelineStage` gaining `@runtime_checkable` in Slice 2: a capability-owned seam evolving because
+its first real consumer cannot be built without the change, recorded here rather than requiring a
+new ADR (Rule 2's ADR->protocol->enforcement sequence governs a seam's *birth*, not an existing
+capability-owned seam's evolution under Rule 5). The field being optional and additive is what
+kept every Slice-7 test passing unmodified - a non-optional field would have been a breaking
+change disguised as an addition.
+
+### Finding: not every "obvious" guard was worth building - three of six candidates were redundant or vacuous, and saying so was more useful than padding the count
+
+Six candidate enforcement properties were evaluated before writing any script:
+
+| Candidate | Verdict | Why |
+|---|---|---|
+| ProviderExecutor cannot import pricing/budget/accounting *adapters* | **Redundant** | Already covered by "application is framework-free and inward-only" (forbids all `gateway.application` -> `gateway.adapters`) |
+| Accounting depends on pricing/budget ports, not adapters | **Redundant** | Same blanket contract as above |
+| ProviderExecutor cannot import the accounting *orchestrators* (same layer, different package) | **Genuinely new** | The blanket contract only governs application->adapters; nothing stopped one application module importing a sibling. Built as Guard B |
+| Cost accounting cannot invoke `AgentRuntime`/`RoutingEngine` | **Already enforced, reused** | Guard L's AST scan is unconditional over `src/gateway`, not scoped to Slice-6/7 files; proven by deliberate violation with zero script changes |
+| Cost accounting cannot construct/mutate `RoutingDecision` | **Already enforced by two independent mechanisms** | `check_routing_decision_construction.py` (blanket scan) plus the dataclass's own `frozen=True` (a mutation attempt raises `FrozenInstanceError` regardless of any guard) - not re-proven here since accounting never imports `domain.routing.models` at all |
+| Pricing/budget adapters mutually independent | **Not applicable, not built** | Exactly one implementation exists per port this slice (`StaticPriceTable`, `InMemoryBudgetStore`) - an independence contract needs two to be meaningful, and a second adapter built solely to make a guard non-vacuous would be exactly the speculative generality Rule 5 forbids |
+
+Only Guard 1 (construction confinement, new AST script) and Guard B (import-linter, new) were
+built. Redundant candidates were named and dismissed rather than silently skipped, and the
+not-applicable one is recorded as absent-on-purpose rather than as an oversight to be embarrassed
+about later.
+
+### Enforcement (each violated, observed failing, restored, observed passing)
+
+| Guard | Mechanism | Violation | Observed |
+|---|---|---|---|
+| 1 (new) | AST scan (`check_accounting_construction.py`) | non-root file constructs `StaticPriceTable` | exit 1, offender named; PASS after removal |
+| B (new) | import-linter (forbidden) | `provider_executor.py` imports `cost_accountant.py` | 21 kept / 1 broken (`provider execution does not depend on accounting`); 22/22 after revert |
+| L (reused, unmodified) | AST scan (`check_routing_engine.py`) | `cost_accountant.py` references `AgentRuntime` | exit 1, offender named; PASS after removal - the **second** slice in a row this exact guard has caught a violation in a file that did not exist when it was written |
+
+**No longer vacuous:** Guard 1 is live from construction - the composition root builds
+`StaticPriceTable`, `InMemoryBudgetStore`, `CostAccountant` and `BudgetEnforcer` in the same
+commit that introduces them, both adapters starting empty (no prices, no budgets configured),
+mirroring the "nothing configured yet" posture of the routing catalog and provider client before
+them.
+
+### Design decisions recorded as decisions, not defaults
+
+- **Money is `Decimal` + an explicit 3-letter currency, quantized to 8 decimal places with
+  `ROUND_HALF_EVEN`.** This is the project's *first* established rounding rule - nothing existed
+  to defer to. 8 places mirrors `docs/Schema.sql`'s `numeric(18,8)` columns; half-even was chosen
+  over half-up because repeated half-up rounding inflates a long-run sum, which is precisely the
+  drift this type exists to prevent. Proven, not asserted: `test_decimal_summation_avoids_float_drift`
+  shows `0.1 + 0.1 + 0.1 != 0.3` in float but exact via `Money`, and
+  `test_fractional_token_pricing_accumulates_without_drift` repeats the same shape across three
+  independent `CostAccountant.account()` calls.
+- **Only input/output token pricing exists.** `docs/Schema.sql`'s `price_table` documents nothing
+  beyond per-model input/output rates either; cached-token, image, audio and tool-call pricing are
+  real provider dimensions with zero consumers in this slice (Rule 5) and were not added.
+- **Pricing is global, not tenant-scoped**, despite `price_table.organization_id` existing in the
+  documented schema for future negotiated rates. Nothing in this slice's required test list needs
+  per-tenant pricing, and the tenant-isolation property that actually matters here - spend
+  isolation - is exercised entirely on the budget side instead.
+- **Every budget in this slice is hard-enforced; no `limit_kind` field exists.** `docs/Schema.sql`
+  documents a `soft` variant (FR-067, warn-but-allow); nothing in this slice's failure-semantics
+  list exercises that branch, so no field was added for it to sit unused.
+- **No migration was added.** `docs/Schema.sql` documents `budget`, `reservation`, `price_table`
+  and `usage_ledger`, but none of the five applied Alembic migrations create them - this slice's
+  persistence does not exist in the real database yet. Introducing it now would be exactly the
+  "casual migration" the brief warned against; the capability-owned in-memory ports
+  (`StaticPriceTable`, `InMemoryBudgetStore`) prove the architecture instead, matching every prior
+  capability slice's own-implementation pattern.
+
+### Known limitations, stated rather than concealed
+
+- **Not hard concurrency-safe enforcement.** `BudgetPort.snapshot()` (read) and `.record()`
+  (write) are two separate awaits; nothing serializes them across concurrent callers. ADR-0004
+  explicitly rejected this exact shape ("Option A - post-hoc accounting only") as insufficient for
+  FR-063/RISK-T03, in favor of an atomic Redis Lua reserve/commit that does not exist anywhere in
+  this codebase. This slice provides deterministic accounting of already-incurred cost plus a
+  budget-store failure policy (ADR-0009 row 1: unavailable -> fail closed); it does not provide,
+  and does not claim to provide, atomic concurrent budget enforcement. That remains a
+  database-backed milestone.
+- **Idempotency is process-local and best-effort.** `BudgetPort.record()` takes an
+  `idempotency_key` and the in-memory adapter deduplicates on it, preventing a retried accounting
+  call from double-charging the same execution *within one process*. The key reused is
+  `correlation_id` - the only stable per-execution identifier the current architecture attaches to
+  a request (`InferenceRequest.correlation_id`) - deliberately not a new identifier minted inside
+  the accounting layer, per the instruction to reuse rather than invent execution identity. This
+  does not survive a process restart and does not coordinate across replicas; durable,
+  distributed exactly-once settlement is out of scope and is not simulated.
+- **Tier-2 compatibility reasoning, not fields.** Future Reflection distinguishing attempt-1 cost
+  from attempt-2 cost from final-request cost needs no change to `CostRecord`'s shape: a
+  multi-attempt caller can pass a distinct `correlation_id` per attempt today. No
+  `attempt_number` field was added - there is no active consumer for it yet (Rule 5).
+
+### Decision
+
+**No action.** ADR-0016 stands unchanged. No superseding ADR required.
+
+### Lessons
+
+- **A capability-owned port's Rule 5 evolution can be as disciplined as a Tier-1 one.**
+  `ProviderResponse` widened exactly the way `PipelineStage` did in Slice 2: named consumer, named
+  insufficiency, additive change, zero breakage - proving the discipline isn't special-cased to
+  Tier 1.
+- **Naming a redundant or vacuous guard candidate is evidence, not a gap.** Three of six
+  candidates in this slice were dismissed with a stated reason rather than built reflexively;
+  that record is more useful to the next slice than a guard count padded with overlapping checks.
+- **When a project has no existing convention for something as basic as money, establishing one
+  explicitly - and proving it under the exact failure mode it exists to prevent - is cheaper than
+  discovering the gap during a later slice that assumes one already exists.**
+

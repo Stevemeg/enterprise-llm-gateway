@@ -56,6 +56,10 @@ Write-Host "==> Provider construction guard (only the composition root may build
 uv run python ..\scripts\check_provider_construction.py src\gateway
 if ($LASTEXITCODE -ne 0) { throw "Provider construction guard failed (ADR-0016 Slice 7)." }
 
+Write-Host "==> Accounting construction guard (only the composition root may build one)"
+uv run python ..\scripts\check_accounting_construction.py src\gateway
+if ($LASTEXITCODE -ne 0) { throw "Accounting construction guard failed (ADR-0016 Slice 8)." }
+
 Write-Host "==> migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
 uv run python ..\scripts\check_migration_guardrails.py migrations\sql
 if ($LASTEXITCODE -ne 0) { throw "Tenant-table RLS guardrail failed (ADR-0002/0014)." }
