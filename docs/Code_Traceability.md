@@ -188,6 +188,7 @@ No members added; no superseding ADR required. Recorded in the evidence log.
 | **Phase 4 Slice 6 — Routing Engine** | **Capability** | **✅ COMPLETE** | **✅ 307 passed, 0 skipped, 96%** |
 | **Phase 4 Slice 7 — Provider Execution** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 315 passed, 0 skipped, 96% coverage** |
 | **Phase 4 Slice 8 — Usage Metering, Cost Accounting & Budget Enforcement** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 352 passed, 0 skipped, 96% coverage** |
+| **Phase 4 Slice 9 — Persistent Usage Ledger & Atomic Budget Settlement** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 397 passed, 0 skipped, 96% coverage** |
 | MCP Gateway | Foundation | ⏳ | — |
 | RBAC | Capability | ⏳ | — |
 
@@ -334,4 +335,71 @@ Tests: `test_money.py` (6), `test_cost_accountant.py` (11), `test_budget_enforce
 import-linter 22 kept / 0 broken.** Alembic at head (`0005_rls_nullif_org_guc`); runtime role
 verified `app_rw`, `rolsuper=False`, `rolbypassrls=False`. All Postgres-backed integration and
 security tests executed against real PostgreSQL 16 + pgvector, none skipped.
+
+### Slice 9 — Persistent Usage Ledger & Atomic Budget Settlement — ✅ COMPLETE
+
+Rule 5 **not triggered against Tier 1** (zero diff on `domain/`, `ports/routing.py`,
+`pipeline.py`, `tools.py`, `mcp.py`, `agents.py`, `application/agents/cost.py`,
+`docs/adr/0016-*.md`). Genuine hard-budget enforcement requires reservation *before* provider
+execution — confirmed and represented capability-locally (no Tier-1 change, no Redis): a new
+`BudgetLedgerPort` gates `ProviderExecutor.execute()` via `ReservationService`. New **ADR-0017**
+adopted: PostgreSQL-transactional reserve/commit (a single atomic conditional `UPDATE`) as the
+current, verified mechanism, scoping — not reversing — ADR-0004's Redis Lua decision (that
+rejection was a hot-path performance finding, not a correctness one; this project has no
+load-testing milestone yet). A new migration (`0006_budget_ledger`) was required, but deliberately
+does **not** reuse the pre-existing `budget`/`reservation`/`usage_ledger` tables from
+`0001_initial.sql` — those model unconsumed hierarchical scope and a provider/model catalog FK,
+and type their request identity as a globally-unique `uuid`, incompatible with
+`InferenceRequest.correlation_id`'s tenant-local `str` identity. See ADR-0017 and
+[Architecture_Evidence_Log.md](Architecture_Evidence_Log.md) for the full analysis.
+
+| Component | Module | Role |
+|---|---|---|
+| Port (capability-owned, new) | `application/ports/ledger.py` | `BudgetLedgerPort`, `ReservationOutcome`, `ReservationResult`, `SettlementDetail`, `LedgerUnavailableError`, `UnknownReservationError` |
+| Estimator (new) | `application/accounting/estimator.py` | `estimate_usage()` — deterministic, conservative, character-based pre-call token estimate (no tokenizer exists) |
+| Shared cost math (extracted) | `application/accounting/cost_accountant.py` | `compute_cost()` factored out so `ReservationService`'s estimate and `CostAccountant`'s actual cost round identically (Rule 3) |
+| Reservation orchestrator (new) | `application/accounting/reservation_service.py` | `ReservationService`; sequences `reserve()` → (caller calls `ProviderExecutor.execute()`) → `settle()`/`release()` |
+| Validation implementation (Rule 4, real) | `adapters/ledger/sql_budget_ledger.py` | `SqlBudgetLedger`; atomic conditional `UPDATE ... WHERE ... RETURNING` (reserve), `SELECT ... FOR UPDATE` (settle/release), and a `pg_advisory_xact_lock` keyed on `(organization_id, correlation_id)` (reserve, closes the same-id concurrent-duplicate race) against real PostgreSQL |
+| Validation implementation (Rule 4, fast double) | `adapters/ledger/in_memory_budget_ledger.py` | `InMemoryBudgetLedger`; process-local, documented as NOT proving atomicity |
+| SQLAlchemy Core tables (new) | `adapters/persistence/ledger_tables.py` | `org_budget`, `budget_reservation`, `cost_ledger` |
+| Migration (new) | `migrations/versions/0006_budget_ledger.py` + `sql/0006_budget_ledger.sql` | Creates the three new tables, RLS (ENABLE+FORCE+policy), append-only `REVOKE` on `cost_ledger` |
+| Composition root | `config/container.py` | Constructs `ledger_port` (`SqlBudgetLedger` if `rls_enabled` else `InMemoryBudgetLedger`) and `reservation_service` (Guard 1, extended) |
+| Guard 1 (extended, unmodified logic) | `scripts/check_accounting_construction.py` | `TARGETS`/`IMPLEMENTATIONS` extended with the three new classes — same script, same pattern as Slice 8 |
+| Guard C (new) | `pyproject.toml` import-linter | `SqlBudgetLedger`/`InMemoryBudgetLedger` mutually independent |
+| Guard B (reused, unchanged) | `pyproject.toml` import-linter | `ReservationService` lives under `gateway.application.accounting`, already covered by Slice 8's "provider execution does not depend on accounting" |
+| Migration guardrail (reused, unchanged) | `scripts/check_migration_guardrails.py` | Generic `organization_id`-column detection caught all three new tables with zero script changes |
+
+Of the six candidate enforcement properties evaluated (see Architecture_Evidence_Log.md), four were
+already covered by prior slices' guards with **zero modification** — the strongest guard-reuse
+result of any slice so far. Only the ledger-adapter independence contract (Guard C) and the
+construction-guard extension were genuinely new, and the extension reused Slice 8's exact script.
+
+**Documented limitations (not omissions):** not yet at ADR-0004's original ≤5ms/≥10k-records/s
+hot-path target at full SaaS scale (correctness is proven; that specific NFR is not claimed); no
+reservation-expiry reconciler (a crash between provider execution and settlement holds the
+reservation until the same `correlation_id` is retried — the same deferred obligation ADR-0004
+itself left to a later milestone); pricing remains `StaticPriceTable`, unchanged; project/api_key-
+scoped budgets remain out of scope (no consumer).
+
+Tests: `test_estimator.py` (4), `test_in_memory_budget_ledger.py` (13),
+`test_reservation_service.py` (7), plus `test_container.py` (+2) for the wired seams (unit); 19
+tests in `test_budget_ledger_postgres.py` (integration) covering reservation outcomes,
+idempotency, four independent concurrency proofs against real connections (different-id race,
+N-way race, same-id concurrent-duplicate reservation, concurrent duplicate settlement),
+cross-tenant RLS isolation, monetary precision round-trip at maximum/minimum representable
+amounts, and append-only enforcement by grant.
+
+**Pre-commit architectural review found and fixed two genuine concurrency defects** (see
+Architecture_Evidence_Log.md): `settle()`/`release()` lacked a row lock on the reservation status
+check (two concurrent `settle()` calls for the same `correlation_id` could double-book spend), and
+`reserve()`'s idempotency lookup raced its own atomic budget update for a brand-new
+`correlation_id` (a concurrent duplicate could be wrongly denied as `EXCEEDED`). Fixed with
+`SELECT ... FOR UPDATE` and a `pg_advisory_xact_lock` respectively; both proven by new concurrency
+tests; full validation re-run after each fix.
+
+**Gate 1 + Gate 2: PASS — 397 passed, 0 skipped, 96% coverage, mypy strict clean (192 files),
+import-linter 23 kept / 0 broken.** Alembic at head (`0006_budget_ledger`); runtime role verified
+`app_rw`, `rolsuper=False`, `rolbypassrls=False`. All Postgres-backed integration/security tests,
+including the new concurrency and append-only-enforcement tests, executed against real PostgreSQL
+16 + pgvector, none skipped.
 

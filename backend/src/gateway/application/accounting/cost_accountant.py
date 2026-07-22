@@ -26,11 +26,29 @@ from decimal import Decimal
 from uuid import UUID
 
 from gateway.application.ports.money import Money
-from gateway.application.ports.pricing import PricingPort
+from gateway.application.ports.pricing import ModelPrice, PricingPort
 from gateway.application.ports.providers import ProviderResponse, ProviderUsage
 from gateway.application.routing.catalog import ProviderDescriptor
 
 _PER_THOUSAND = Decimal(1000)
+
+
+def compute_cost(usage: ProviderUsage, price: ModelPrice) -> tuple[Money, Money, Money]:
+    """``usage x price -> (input_cost, output_cost, total_cost)``, quantized once, shared by
+    ``CostAccountant.account`` (actual usage) and ``ReservationService`` (Slice 9, estimated
+    usage) - both must round the same way, or an estimate and its own settlement could
+    disagree about a boundary amount (Rule 3: this is exactly a fact two modules must agree on,
+    silently, if left as duplicated arithmetic)."""
+    input_cost = Money(
+        (Decimal(usage.prompt_tokens) / _PER_THOUSAND) * price.input_price_per_1k,
+        price.currency,
+    ).quantize()
+    output_cost = Money(
+        (Decimal(usage.completion_tokens) / _PER_THOUSAND) * price.output_price_per_1k,
+        price.currency,
+    ).quantize()
+    total_cost = (input_cost + output_cost).quantize()
+    return input_cost, output_cost, total_cost
 
 
 class MissingUsageError(RuntimeError):
@@ -99,15 +117,7 @@ class CostAccountant:
                 f"no price configured for provider={provider.name!r} model={provider.model!r}"
             )
 
-        input_cost = Money(
-            (Decimal(usage.prompt_tokens) / _PER_THOUSAND) * price.input_price_per_1k,
-            price.currency,
-        ).quantize()
-        output_cost = Money(
-            (Decimal(usage.completion_tokens) / _PER_THOUSAND) * price.output_price_per_1k,
-            price.currency,
-        ).quantize()
-        total_cost = (input_cost + output_cost).quantize()
+        input_cost, output_cost, total_cost = compute_cost(usage, price)
 
         return CostRecord(
             organization_id=organization_id,

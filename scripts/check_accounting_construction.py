@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Guard 1 - concrete pricing/budget adapters and the accounting orchestrators may only be
-constructed in the composition root (ADR-0016 Slice 8).
+"""Guard 1 - concrete pricing/budget/ledger adapters and the accounting orchestrators may only be
+constructed in the composition root (ADR-0016 Slice 8, extended Slice 9/ADR-0017).
 
 Same pattern as the provider-execution construction guard (Slice 7) and every construction guard
 before it: import-linter answers *dependency* questions, but the composition root must import
 these legitimately, so the remaining question is *who calls the constructor* - an AST question.
-A component that builds its own pricing table or budget store has chosen its own money, which is
-exactly what these seams exist to prevent.
+A component that builds its own pricing table, budget store, or budget ledger has chosen its own
+money, which is exactly what these seams exist to prevent. Reused unchanged as-a-pattern for
+Slice 9's ledger classes rather than writing a new guard script (nothing about "who may construct
+this" differs from Slice 8's shape).
 
 Usage: python scripts/check_accounting_construction.py [src_dir]
 Exit 0 = construction confined to the composition root; exit 1 = any other site.
@@ -18,13 +20,26 @@ import ast
 import sys
 from pathlib import Path
 
-TARGETS = frozenset({"StaticPriceTable", "InMemoryBudgetStore", "CostAccountant", "BudgetEnforcer"})
+TARGETS = frozenset(
+    {
+        "StaticPriceTable",
+        "InMemoryBudgetStore",
+        "CostAccountant",
+        "BudgetEnforcer",
+        "SqlBudgetLedger",
+        "InMemoryBudgetLedger",
+        "ReservationService",
+    }
+)
 ALLOWED = ("gateway/config/container.py",)
 IMPLEMENTATIONS = (
     "static_price_table.py",
     "in_memory_budget_store.py",
     "cost_accountant.py",
     "budget_enforcer.py",
+    "sql_budget_ledger.py",
+    "in_memory_budget_ledger.py",
+    "reservation_service.py",
 )
 
 

@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from gateway.adapters.audit.composite_sink import CompositeAuthAuditSink
 from gateway.adapters.audit.logging_sink import LoggingAuthAuditSink
 from gateway.adapters.budget.in_memory_budget_store import InMemoryBudgetStore
+from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
+from gateway.adapters.ledger.sql_budget_ledger import SqlBudgetLedger
 from gateway.adapters.persistence.engine import create_database_engine, create_session_factory
 from gateway.adapters.persistence.health import DatabaseHealthCheck
 from gateway.adapters.persistence.uow import UnitOfWorkFactory
@@ -28,6 +30,7 @@ from gateway.adapters.security.oidc_state import StateSigner
 from gateway.adapters.security.token_service import JwtTokenService
 from gateway.application.accounting.budget_enforcer import BudgetEnforcer
 from gateway.application.accounting.cost_accountant import CostAccountant
+from gateway.application.accounting.reservation_service import ReservationService
 from gateway.application.agents.cost import CostAgent
 from gateway.application.agents.health import HealthAgent
 from gateway.application.agents.planner import PlannerAgent
@@ -36,6 +39,7 @@ from gateway.application.agents.provider import ProviderAgent
 from gateway.application.agents.runtime import AgentRuntime
 from gateway.application.ports.auth import AuthAuditSink
 from gateway.application.ports.budget import BudgetPort
+from gateway.application.ports.ledger import BudgetLedgerPort
 from gateway.application.ports.pricing import PricingPort
 from gateway.application.ports.providers import ProviderClient
 from gateway.application.ports.routing import RoutingEngine
@@ -131,6 +135,8 @@ class Container:
     budget_port: BudgetPort
     cost_accountant: CostAccountant
     budget_enforcer: BudgetEnforcer
+    ledger_port: BudgetLedgerPort
+    reservation_service: ReservationService
 
     @classmethod
     def create(
@@ -199,6 +205,17 @@ class Container:
         cost_accountant = CostAccountant(pricing_port)
         budget_enforcer = BudgetEnforcer(budget_port)
 
+        # --- durable budget ledger / reservation object graph (ADR-0017, Slice 9) -------
+        # Real reserve/commit atomicity is a PostgreSQL guarantee (row-level locking inside one
+        # transaction) - SqlBudgetLedger only proves anything against a real Postgres engine. The
+        # in-memory fallback (SQLite/local dev without Postgres) satisfies Rule 4's second
+        # implementation and lets ReservationService be exercised without a database, but does
+        # NOT prove atomicity (see its docstring) - only the Postgres path does.
+        ledger_port: BudgetLedgerPort = (
+            SqlBudgetLedger(uow_factory) if rls_enabled else InMemoryBudgetLedger()
+        )
+        reservation_service = ReservationService(ledger_port, pricing_port, cost_accountant)
+
         health = HealthRegistry(version=settings.service_version, clock=clock)
         health.register("database", DatabaseHealthCheck(engine))
 
@@ -230,6 +247,8 @@ class Container:
             budget_port=budget_port,
             cost_accountant=cost_accountant,
             budget_enforcer=budget_enforcer,
+            ledger_port=ledger_port,
+            reservation_service=reservation_service,
         )
 
     async def dispose(self) -> None:

@@ -312,3 +312,15 @@ name = "provider execution does not depend on accounting"
 type = "forbidden"
 source_modules = ["gateway.application.providers"]
 forbidden_modules = ["gateway.application.accounting"]
+
+[[tool.importlinter.contracts]]
+# Guard C - BudgetLedgerPort implementations are mutually independent (ADR-0016 Slice 9). One
+# importing the other would make the pair a single implementation wearing two names, and the
+# Rule-4 proof (a second backend validates the port with no protocol change) would be comparing
+# a backend against itself - same reasoning as Guard 2 for ProviderClient (Slice 7).
+name = "budget ledger implementations are mutually independent"
+type = "independence"
+modules = [
+    "gateway.adapters.ledger.sql_budget_ledger",
+    "gateway.adapters.ledger.in_memory_budget_ledger",
+]

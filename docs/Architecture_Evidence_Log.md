@@ -648,3 +648,230 @@ them.
   explicitly - and proving it under the exact failure mode it exists to prevent - is cheaper than
   discovering the gap during a later slice that assumes one already exists.**
 
+## Evidence Record - Phase 4 Slice 9: Persistent Usage Ledger & Atomic Budget Settlement
+
+**Classification:** Capability milestone. **Evidence strength: STRONG** - the Rule 5 determination,
+the reservation-vs-settlement analysis, the schema-shape divergence from the Phase-1 illustrative
+tables, and the six-candidate guard evaluation were all determined and stated before any
+persistence code was written.
+
+**Pre-registered prediction.** A tenant-scoped, transactionally safe usage ledger and atomic
+budget settlement can be built entirely as a capability consuming existing seams (`UnitOfWork`,
+RLS binding, `PricingPort`, `CostAccountant`), without widening any Tier-1 protocol, and without
+disguising post-hoc settlement as pre-call hard enforcement.
+
+**Falsification conditions**
+
+- If hard enforcement could be expressed only by widening `RoutingDecision`, `RoutingExecution`,
+  `PipelineStage`, `BaseAgent`, `ToolRegistry` or `McpGateway`, **Rule 5 would be triggered against
+  Tier 1** and the milestone would stop before implementation.
+- If genuine hard-budget enforcement turned out to require reservation *before* provider execution,
+  and the existing architecture could not represent that capability-locally (without Redis or a
+  Tier-1 change), the milestone would stop and report the architectural finding rather than ship a
+  settlement-only mechanism mislabeled as hard enforcement.
+- If the Phase-1 illustrative `budget`/`reservation`/`usage_ledger` tables (already migrated in
+  `0001_initial.sql`, discovered by inspecting actual Alembic state rather than trusting
+  `docs/Schema.sql`) could be reused without fabricating unconsumed catalog/scope data or coercing
+  a non-UUID `correlation_id` into a `uuid NOT NULL` column, they should be reused rather than
+  duplicated.
+- If atomic reservation could not be proven against real PostgreSQL (only asserted, or only proven
+  against an in-memory stand-in), the concurrency claim would not count as evidence.
+
+**Outcome: prediction held; one falsification condition materialized honestly rather than being
+argued around.**
+
+| Item | Result |
+|---|---|
+| Rule 5 against Tier 1 | **NOT TRIGGERED** - zero diff on `domain/`, `application/ports/routing.py`, `pipeline.py`, `tools.py`, `mcp.py`, `agents.py`, `application/agents/cost.py`, and `docs/adr/0016-*.md` (verified by `git diff --stat`) |
+| Reservation-before-execution required for genuine hard enforcement | **Confirmed, and represented capability-locally** - `BudgetLedgerPort.reserve()` gates `ProviderExecutor.execute()`; a rejected reservation means the provider is never called. No Tier-1 change was needed to express it |
+| Phase-1 illustrative tables reusable as-is | **Falsified, honestly reported, new tables built (ADR-0017)** - `budget`/`reservation`/`usage_ledger` (0001_initial.sql) model hierarchical scope, a provider/model catalog FK, and a `uuid NOT NULL request_id` with a *global* `UNIQUE` constraint; none of that is populated or consumed anywhere in this codebase, and `InferenceRequest.correlation_id` is an arbitrary `str`. Reusing them would have meant either fabricating unconsumed data (Rule 5 violation) or an unsafe type coercion. New tables (`org_budget`, `budget_reservation`, `cost_ledger`) model exactly what Slice 8's ports already define |
+| Concurrency proven, not asserted | **Proven against real PostgreSQL** - `test_two_requests_racing_for_the_last_budget_only_one_succeeds` and `test_concurrent_reservations_never_exceed_the_budget_total` use `asyncio.gather` across genuinely separate connections; `InMemoryBudgetLedger` explicitly disclaims this property |
+| Rule 4 | Satisfied by two real implementations (`SqlBudgetLedger`, `InMemoryBudgetLedger`) - the in-memory one proves the port's business semantics without a database but is documented as not proving atomicity, mirroring `InMemoryBudgetStore`'s own disclaimer in Slice 8 |
+| Validation | **Gate 1 + Gate 2: 397 passed, 0 skipped, 96% coverage** (394 on the first pass, before the pre-commit review below found and fixed two concurrency defects and one coverage gap) - full pass, including every Postgres-backed concurrency/RLS/idempotency/precision/append-only test |
+
+### The reservation/settlement boundary, and why settlement-only was rejected
+
+Slice 8's `BudgetEnforcer` runs *after* `ProviderExecutor` already called the provider - honest
+about its own limitation ("there is no call left to block"), but exactly the shape ADR-0004
+rejected as insufficient for FR-063. This slice's falsification condition was direct: can
+reservation happen *before* the call, atomically, without Redis or a Tier-1 change? It can -
+`ReservationService.reserve()` -> only if permitted, `ProviderExecutor.execute()` -> `settle()` or
+`release()`. `BudgetEnforcer`/`BudgetPort`/`InMemoryBudgetStore` (Slice 8) are unchanged and still
+valid for their own purpose (post-hoc classification for a future alerting/reconciliation
+consumer); nothing here deletes them, and nothing here pretends the new path replaces them by
+fiat - it replaces them in practical enforcement value, which is recorded as an honest observation,
+not acted on by deleting still-tested code with no stated mandate to do so.
+
+### Finding: ADR-0004 already decided the mechanism question, and the honest move was a companion ADR, not a quiet reinterpretation
+
+ADR-0004 mandates atomic Redis Lua reserve/commit, explicitly rejecting a single Postgres
+transaction ("Option B") - but reading the rejection closely, it is a **performance** finding
+(hot-path latency/throughput at full SaaS scale), not a **correctness** finding. This project has
+no load-testing milestone yet and no Redis client anywhere in the codebase; building one now, for a
+milestone with no stated throughput requirement, would have been exactly the speculative
+infrastructure Rule 5 warns against one layer below protocols. Per GP-2's spirit (evidenced by
+ADR-0013/14/15: a rule bent quietly is a defect waiting to be found later), this was written up as
+**ADR-0017** rather than silently implementing Postgres-only reservation and calling it done. The
+new ADR is explicit that it scopes, not reverses, ADR-0004: Redis Lua remains the target once a
+load-testing milestone or a concrete latency requirement makes Postgres-only reservation
+insufficient - evidence (GP-1), not a hypothetical.
+
+### Finding: the "obvious" schema reuse was the wrong move, and only inspecting actual migration state (not Schema.sql) revealed it
+
+The initial assumption - reuse `docs/Schema.sql`'s documented `budget`/`reservation`/`usage_ledger`
+- would have been wrong in a way that only surfaced by reading `backend/migrations/sql/0001_initial.sql`
+directly: those tables already exist (migrated, not merely documented), but shaped for a
+capability this project has not built (a provider/model catalog with real rows, project/api_key
+budget hierarchy, period rollover) and keyed by a `uuid` this project's actual identifier
+(`correlation_id: str`) cannot safely populate. Building on the assumption that "the schema already
+exists, just wire it up" would have produced either fabricated catalog rows with no reader (Rule 5
+violation, the same category of finding as Slice 8's `limit_kind`) or a runtime failure the first
+time a non-UUID correlation id was inserted. New, narrower tables were the correct, non-speculative
+answer - not a workaround.
+
+### Finding: not every "obvious" guard was worth building - reuse dominated over new construction
+
+| Candidate | Verdict | Why |
+|---|---|---|
+| `BudgetLedgerPort` implementations mutually independent | **Genuinely new** | Two real implementations now exist (`SqlBudgetLedger`, `InMemoryBudgetLedger`); nothing previously prevented one importing the other. Built as Guard C |
+| Ledger/reservation classes constructed only in the composition root | **Reused, extended** | `check_accounting_construction.py` (Slice 8's Guard 1) is a generic AST scan over a `TARGETS`/`IMPLEMENTATIONS` list - extended with the three new class names rather than writing a second script with identical logic |
+| `ProviderExecutor` must not depend on the ledger/reservation seam | **Already enforced, reused unchanged** | Guard B (`provider execution does not depend on accounting`, Slice 8) forbids `gateway.application.providers` -> `gateway.application.accounting`; `ReservationService` lives under `gateway.application.accounting`, so it is already covered with zero script or contract changes |
+| Tenant isolation on the three new tables | **Already enforced, reused unchanged** | `check_migration_guardrails.py`'s tenant-table detection is generic (any `CREATE TABLE` body containing `organization_id`) - it caught all three new tables with no changes to the guardrail script itself |
+| Reservation/settlement atomicity | **New claim, proof mechanism is the database, not a script** | Nothing to lint here - the property is "does PostgreSQL's own row lock serialize this," provable only by real concurrent connections (`test_budget_ledger_postgres.py`), not by static analysis |
+| Cost ledger append-only enforcement | **New, proven by grant + a failing-write test** | `REVOKE UPDATE, DELETE ON cost_ledger FROM app_rw` (migration 0006), proven by `test_cost_ledger_rejects_update_from_the_runtime_role` attempting the forbidden write and observing `permission denied` |
+
+Only Guard C (import-linter, new) and the extension to the existing Guard 1 AST script were built.
+Every other candidate was already covered by a prior slice's guard with zero modification - the
+strongest reuse result of any slice so far, and recorded as such rather than building parallel
+scripts that would have checked the same thing twice under a different name.
+
+### Enforcement (each violated, observed failing, restored, observed passing)
+
+| Guard | Mechanism | Violation | Observed |
+|---|---|---|---|
+| C (new) | import-linter (independence) | `in_memory_budget_ledger.py` imports `sql_budget_ledger.py` | 22 kept / 1 broken (`budget ledger implementations are mutually independent`); 23/23 after revert |
+| 1 (extended, unmodified script logic) | AST scan (`check_accounting_construction.py`) | `settings.py` constructs `ReservationService` | exit 1, offender named (`gateway/config/settings.py: constructs ReservationService`); PASS after removal |
+
+A third property - genuine atomic concurrency - was proven positively rather than by
+deliberate-violation: `test_concurrent_reservations_never_exceed_the_budget_total` asserts exactly
+5 of 10 concurrent 10-unit reservations succeed against a 50-unit budget, regardless of scheduling
+order. There is no "violate it" step for a database-level guarantee; the falsifiable claim is that
+the count could ever exceed 5, and it did not across the run.
+
+### Design decisions recorded as decisions, not defaults
+
+- **New tables, not the pre-existing `budget`/`reservation`/`usage_ledger`.** See ADR-0017 and the
+  finding above - `org_budget`, `budget_reservation`, `cost_ledger`, scoped to exactly what
+  `BudgetPort`/`PricingPort`/`CostAccountant` (Slice 8) already model.
+- **Idempotency identity is `UNIQUE (organization_id, correlation_id)`, not a bare unique
+  `correlation_id`.** The pre-existing illustrative `reservation.request_id` carries a *global*
+  unique constraint; `correlation_id` is caller-supplied and tenant-local by nature, so a composite
+  key is the correct identity, not an accidental global one (explicitly called out as a required
+  check in the brief, and confirmed by `test_two_tenants_may_independently_reuse_the_same_correlation_id`
+  / `test_rls_prevents_settling_a_reservation_through_the_wrong_tenant`).
+- **The atomic primitive is a single conditional `UPDATE ... WHERE ... RETURNING`, not an explicit
+  `SELECT ... FOR UPDATE`.** PostgreSQL's own `UPDATE` re-evaluates its `WHERE` clause against the
+  latest committed row when unblocked from a lock wait (the "first updater wins, re-check" rule) -
+  the same indivisible read-check-write property ADR-0004 wanted from a Lua script, without a
+  second explicit locking statement.
+- **`settle()` takes a port-local `SettlementDetail`, not the accounting layer's `CostRecord`.** The
+  port must not import a concrete orchestrator's type; `SettlementDetail` restates the same facts
+  so the budget update and the `cost_ledger` insert happen in one transaction (no partial write
+  between "spend booked" and "ledger entry written").
+- **Reservation estimate reuses `CostAccountant`'s own rounding math (`compute_cost`), not a
+  separate formula.** An estimate and its own settlement rounding the same fractional cost
+  differently would be exactly the silent-disagreement Rule 3 exists to prevent.
+- **The estimator is a deliberately conservative, character-based heuristic** (no tokenizer exists
+  in this project) - `completion_tokens` is assumed as large as `prompt_tokens`, more conservative
+  than `InMemoryProviderClient`'s own actual-usage synthesis (half the prompt), so a reservation is
+  expected to exceed the fake client's real usage in tests, not fall short of it.
+
+### Known limitations, stated rather than concealed
+
+- **Not yet at ADR-0004's original hot-path performance target.** A single row-locked `UPDATE` on
+  a hot budget row becomes a serialization point under very high concurrent QPS *against the same
+  organization* - correctness is proven, NFR-P05 (≤5ms)/NFR-S05 (≥10k records/s) at full SaaS scale
+  is not claimed. ADR-0017 records this explicitly and names Redis Lua reserve/commit as the future
+  mechanism once a load-testing milestone provides the evidence (GP-1) that Postgres-only
+  reservation is insufficient.
+- **No reservation-expiry reconciler.** A reservation abandoned mid-flight (process crash between
+  provider execution and settlement) holds its budget reservation until the same `correlation_id`
+  is retried by the caller. ADR-0004 itself deferred a "reconciler" to a later milestone; this
+  narrower mechanism inherits the same deferred obligation rather than fabricating one.
+- **Pricing remains `StaticPriceTable` (Slice 8), unchanged.** This slice did not touch pricing
+  persistence - `price_table` (0001_initial.sql) is not populated or consumed, same posture as
+  Slice 8's own decision not to touch it.
+- **Project/api_key-scoped budgets are still out of scope.** `org_budget` is organization-scoped
+  only, matching `BudgetPort`'s existing shape; no consumer exists for hierarchical scope (Rule 5).
+
+### Pre-commit architectural review found two genuine concurrency defects - both fixed, re-validated
+
+Before committing, ADR-0017 and migration `0006_budget_ledger` were checked line-by-line against
+what the code actually does, per an explicit review request. Two of the eight claims under review
+did not hold as originally implemented; both were data-integrity defects, not style issues, and
+both were fixed rather than argued around.
+
+1. **"Settlement cannot double-charge" was false under true concurrency.** `settle()` and
+   `release()` read `budget_reservation.status` with a plain `SELECT`, then branched on it. Two
+   concurrent `settle()` calls for the *same* `correlation_id` could both read `status="reserved"`
+   before either committed, and both would then apply their own `org_budget` update -
+   `budget_reservation.status` still ended up correctly `"committed"` (looking idempotent), but the
+   monetary side-effect ran twice. **Fix:** both reads now take `SELECT ... FOR UPDATE` on the
+   reservation row, so the second caller blocks until the first commits, then re-reads the
+   now-terminal status and takes the no-op path. This also closes the symmetric `release()`-races-
+   `settle()` case the same review line item implicitly covers ("release cannot incorrectly alter
+   a settled reservation").
+2. **The `(organization_id, correlation_id)` idempotency boundary was incomplete for a true
+   concurrent double-submit of a brand-new id.** `reserve()`'s "already reserved?" lookup and its
+   atomic budget `UPDATE` are two separate statements; two concurrent `reserve()` calls for the
+   same never-before-seen `correlation_id` could both pass the lookup, and the loser's budget
+   `UPDATE` would then evaluate against the winner's *already-committed* reserved amount and
+   correctly-by-its-own-logic-but-wrongly-for-this-case report `EXCEEDED` for what is actually its
+   own already-satisfied duplicate, not a competing request. **Fix:** `reserve()` now opens with a
+   transaction-scoped PostgreSQL advisory lock (`pg_advisory_xact_lock`) keyed on
+   `(organization_id, correlation_id)` - there is no row to lock yet, so a row lock cannot serve
+   this purpose. The second caller blocks until the first fully commits, then correctly finds the
+   existing reservation and replays it idempotently.
+
+Both were caught by adding tests that exercise genuine concurrent duplicate calls with
+`asyncio.gather` (`test_concurrent_settlement_of_the_same_reservation_never_double_charges`,
+`test_concurrent_duplicate_reservation_never_double_holds_budget`) - the original test suite only
+exercised concurrent *different* correlation ids (a true race for scarce budget, which was already
+correct) and *sequential* duplicate retries (already correct via the idempotency lookup); neither
+exercised concurrent *identical* correlation ids, which is exactly where both defects lived. A
+third gap surfaced while re-checking the review's "release cannot incorrectly alter a settled
+reservation" line item against the test suite: the reverse order (`settle()` then `release()`) had
+no test, only `release()` then `settle()`. Added
+`test_release_of_an_already_settled_reservation_is_a_safe_no_op` to close it - the behavior was
+already correct in the implementation, this closed a coverage gap, not a third defect. Full Gate 1
++ Gate 2 was re-run after each change: **397 passed, 0 skipped, 96% coverage** (up from 394,
+reflecting the three new tests), import-linter 23 kept / 0 broken, mypy strict clean.
+
+An initial, more complex fix attempt (catching the `IntegrityError` a concurrent duplicate `INSERT`
+would raise and recovering via a fresh idempotent-replay lookup) was implemented, tested, and then
+deliberately removed once the advisory lock proved sufficient on its own: with the lock in place,
+that recovery path becomes unreachable dead code, and carrying it anyway would have been exactly
+the unnecessary defensive complexity this project's own conventions warn against. One correct
+mechanism was kept in preference to two, one of which was inert.
+
+### Decision
+
+**No action against ADR-0016** (frozen, unchanged). **New ADR-0017 accepted**, scoping (not
+reversing) ADR-0004: PostgreSQL-transactional reserve/commit is the current, verified hard-
+enforcement mechanism; Redis Lua remains the documented future mechanism for when scale evidence
+demands it.
+
+### Lessons
+
+- **Reading actual migration state instead of trusting `docs/Schema.sql` changed the entire design.**
+  The instruction to treat Schema.sql as documentation, not proof, was not a formality - the
+  Phase-1 tables genuinely exist, and reusing them without checking would have produced either
+  fabricated data or a runtime type error, not merely redundant work.
+- **A rejected ADR option can still be correct under a narrower claim than the one it was
+  rejected for.** ADR-0004 rejected Postgres transactions for a *performance* reason; treating that
+  as a blanket correctness rejection would have forced Redis infrastructure with no consumer.
+  Reading *why* a decision was made, not just *that* it was made, was what unlocked this slice.
+- **The strongest guard-reuse result yet came from a slice that added the least new enforcement
+  surface.** Three of five relevant guards required zero new code - a sign the prior slices'
+  contracts were drawn at the right level of generality, not that this slice skipped enforcement.
+
