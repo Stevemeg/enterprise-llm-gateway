@@ -82,4 +82,9 @@ auditable.
 | Only one application component orchestrates the runtime | ADR-0016 inv. 3 | `scripts/check_routing_engine.py` (Guard L) | ✅ second caller → exit 1 |
 | Provider catalogue is tenant-scoped | ADR-0002 | `InMemoryProviderCatalog` keyed by organization | ✅ `test_another_tenant_sees_an_empty_catalog` |
 | Engine defects cannot masquerade as denials | ADR-0016 inv. 3 | `RoutingIntegrityError` raised, never recorded | ✅ `test_catalog_disagreement_raises_instead_of_faking_a_denial` |
+| Provider execution never overrides an unrouted decision | ADR-0016 Slice 7 | `ProviderExecutor.execute()` refuses any `RoutingExecution` where `routed` is `False` before calling the client | ✅ `test_unrouted_execution_is_never_sent_to_the_client`, `test_policy_denial_is_never_sent_to_the_client` |
+| Provider clients constructed only in the composition root | ADR-0016 Slice 7 | `scripts/check_provider_construction.py` (AST), wired into `validate.ps1`/`validate.sh` | ✅ consumer construction → exit 1 |
+| Provider client implementations are mutually independent | ADR-0016 Slice 7 | import-linter (independence) | ✅ `fake_client` → `in_memory_client` → BROKEN |
+| Only the routing engine may reach `AgentRuntime` (extends to provider execution) | ADR-0016 inv. 3, Slice 7 | `scripts/check_routing_engine.py` (Guard L, reused unmodified from Slice 6) | ✅ `AgentRuntime` reference in `provider_executor.py` → exit 1 |
+| Provider failures are data, never exceptions | ADR-0009, ADR-0016 Slice 7 | `ProviderClient.invoke()` returns `ProviderResponse(ok=False, ...)`, mirroring `McpResult` | ✅ `test_provider_failure_is_data_not_an_exception` |
 

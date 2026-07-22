@@ -17,6 +17,7 @@ from gateway.adapters.persistence.engine import create_database_engine, create_s
 from gateway.adapters.persistence.health import DatabaseHealthCheck
 from gateway.adapters.persistence.uow import UnitOfWorkFactory
 from gateway.adapters.pipeline.routing_stage import AgentRoutingStage
+from gateway.adapters.providers.in_memory_client import InMemoryProviderClient
 from gateway.adapters.secrets.env_resolver import EnvSecretsResolver
 from gateway.adapters.security.jwt import JwtService
 from gateway.adapters.security.key_provider import KeyProvider
@@ -30,8 +31,10 @@ from gateway.application.agents.policy import PolicyAgent
 from gateway.application.agents.provider import ProviderAgent
 from gateway.application.agents.runtime import AgentRuntime
 from gateway.application.ports.auth import AuthAuditSink
+from gateway.application.ports.providers import ProviderClient
 from gateway.application.ports.routing import RoutingEngine
 from gateway.application.ports.secrets import SecretNotFoundError, SecretsResolver
+from gateway.application.providers.provider_executor import ProviderExecutor
 from gateway.application.routing.catalog import InMemoryProviderCatalog
 from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
 from gateway.config.settings import AuthSettings, Settings
@@ -116,6 +119,8 @@ class Container:
     state_signer: StateSigner
     routing_engine: RoutingEngine
     routing_stage: AgentRoutingStage
+    provider_client: ProviderClient
+    provider_executor: ProviderExecutor
 
     @classmethod
     def create(
@@ -167,6 +172,13 @@ class Container:
         )
         routing_stage = AgentRoutingStage(routing_engine)
 
+        # --- provider execution object graph (ADR-0016 Slice 7) -------------------------
+        # The composition root is the only place either may be built (Guard 1). No real
+        # provider SDK exists yet (that is provider-abstraction work), so the in-memory client
+        # is the current default - it validates the port, not a production integration.
+        provider_client: ProviderClient = InMemoryProviderClient()
+        provider_executor = ProviderExecutor(provider_client)
+
         health = HealthRegistry(version=settings.service_version, clock=clock)
         health.register("database", DatabaseHealthCheck(engine))
 
@@ -192,6 +204,8 @@ class Container:
             state_signer=state_signer,
             routing_engine=routing_engine,
             routing_stage=routing_stage,
+            provider_client=provider_client,
+            provider_executor=provider_executor,
         )
 
     async def dispose(self) -> None:

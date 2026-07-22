@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from gateway.application.ports.providers import ProviderClient
+from gateway.application.providers.provider_executor import ProviderExecutor
 from gateway.config.container import Container
 from gateway.config.settings import Settings
 from gateway.delivery.http.ops.health import HealthRegistry
@@ -13,6 +15,12 @@ def test_container_wires_singletons(test_settings: Settings) -> None:
     assert container.settings is test_settings
     assert isinstance(container.clock, Clock)
     assert isinstance(container.health, HealthRegistry)
+
+
+def test_container_wires_provider_execution(test_settings: Settings) -> None:
+    container = Container.create(test_settings)
+    assert isinstance(container.provider_client, ProviderClient)
+    assert isinstance(container.provider_executor, ProviderExecutor)
 
 
 def test_health_registry_uses_service_version(test_settings: Settings) -> None:

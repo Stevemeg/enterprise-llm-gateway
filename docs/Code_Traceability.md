@@ -186,6 +186,7 @@ No members added; no superseding ADR required. Recorded in the evidence log.
 | **Phase 4 Stabilization — validation parity** | Stabilization | **✅ COMPLETE** | **✅ guard sets identical in both scripts** |
 | **Phase 4 Slice 5 — RBAC Foundation** | **Capability** | **✅ COMPLETE** | **✅ 294 passed, 0 skipped, 95%** |
 | **Phase 4 Slice 6 — Routing Engine** | **Capability** | **✅ COMPLETE** | **✅ 307 passed, 0 skipped, 96%** |
+| **Phase 4 Slice 7 — Provider Execution** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 315 passed, 0 skipped, 96% coverage** |
 | MCP Gateway | Foundation | ⏳ | — |
 | RBAC | Capability | ⏳ | — |
 
@@ -253,4 +254,34 @@ Three orchestration layers, one job each:
 
 `RoutingExecution` is limited to `{decision, provider}`; `RoutingDecision` remains the only
 explanation. `RoutingIntegrityError` is an exception, never an explainable outcome.
+
+### Slice 7 — Provider Execution — ✅ COMPLETE
+
+Rule 5 **not triggered**: `RoutingDecision` and `RoutingExecution` are unchanged; neither carries
+a request payload. `InferenceRequest` is a new, capability-owned typed object (Rule 3) passed to
+`ProviderExecutor.execute()` alongside — never inside — the `RoutingExecution`.
+
+| Component | Module | Role |
+|---|---|---|
+| Port (capability-owned) | `application/ports/providers.py` | `ProviderClient`, `InferenceRequest`, `ProviderResponse` |
+| Provider orchestrator | `application/providers/provider_executor.py` | `ProviderExecutor`; turns a routed selection into one provider call |
+| Validation implementation 1 (Rule 4) | `adapters/providers/in_memory_client.py` | `InMemoryProviderClient`; deterministic, always succeeds |
+| Validation implementation 2 (Rule 4) | `adapters/providers/fake_client.py` | `FakeProviderClient`; scriptable, exercises failure paths |
+| Composition root | `config/container.py` | Constructs `provider_client` + `provider_executor` (Guard 1) |
+| Guard 1 (new) | `scripts/check_provider_construction.py` | Construction of `InMemoryProviderClient`/`FakeProviderClient`/`ProviderExecutor` confined to the composition root |
+| Guard 2 (new) | `pyproject.toml` import-linter | `in_memory_client` and `fake_client` mutually independent |
+| Guard L (reused, unchanged) | `scripts/check_routing_engine.py` | `AgentRuntime` remains reachable only from the routing engine — proven to also catch `ProviderExecutor` |
+
+`ProviderExecutor` never reaches `AgentRuntime` and never re-decides a routing outcome: an unrouted
+`RoutingExecution` (any outcome but `SELECTED`, or no resolved provider) is refused before the
+client is called — `not_routed: <outcome>` is data, not an exception, matching `McpResult`'s
+fail-as-data convention. All three guards (1, 2, reused L) were proven by deliberate violation and
+restoration before Gate 1 closed. Tests: `test_provider_executor.py` (9), `test_container.py`
+wiring (1).
+
+**Gate 1 + Gate 2: PASS — 315 passed, 0 skipped, 96% coverage, mypy strict clean (167 files),
+import-linter 21 kept / 0 broken.** Alembic at head (`0005_rls_nullif_org_guc`); runtime role
+verified `app_rw`, `rolsuper=False`, `rolbypassrls=False`. All Postgres-backed integration and
+security tests (RLS isolation, OIDC state store, database role, default privileges) executed
+against real PostgreSQL 16 + pgvector, none skipped.
 

@@ -288,3 +288,15 @@ name = "the routing engine depends on application and domain only"
 type = "forbidden"
 source_modules = ["gateway.application.routing"]
 forbidden_modules = ["gateway.adapters", "gateway.delivery", "gateway.config"]
+
+[[tool.importlinter.contracts]]
+# Guard 2 - ProviderClient implementations are mutually independent (ADR-0016 Slice 7). One
+# importing the other would make the pair a single implementation wearing two names, and the
+# Rule-4 proof (a second backend validates the port with no protocol change) would be comparing
+# a backend against itself.
+name = "provider client implementations are mutually independent"
+type = "independence"
+modules = [
+    "gateway.adapters.providers.in_memory_client",
+    "gateway.adapters.providers.fake_client",
+]

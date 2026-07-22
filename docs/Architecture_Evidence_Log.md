@@ -407,3 +407,90 @@ adapters land.
 routing engine. The registry, MCP and resolver construction guards remain vacuous pending their
 own wiring.
 
+## Evidence Record - Phase 4 Slice 7: Provider Execution
+
+**Classification:** Capability milestone. **Evidence strength: STRONG** - the falsification
+condition was stated in full, protocol by protocol, before any provider-execution code was
+written, and the reuse-vs-duplicate decision for Guard L was made explicit in advance rather than
+discovered while coding.
+
+**Pre-registered prediction.** A `ProviderExecutor` can turn a `RoutingExecution` into a provider
+call by consuming the existing `RoutingExecution`/`RoutingDecision` seam and a new
+capability-owned `ProviderClient` port, without modifying `RoutingDecision`, `RoutingExecution`,
+or any Tier-1 protocol - and Guard L, built in Slice 6 to keep `AgentRuntime` reachable only from
+the routing engine, generalises unmodified to a second application-layer module without needing a
+duplicate guard.
+
+**Falsification conditions**
+
+- If executing a provider call required widening `RoutingDecision` or `RoutingExecution` with
+  request payload, **Rule 1 was falsified and Rule 5 triggered**.
+- If `ProviderExecutor` needed its own `AgentRuntime`-reachability guard because Guard L's AST
+  scan (which matches *any* file referencing `AgentRuntime`, not a hardcoded list of Slice-6
+  files) failed to catch a violation in a module Guard L's author never anticipated, **guard
+  reuse across slices does not generalise**.
+- If `ProviderClient` needed a null implementation to be considered proven, **Rule 4's "real
+  implementation" clause was insufficient** and needed a trivial/null exception carved out for it,
+  as already happened once for `RoutingEngine` in Slice 6.
+
+**Outcome: prediction held on every condition.**
+
+| Item | Result |
+|---|---|
+| Rule 5 | **NOT TRIGGERED** - contracts 20 -> 21, all kept; `domain/routing/models.py` and `application/ports/routing.py` byte-unchanged |
+| Guard L reuse | **Confirmed by deliberate violation**: an `AgentRuntime` reference added to `application/providers/provider_executor.py` (a file that did not exist when Guard L was written) was caught immediately - `[L] gateway/application/providers/provider_executor.py: references AgentRuntime; only the routing engine may` - with **zero changes to `check_routing_engine.py`** |
+| Rule 4 | Satisfied by **two real implementations** (`InMemoryProviderClient`, `FakeProviderClient`), no null variant - same resolution pattern as Slice 6's `RoutingEngine`, now observed a second time |
+| Validation | **Gate 1 + Gate 2: 315 passed, 0 skipped, 96% coverage** - full pass, including every Postgres-backed RLS/integration/security test |
+
+### Finding: Guard L generalises across slices without modification - the reuse claim is now evidence, not a design intention
+
+Slice 6 built Guard L to answer one question: is `AgentRuntime` reachable from anywhere but the
+routing engine? The guard is implemented as an AST scan over every `*.py` file under
+`src/gateway`, not as a list of files known at the time it was written. Slice 7 is the first test
+of whether that generality was real or accidental. Adding `application/providers/provider_executor.py`
+- a module Guard L's author could not have named in Slice 6 - and referencing `AgentRuntime`
+inside it caused an immediate, correctly-attributed failure with no guard-script change. This is
+the intended payoff of choosing "who references this name" over "who imports this specific file"
+as the scan's question, and it is now demonstrated rather than assumed.
+
+The decision to **not** write a second guard (e.g. a "Slice-7-specific AgentRuntime guard") was
+made before implementation, not discovered as a simplification afterward - avoiding that
+duplication was itself a falsifiable prediction, and it held.
+
+### Finding: `InferenceRequest` needed to exist as a typed object, not a dict, from the first line
+
+`ProviderExecutor.execute(execution, request)` takes `RoutingExecution` and `InferenceRequest` as
+two separate parameters by design (per the governing decision, before code existed). This is
+Rule 3's trigger test applied prospectively rather than discovered by refactor: `ProviderExecutor`
+and every `ProviderClient` implementation must agree on the request shape, and that agreement
+would drift silently if left as a `dict[str, Any]` convention - exactly the failure Rule 3 exists
+to prevent. `InferenceRequest` was typed in `application/ports/providers.py` alongside the port it
+serves (matching the `McpInvocation`/`McpResult` precedent from Slice 4, not `domain/`, since it
+carries no CI-enforced structural invariant of its own).
+
+### Enforcement (each violated, observed failing, restored, observed passing)
+
+| Guard | Mechanism | Violation | Observed |
+|---|---|---|---|
+| 1 (new) | AST scan (`check_provider_construction.py`) | non-root file constructs `InMemoryProviderClient` | exit 1, offender named; PASS after removal |
+| 2 (new) | import-linter (independence) | `fake_client` imports `in_memory_client` | 20 kept / 1 broken (`provider client implementations are mutually independent`); 21/21 after revert |
+| L (reused, unmodified) | AST scan (`check_routing_engine.py`) | `provider_executor.py` references `AgentRuntime` | exit 1, offender named; PASS after removal |
+
+**No longer vacuous:** Guard 1 is live from construction - the composition root builds both
+`provider_client` and `provider_executor` in the same commit that introduces them, unlike the
+registry/MCP/resolver construction guards, which remain vacuous pending their own wiring.
+
+### Decision
+
+**No action.** ADR-0016 stands unchanged. No superseding ADR required.
+
+### Lessons
+
+- **A guard built to answer "who references X" rather than "who imports file Y" survives the
+  seam's own author being wrong about who will need it later.** This is now demonstrated twice
+  in one direction (Guard L catching a file it predates) rather than assumed from its design.
+- **Deciding not to build a guard is a decision that can itself be falsified.** Stating in advance
+  "Guard L should catch this without changes" and then proving it, rather than writing a
+  redundant guard "to be safe," produced sharper evidence than either silence or duplication
+  would have.
+
