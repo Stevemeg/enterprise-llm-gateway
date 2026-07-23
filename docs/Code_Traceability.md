@@ -191,6 +191,8 @@ No members added; no superseding ADR required. Recorded in the evidence log.
 | **Phase 4 Slice 9 — Persistent Usage Ledger & Atomic Budget Settlement** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 397 passed, 0 skipped, 96% coverage** |
 | **Phase 4 Slice 10 — Semantic-Safe Response Caching & Request Deduplication** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 440 passed, 0 skipped, 96% coverage** |
 | **Phase 4 Slice 11 — Reflection / Retry Layer** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 485 passed, 0 skipped, 97% coverage** |
+| **Phase 4 Slice 12 — Evaluation Pipeline** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 520 passed, 0 skipped, 97% coverage** |
+| **Phase 4 Slice 13 — Policy Engine Foundation** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 546 passed, 0 skipped, 97% coverage** |
 | MCP Gateway | Foundation | ⏳ | — |
 | RBAC | Capability | ⏳ | — |
 
@@ -529,4 +531,119 @@ for, so backoff is asserted exactly (`[100ms, 200ms, 400ms]`) rather than approx
 import-linter 27 kept / 0 broken.** Alembic head unchanged at `0006_budget_ledger` (no migration
 this slice); runtime role verified `app_rw`, `rolsuper=False`, `rolbypassrls=False`. All
 Postgres-backed integration/security tests, including the new ledger regression tests, executed
+against real PostgreSQL 16 + pgvector, none skipped.
+
+### Slice 12 — Evaluation Pipeline — ✅ COMPLETE
+
+Rule 5 **not triggered** — against Tier 1 *or* any capability-owned port. Unlike Slice 11 (which
+had to add `ProviderErrorCategory`), evaluation needed **no new field anywhere**: it reads
+`ExecutionOutcome` and `ProviderResponse.ok/content/usage` exactly as they already exist. Zero diff
+on `domain/`, all Tier-1 ports, `agents/`, `routing/`, ADR-0016. **No migration, no persistence** —
+no consumer needs evaluation history, so none was built (GP-1).
+
+**Evaluation is Tier-2 as ADR-0016 predicted, but deliberately *not* by implementing
+`PipelineStage`.** It is post-hoc, needing the finished result; a stage's `after_response` would
+have to smuggle a rich typed object through the opaque `dict[str, Any]` attributes bag (Rule 3
+violation, and strictly weaker than the typed alternative), and no pipeline runner exists to
+execute stages anyway (Rule 4). The stage seam is untouched — Slice 13 is the capability that
+genuinely consumes it.
+
+| Component | Module | Role |
+|---|---|---|
+| Port (capability-owned, new) | `application/ports/evaluation.py` | `Evaluator`, `EvaluationInput`, `EvaluationResult`, `EvaluationOutcome` (PASSED/FAILED/ERROR/NOT_APPLICABLE) |
+| Evaluator 1 (new) | `application/evaluation/response_completeness.py` | A response reported `ok` must carry content — `content` is `Any` with a `None` default, so an adapter can report success while delivering nothing, which Slice 10 would then cache and Slice 9 settle money against |
+| Evaluator 2 (new) | `application/evaluation/usage_consistency.py` | Executed successes must report usage (else settlement is impossible); cache hits must not (nothing was spent). Observes an existing invariant, in both directions, that nothing else checks |
+| Runner (new) | `application/evaluation/runner.py` | `EvaluationRunner`, `EvaluationReport`; declared-order execution, per-evaluator error isolation |
+| Composition root | `config/container.py` | Constructs `evaluators` + `evaluation_runner` (Guard 1, extended) |
+| Guard (new) | `pyproject.toml` import-linter | `gateway.application.evaluation` forbidden from providers, accounting, ports.ledger, routing.engine, reflection, authorization (`allow_indirect_imports` — only a direct reach-around is a violation) |
+| Guard (new) | `pyproject.toml` import-linter | Evaluator implementations mutually independent |
+| Guard 1 (reused, extended) | `scripts/check_execution_construction.py` | `EvaluationRunner` added — it owns *which* evaluators run; the two pure evaluators are deliberately NOT confined (NOT APPLICABLE: stateless, no configuration authority) |
+| `RoutingDecision` / Guard L (reused, unchanged) | `check_routing_decision_construction.py`, `check_routing_engine.py` | Both proven against `evaluation/runner.py` |
+
+**Result vocabulary is four states because three would lie.** "The evaluator failed" and "the
+evaluated thing failed" are separate operational facts (`evaluation_degraded` vs `target_failed`);
+`NOT_APPLICABLE` exists because both evaluators genuinely need to say "outside what I judge" — a
+budget denial delivered no response to assess, and reporting that as PASSED would inflate quality
+metrics with requests nobody evaluated.
+
+**Documented limitations:** not persisted; not wired into a request path (no inference endpoint
+exists); synchronous only, no background dispatch; no LLM judge (external dependency and
+non-determinism to prove a seam two pure functions already prove); the `EXECUTED + usage=None`
+branch is defence in depth, unreachable through the coordinator because `CostAccountant` rejects
+such a response at settlement first — discovered by a failing test and recorded rather than hidden.
+
+Tests: `test_evaluators.py` (24), `test_evaluation_runner.py` (14), plus `test_container.py` (+3).
+
+**Gate 1 + Gate 2 at Slice-12 completion: PASS — 520 passed, 0 skipped, 97% coverage, mypy strict
+clean (219 files), import-linter 29 kept / 0 broken.** All new modules at 100% line coverage.
+
+### Slice 13 — Policy Engine Foundation — ✅ COMPLETE
+
+Rule 5 **not triggered**. `PolicyStage` implements the Tier-1 `PipelineStage` protocol
+**byte-for-byte unchanged**, consumes only pre-existing `StageContext` fields
+(`organization_id`, `correlation_id`, `attributes["request"]`), and expresses every outcome in the
+existing `StageAction` vocabulary. **This is the cleanest confirmation of ADR-0016's Tier-2
+demotion of Policy Engine.** No migration. **No new ADR** — nothing here contradicts an Accepted
+decision.
+
+**Three-way boundary, settled before code:**
+
+| Component | Question | Owns |
+|---|---|---|
+| RBAC (`AuthorizationStage` + `PermissionResolver`) | *May this **principal** perform this action?* | identity → permissions → declared requirement |
+| `PolicyAgent` (inside `AgentRuntime`) | *Which **providers/regions** is this eligible for?* | routing-time eligibility |
+| **Policy Engine** (this slice) | *Is this **request** permitted at all?* | identity- and provider-independent admissibility |
+
+| Component | Module | Role |
+|---|---|---|
+| Port (capability-owned, new) | `application/ports/policy.py` | `PolicyEnginePort`, `PolicyQuery`, `PolicyVerdict`, `PolicyEffect` (ALLOW/DENY only), `PolicyEngineUnavailableError`, `REQUEST_PAYLOAD_KEY` |
+| Engine (new) | `adapters/policy/local_policy_engine.py` | `LocalPolicyEngine` — deterministic max-request-size policy over a canonical JSON encoding |
+| Stage (new) | `adapters/pipeline/policy_stage.py` | `PolicyStage` — implements `PipelineStage` unchanged, beside `AuthorizationStage` |
+| Composition root | `config/container.py` | Constructs `policy_engine` + `policy_stage` |
+| Guard (new) | `pyproject.toml` import-linter | Policy consumers depend on `PolicyEnginePort` only (Guard G's shape, applied to policy) |
+| Guard (new) | `pyproject.toml` import-linter | `gateway.adapters.policy` forbidden from routing, agents, providers, accounting, ports.ledger, reflection, evaluation, adapters.authorization |
+| Guard G (reused, unchanged) | `pyproject.toml` | Already forbids `adapters.pipeline` → `adapters.authorization`; proven to catch a violation planted in `policy_stage.py`, so no policy-specific duplicate was added |
+| `RoutingDecision` / Guard L (reused, unchanged) | AST scans | Proven against `policy_stage.py` and `local_policy_engine.py` |
+
+**First policy chosen from data that actually exists.** Model-capability, environment and
+data-classification policies were all rejected: no org policy store, no capability catalog and no
+data classification exist, and inventing one to justify the Policy Engine would be exactly the
+speculative infrastructure GP-1 forbids. Maximum request size survives because the payload already
+flows through `StageContext.attributes["request"]` (the convention `AgentRoutingStage` established
+in Slice 6, now named as a declared constant), and Slice 9's estimator already derives reservations
+from payload length — so an unbounded payload is simultaneously a cost problem and an abuse vector,
+rejected before both the budget reservation and the provider call.
+
+**Fail-closed, proven four ways** (not merely documented): engine outage, engine defect (any escaped
+exception), a verdict that is not a `PolicyVerdict` (a remote engine can deserialize into something
+unexpected — "unexpected" must not become "allowed"), and a missing tenant. `PolicyEffect` has no
+`UNAVAILABLE` member deliberately: an engine that could not decide has not produced an effect, and
+modelling "no answer" as a kind of answer is what lets an outage quietly become a verdict.
+
+**Denial and outage both block but stay distinguishable in the audit trail** (`policy_denied` +
+rule + measurements vs `policy_unavailable`) while the **caller sees an identical generic reason** —
+naming the rule or threshold would be a reconnaissance aid, the same reasoning
+`AuthorizationStage` applies to permission names.
+
+**OPA: DEFERRED, explicitly.** No OPA server, no Rego bundle, no distribution mechanism, no
+deployment configuration, no consumer needing externally-authored policy. An adapter built now
+would be a fake integration whose parity tests compare a stub against itself — the same
+evidence-first posture ADR-0017 took toward Redis Lua and ADR-0018 toward the pgvector tier. When a
+real consumer exists it implements `PolicyEnginePort` beside `LocalPolicyEngine` and **the stage
+does not change**.
+
+**Documented limitations:** one policy, one engine (no rule composition, DSL, admin API or policy
+database — none has a consumer); `PolicyStage` is composed and tested but **not wired into a
+request path**, because no pipeline runner exists to execute stages around an inference — like
+`AuthorizationStage` before it, this is the largest outstanding debt across Slices 5–13; no policy
+caching (no performance requirement, and invalidation is not free); policy does not consult
+evaluation results (no consumer, and coupling would collapse two deliberately independent
+capabilities).
+
+Tests: `test_policy_engine.py` (26), plus `test_container.py` (+3).
+
+**Gate 1 + Gate 2 (combined, both slices present): PASS — 546 passed, 0 skipped, 97% coverage,
+mypy strict clean (224 files), import-linter 31 kept / 0 broken.** Alembic head unchanged at
+`0006_budget_ledger` (no migration in either slice); runtime role verified `app_rw`,
+`rolsuper=False`, `rolbypassrls=False`. All Postgres-backed integration/security tests executed
 against real PostgreSQL 16 + pgvector, none skipped.

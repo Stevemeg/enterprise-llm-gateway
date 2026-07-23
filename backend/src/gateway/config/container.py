@@ -21,7 +21,9 @@ from gateway.adapters.ledger.sql_budget_ledger import SqlBudgetLedger
 from gateway.adapters.persistence.engine import create_database_engine, create_session_factory
 from gateway.adapters.persistence.health import DatabaseHealthCheck
 from gateway.adapters.persistence.uow import UnitOfWorkFactory
+from gateway.adapters.pipeline.policy_stage import PolicyStage
 from gateway.adapters.pipeline.routing_stage import AgentRoutingStage
+from gateway.adapters.policy.local_policy_engine import LocalPolicyEngine
 from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.in_memory_client import InMemoryProviderClient
 from gateway.adapters.secrets.env_resolver import EnvSecretsResolver
@@ -39,12 +41,17 @@ from gateway.application.agents.planner import PlannerAgent
 from gateway.application.agents.policy import PolicyAgent
 from gateway.application.agents.provider import ProviderAgent
 from gateway.application.agents.runtime import AgentRuntime
+from gateway.application.evaluation.response_completeness import ResponseCompletenessEvaluator
+from gateway.application.evaluation.runner import EvaluationRunner
+from gateway.application.evaluation.usage_consistency import UsageAccountingConsistencyEvaluator
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import InferenceCoordinator
 from gateway.application.ports.auth import AuthAuditSink
 from gateway.application.ports.budget import BudgetPort
 from gateway.application.ports.cache import ResponseCachePort
+from gateway.application.ports.evaluation import Evaluator
 from gateway.application.ports.ledger import BudgetLedgerPort
+from gateway.application.ports.policy import PolicyEnginePort
 from gateway.application.ports.pricing import PricingPort
 from gateway.application.ports.providers import ProviderClient
 from gateway.application.ports.routing import RoutingEngine
@@ -150,6 +157,10 @@ class Container:
     sleeper: Sleeper
     retry_policy: RetryPolicy
     reflective_executor: ReflectiveExecutor
+    evaluators: tuple[Evaluator, ...]
+    evaluation_runner: EvaluationRunner
+    policy_engine: PolicyEnginePort
+    policy_stage: PolicyStage
 
     @classmethod
     def create(
@@ -251,6 +262,25 @@ class Container:
         retry_policy = RetryPolicy()
         reflective_executor = ReflectiveExecutor(inference_coordinator, retry_policy, sleeper)
 
+        # --- evaluation object graph (ADR-0016 Slice 12) ---------------------------------
+        # Post-hoc observation only: the runner is handed completed outcomes and can reach
+        # nothing else (import-linter, Slice 12). Both evaluators are deterministic and pure -
+        # no LLM judge, no external model, no new data (Rule 5). Declared order is the order
+        # they run in, so reports are byte-identical across runs.
+        evaluators: tuple[Evaluator, ...] = (
+            ResponseCompletenessEvaluator(),
+            UsageAccountingConsistencyEvaluator(),
+        )
+        evaluation_runner = EvaluationRunner(evaluators)
+
+        # --- policy engine object graph (ADR-0016 Slice 13) ------------------------------
+        # PolicyStage implements the Tier-1 PipelineStage seam UNCHANGED - the architectural
+        # hypothesis ADR-0016 made when it demoted Policy Engine to Tier 2. The engine is local
+        # and deterministic; OPA is deliberately deferred (no server, no bundle, no consumer -
+        # see LocalPolicyEngine's docstring), and substituting it later changes only this line.
+        policy_engine: PolicyEnginePort = LocalPolicyEngine()
+        policy_stage = PolicyStage(policy_engine)
+
         health = HealthRegistry(version=settings.service_version, clock=clock)
         health.register("database", DatabaseHealthCheck(engine))
 
@@ -290,6 +320,10 @@ class Container:
             sleeper=sleeper,
             retry_policy=retry_policy,
             reflective_executor=reflective_executor,
+            evaluators=evaluators,
+            evaluation_runner=evaluation_runner,
+            policy_engine=policy_engine,
+            policy_stage=policy_stage,
         )
 
     async def dispose(self) -> None:

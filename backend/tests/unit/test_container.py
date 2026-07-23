@@ -4,14 +4,19 @@ from __future__ import annotations
 
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
+from gateway.adapters.pipeline.policy_stage import PolicyStage
 from gateway.application.accounting.budget_enforcer import BudgetEnforcer
 from gateway.application.accounting.cost_accountant import CostAccountant
 from gateway.application.accounting.reservation_service import ReservationService
+from gateway.application.evaluation.runner import EvaluationRunner
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import InferenceCoordinator
 from gateway.application.ports.budget import BudgetPort
 from gateway.application.ports.cache import ResponseCachePort
+from gateway.application.ports.evaluation import Evaluator
 from gateway.application.ports.ledger import BudgetLedgerPort
+from gateway.application.ports.pipeline import PipelineStage
+from gateway.application.ports.policy import PolicyEnginePort
 from gateway.application.ports.pricing import PricingPort
 from gateway.application.ports.providers import ProviderClient
 from gateway.application.providers.provider_executor import ProviderExecutor
@@ -89,3 +94,51 @@ def test_health_registry_uses_service_version(test_settings: Settings) -> None:
     container = Container.create(test_settings)
     # The registry reports the configured version.
     assert container.settings.service_version == "0.1.0"
+
+
+def test_container_wires_evaluation(test_settings: Settings) -> None:
+    container = Container.create(test_settings)
+    assert isinstance(container.evaluation_runner, EvaluationRunner)
+    assert len(container.evaluators) >= 1
+    assert all(isinstance(e, Evaluator) for e in container.evaluators)
+
+
+def test_wired_evaluators_have_distinct_names(test_settings: Settings) -> None:
+    """Two evaluators sharing a name would make their verdicts indistinguishable in a report."""
+    container = Container.create(test_settings)
+    names = [e.name for e in container.evaluators]
+    assert len(names) == len(set(names))
+
+
+def test_the_runner_runs_exactly_the_wired_evaluators(test_settings: Settings) -> None:
+    container = Container.create(test_settings)
+    assert container.evaluation_runner.evaluators == container.evaluators
+
+
+def test_container_wires_policy(test_settings: Settings) -> None:
+    container = Container.create(test_settings)
+    assert isinstance(container.policy_engine, PolicyEnginePort)
+    assert isinstance(container.policy_stage, PolicyStage)
+
+
+def test_the_wired_policy_stage_is_a_pipeline_stage(test_settings: Settings) -> None:
+    """ADR-0016's Tier-2 hypothesis, checked on the actually-wired object."""
+    container = Container.create(test_settings)
+    assert isinstance(container.policy_stage, PipelineStage)
+
+
+def test_policy_and_evaluation_are_wired_as_separate_capabilities(test_settings: Settings) -> None:
+    """Slices 12 and 13 must remain independent - neither is the other's collaborator.
+
+    Asserted by module provenance rather than object identity: an ``is not`` between two
+    different types is statically vacuous (mypy rejects it as a non-overlapping comparison), so
+    it would pass forever without ever being able to fail.
+    """
+    container = Container.create(test_settings)
+
+    evaluator_modules = {type(e).__module__ for e in container.evaluators}
+    assert evaluator_modules
+    assert all(m.startswith("gateway.application.evaluation") for m in evaluator_modules)
+    assert not any("policy" in m for m in evaluator_modules)
+    assert type(container.policy_engine).__module__.startswith("gateway.adapters.policy")
+    assert type(container.policy_stage).__module__.startswith("gateway.adapters.pipeline")

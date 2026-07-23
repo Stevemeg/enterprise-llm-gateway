@@ -1291,3 +1291,332 @@ field was.
 - **The previous slice's discipline paid its own cost back.** Slice 10's insistence that cache
   identity and deduplication identity are different concepts is precisely what let attempt-scoped
   retry identity be introduced without breaking either.
+
+## Evidence Record - Phase 4 Slice 12: Evaluation Pipeline
+
+**Classification:** Capability milestone. **Evidence strength: STRONG** - the Rule 5 determination,
+the observation boundary, the first-evaluator choice and the no-persistence decision were all
+settled before any evaluation code was written.
+
+**Pre-registered prediction.** Evaluation can be built entirely as a Tier-2 consumer of already
+completed execution outcomes: no Tier-1 protocol change, no capability-owned port change, no new
+field anywhere, and no route by which an evaluator could participate in the request it judges.
+
+**Falsification conditions**
+
+- If evaluation required a new field on `ProviderResponse`, `RoutingDecision`, `RoutingExecution`,
+  `InferenceRequest`, `PipelineStage` or any Tier-1 seam, **Rule 5 would fire** and the slice
+  would stop before implementation.
+- If the only deterministic evaluator worth writing needed data this system cannot observe
+  (latency, structured-output schemas, semantic quality), the slice would have to report that
+  rather than invent the metric.
+- If evaluation could not be prevented *structurally* from routing, executing, budgeting or
+  retrying - only by review - the "evaluation observes" claim would be a convention, not a
+  boundary.
+
+**Outcome: prediction held on every condition.**
+
+| Item | Result |
+|---|---|
+| Rule 5 against Tier 1 | **NOT TRIGGERED** - zero diff on `domain/`, `ports/routing.py`, `pipeline.py`, `tools.py`, `mcp.py`, `agents.py`, `agents/`, `routing/`, ADR-0016 |
+| Rule 5 against any capability-owned port | **NOT TRIGGERED** - unlike Slice 11 (which had to add `ProviderErrorCategory`), evaluation needed no new field at all. It reads `ExecutionOutcome`, `ProviderResponse.ok/content/usage` exactly as they already exist |
+| Is it a `PipelineStage`? | **Deliberately not** - see the finding below. The stage seam is untouched and remains available; Slice 13 is the capability that genuinely consumes it |
+| Persistence | **None built** - no consumer needs evaluation history, so no table, no migration, no RLS work (GP-1: evidence, not anticipation) |
+| Rule 4 | Satisfied by two real, independent evaluators plus the runner as consumer; a third (`ExplodingEvaluator`) exists only as a test double for the `ERROR` path |
+| Validation | **Gate 1 + Gate 2: 520 passed, 0 skipped, 97% coverage** at Slice-12 completion; all new modules at 100% line coverage |
+
+### Finding: evaluation is Tier-2 as ADR-0016 predicted, but *not* by implementing `PipelineStage`
+
+ADR-0016 demoted Evaluation from Tier 1 on the reasoning that it should consume the stable
+interception seam rather than requiring every interface to know evaluation exists. The demotion is
+vindicated - nothing in Tier 1 changed - but the mechanism is not the one the ADR's wording
+implies, and that difference is worth recording rather than glossing:
+
+1. **Evaluation is post-hoc, not interception.** It needs the *finished* result: outcome, response,
+   usage. `PipelineStage.after_response` receives a `StageContext` whose `attributes` is
+   `dict[str, Any]` and is documented as opaque by contract. Passing a rich typed result through an
+   untyped bag would convert a checked contract into a convention - exactly what Rule 3 exists to
+   prevent, and a strictly *worse* guarantee than the typed alternative.
+2. **No pipeline runner exists.** Nothing in this codebase executes a chain of stages around an
+   inference. Implementing `PipelineStage` today would have produced a seam consumed by nothing
+   (Rule 4) - the abstraction would have looked like compliance while enforcing less.
+
+So evaluation consumes typed capability-owned objects instead. The Tier-2 claim (a capability can
+be added without disturbing Tier 1) is confirmed; the assumption that *the way* it happens is
+always "become a stage" is not. Slice 13 exercises the stage route on a capability that genuinely
+intercepts, which is where it fits.
+
+### Finding: the useful first evaluator was one that checks an invariant the money path already assumes
+
+The brief warned against inventing metrics the system cannot observe. Latency is not recorded
+anywhere (`ProviderResponse` carries no timing; `AttemptRecord` carries none); structured-output
+schemas do not exist (`content` is `Any`). Both were rejected on that basis.
+
+What the system *does* have is an unchecked invariant that runs in **opposite directions** depending
+on how a response was produced:
+
+- An **executed** success must carry `ProviderUsage` - `CostAccountant.account()` raises
+  `MissingUsageError` without it and `ReservationService.settle()` cannot convert the reservation
+  into recorded spend. A delivered success with no usage means either unbooked spend or a budget
+  reservation still held.
+- A **cache hit** must carry no usage - Slice 10 sets `usage=None` deliberately, because
+  fabricating consumption for a call that never happened would misrepresent an observation. Usage
+  on a hit would mean the cache had begun inventing consumption, and anything metering it would
+  over-bill.
+
+`UsageAccountingConsistencyEvaluator` observes both directions. Nothing else in the system checks
+either, and it needed no new data to do it. `ResponseCompletenessEvaluator` covers a second real
+defect class: `ProviderResponse.content` is `Any` with a `None` default, so an adapter can report
+success while delivering nothing - and Slice 10 would then cache it and Slice 9 would settle real
+money against it.
+
+**A test discovered the limit of that second evaluator's reach, and it is recorded rather than
+hidden.** The `EXECUTED + ok + usage=None` branch is unreachable *through the coordinator*: an
+attempt to drive it end-to-end failed with `MissingUsageError`, because settlement rejects such a
+response first. The branch is therefore defence in depth - it would catch the same defect if
+settlement were ever made lenient - not a path exercised in today's wiring. The test was rewritten
+to use a genuinely reachable scenario (content-less but settleable) rather than left asserting
+something the architecture already prevents.
+
+### Finding: four result states, because three would lie
+
+The brief required distinguishing "the evaluator failed" from "the evaluated thing failed".
+`NOT_APPLICABLE` is a fourth, and it is not padding: both evaluators need to say "this outcome is
+outside what I judge" (a budget denial delivered no response to assess). Reporting that as `PASSED`
+would inflate quality metrics with requests nobody evaluated; reporting it as `FAILED` would
+double-count one incident in any metric built on both evaluation and `ExecutionOutcome`.
+
+`EvaluationReport` keeps `target_failed` and `evaluation_degraded` as separate properties for the
+same reason - a dashboard that cannot tell "10% of responses are bad" from "10% of evaluations
+crashed" shows the same number for a quality problem and an outage.
+
+### The guard evaluation
+
+| Candidate | Verdict | Why |
+|---|---|---|
+| Evaluation cannot route, execute, budget, retry or authorize | **NEW (one contract, six targets)** | Nothing previously restricted `gateway.application.evaluation`. `allow_indirect_imports = true` is essential: evaluation -> `execution.inference_coordinator` -> accounting/providers is the *intended* path (it must name the types it judges), so only a direct reach-around is a violation |
+| Evaluator implementations mutually independent | **NEW** | Same reasoning as the ProviderClient/BudgetLedgerPort/ResponseCachePort independence contracts. It also underwrites the runner's composition tests: "one evaluator's verdict cannot erase another's" is only meaningful if the two cannot reach each other |
+| `EvaluationRunner` construction confined to composition root | **REUSED, extended** | `check_execution_construction.py` extended rather than duplicated. The runner owns *which* evaluators run - a component building its own would silently evaluate against a different or empty set, and its reports would look exactly as authoritative |
+| The two evaluator classes confined to composition root | **NOT APPLICABLE** | Stateless, pure, no configuration authority. Constructing one elsewhere decides nothing, so guarding it would be symmetry rather than enforcement |
+| Evaluation cannot import adapters | **REDUNDANT** | The blanket "application is framework-free and inward-only" contract already forbids `gateway.application` -> `gateway.adapters` |
+| Evaluation cannot construct `RoutingDecision` / reach `AgentRuntime` | **REUSED, unchanged** | Both are whole-repo AST scans with no per-slice allowlist; proven against `evaluation/runner.py` |
+
+### Enforcement (each violated, mutation verified present, observed failing, restored, observed passing)
+
+| Guard | Violation planted | Observed |
+|---|---|---|
+| Evaluation observes only (new) | `runner.py` imports `application.providers.provider_executor` | 28 kept / 1 broken |
+| Evaluation observes only (new) | ...`application.accounting.cost_accountant` | 28/1 |
+| Evaluation observes only (new) | ...`application.ports.ledger` | 28/1 |
+| Evaluation observes only (new) | ...`application.routing.engine` | 28/1 |
+| Evaluation observes only (new) | ...`application.reflection.retry_policy` | 28/1 |
+| Evaluation observes only (new) | ...`application.authorization.requirements` | 28/1 |
+| Evaluator independence (new) | `usage_consistency.py` imports `response_completeness` | 28 kept / 1 broken |
+| Execution construction (reused, extended) | `routing/engine.py` constructs `EvaluationRunner` | exit 1, offender named |
+| `RoutingDecision` construction (reused) | `runner.py` constructs `RoutingDecision(...)` | exit 1 |
+| Guard L / `AgentRuntime` (reused) | `runner.py` references `AgentRuntime` | exit 1 |
+
+Every mutation was verified present in the file (`grep -c` before running the guard) so no proof
+could pass for the wrong reason - the failure mode this project hit in Slice 11, where a violation
+planted in an exempt file produced a false PASS. **A related hazard surfaced here and is recorded:**
+`git checkout --` cannot restore an *untracked* file, so the first two restore attempts on
+`runner.py` silently left the mutation in place and the second proof ran against a doubly-mutated
+file (`mutation=2`). The file was cleaned programmatically and all guards re-verified green.
+
+### Known limitations, stated rather than concealed
+
+- **Not persisted.** Reports are returned, not stored. When a real consumer needs durable history,
+  the tenant-scoped RLS-forced table it requires should be designed against that consumer's query
+  shape rather than guessed at now.
+- **Not wired into a request path.** Like `ReservationService`, `InferenceCoordinator` and
+  `ReflectiveExecutor` before it, evaluation is composed in the container and proven by tests; no
+  HTTP handler consumes it because no inference endpoint exists yet.
+- **Synchronous only.** No background dispatch, deliberately - the brief warned against
+  background-task races in tests, and no consumer needs asynchrony.
+- **`EXECUTED + usage=None` is defence in depth**, not a live path (see the finding above).
+- **No LLM-judge evaluator**, by instruction and by preference: it would add an external model
+  dependency and non-determinism to prove a seam that two pure functions already prove.
+
+## Evidence Record - Phase 4 Slice 13: Policy Engine Foundation
+
+**Classification:** Capability milestone. **Evidence strength: STRONG** - the Rule 5 determination,
+the three-way RBAC/PolicyAgent/PolicyEngine boundary, the first-policy choice and the OPA deferral
+were all settled before implementation.
+
+**Pre-registered prediction.** Policy can be added as a Tier-2 consumer of the existing
+`PipelineStage` seam, unchanged, reading only `StageContext` fields that already exist - and can be
+prevented structurally from becoming a second authorizer or a second router.
+
+**Falsification conditions**
+
+- If the first policy could not be expressed through `StageAction`'s existing
+  CONTINUE/ANNOTATE/BLOCK vocabulary, or required new `StageContext` fields, **Rule 5 would fire**
+  against Tier 1 and the slice would stop.
+- If the only policy worth writing required data that does not exist (data classification, org
+  policy flags, model capability catalog), the slice would have to report that rather than invent
+  a classification system to justify itself.
+- If policy-engine outage could not be made to fail closed *and* remain distinguishable from an
+  ordinary denial, the security semantics would be unacceptable.
+
+**Outcome: prediction held. This is the cleanest Tier-2 confirmation of the two slices** - policy
+is exactly the shape ADR-0016 anticipated, and `PolicyStage` implements `PipelineStage` byte-for-byte
+unchanged.
+
+| Item | Result |
+|---|---|
+| Rule 5 against Tier 1 | **NOT TRIGGERED** - `PipelineStage`, `StageContext`, `StageResult`, `StageAction` all unchanged; zero diff across `domain/`, all Tier-1 ports, `agents/`, `routing/`, ADR-0016 |
+| `StageContext` fields consumed | `organization_id`, `correlation_id`, `attributes["request"]` - all pre-existing. The payload key is the convention `AgentRoutingStage` established in Slice 6, now named as a declared constant instead of a second magic string |
+| Speculative additions | **None.** No `principal_id` on `PolicyQuery` (the first policy is identity-independent and RBAC owns identity), no provider/model (PolicyAgent owns eligibility), no evaluation results (no consumer) |
+| OPA | **Deferred, explicitly** - see below |
+| Fail-closed | Proven three ways, not merely documented |
+| Validation | **Gate 1 + Gate 2 (combined, both slices): 546 passed, 0 skipped, 97% coverage** |
+
+### The three-way boundary, stated before code
+
+Three things in this system now sound like "policy". They answer different questions, and the
+whole risk of this slice was letting them blur:
+
+| Component | Question | Owns |
+|---|---|---|
+| RBAC - `AuthorizationStage` + `PermissionResolver` (Slice 5) | *May this **principal** perform this action?* | identity -> permission set -> declared requirement |
+| `PolicyAgent` inside `AgentRuntime` (Slice 2/6) | *Which **providers/regions** is this request eligible for?* | routing-time eligibility, contributed into `RoutingDecision` |
+| **Policy Engine** (this slice) | *Is this **request** permitted by deployment policy at all?* | identity-independent, provider-independent request admissibility |
+
+The first policy - a maximum request size - sits unambiguously in the third bucket: it is not about
+who is asking and not about which provider would serve it. Overlap is prevented structurally, not
+by intent: the policy engine cannot import `adapters.authorization` (so it cannot resolve
+permissions), cannot import `application.routing` or `application.agents` (so it cannot route or
+reach `AgentRuntime`), and the stage cannot import a concrete engine (so policy source stays
+swappable). Every one of those was proven by deliberate violation.
+
+### Finding: the first policy had to be chosen from data that actually exists
+
+Model-capability restrictions, environment restrictions and data-classification rules were all
+considered and rejected: no org policy store, no model capability catalog and no data
+classification exist anywhere in this repository, and inventing one to justify the Policy Engine
+would have been the exact speculative-infrastructure failure GP-1 forbids.
+
+Maximum request size survives because every input it needs already flows: the payload is in
+`StageContext.attributes["request"]`, and Slice 9's estimator already derives budget reservations
+from payload length - which means an unbounded payload is simultaneously a cost problem and an
+abuse vector. Rejecting it in `before_request` costs nothing, since it happens before both the
+budget reservation and the provider call.
+
+An unmeasurable payload (one that cannot be canonically JSON-encoded) is **denied**, not waved
+through: a limit that cannot be measured has not been satisfied, and the alternative would let an
+oversized payload bypass the control by being malformed enough to defeat the check.
+
+### Finding: outage must block *and* stay distinguishable from denial
+
+`PolicyEffect` has exactly two members, ALLOW and DENY. There is deliberately no `UNAVAILABLE`
+effect: an engine that could not decide has not produced an effect, and modelling "no answer" as a
+kind of answer is precisely what lets an outage quietly become a verdict. Unavailability is an
+exception (`PolicyEngineUnavailableError`), matching `LedgerUnavailableError` and
+`BudgetUnavailableError`.
+
+The stage fails closed three ways - outage, engine defect (any escaped exception), and a verdict
+that is not a `PolicyVerdict` (a remote engine can deserialize into something unexpected, and
+"unexpected" must not resolve to "allowed") - plus a fourth for a missing tenant, since
+organization policy cannot be applied without an organization.
+
+Both denial and outage block, and the **caller cannot tell them apart** (identical generic reason);
+the **audit annotations can** (`policy_denied` + rule + measurements vs. `policy_unavailable`).
+`test_an_outage_is_distinguishable_from_a_denial_in_the_audit_trail` pins both halves. Without the
+split, a policy outage and a spike in legitimate denials would look identical on exactly the
+dashboard an operator would use to tell them apart.
+
+Caller reason never names the rule or the threshold, mirroring `AuthorizationStage`'s refusal to
+name the missing permission: telling a caller precisely which control stopped them and where its
+limit sits is a reconnaissance aid.
+
+### OPA decision: DEFERRED
+
+There is no OPA server, no Rego bundle, no bundle-distribution mechanism, no deployment
+configuration for one, and no consumer that needs policy authored outside this process. An OPA
+adapter built now would be a fake integration - an interface shaped like a remote engine with
+nothing behind it - and its parity tests would compare a stub against itself.
+
+This is the same evidence-first posture ADR-0017 took toward Redis Lua and ADR-0018 toward the
+pgvector semantic tier, applied a third time. It is a decision, not an omission: when a real
+policy-distribution consumer exists, it implements `PolicyEnginePort` beside `LocalPolicyEngine`
+and **the stage does not change** - that substitutability is the entire reason the port exists, and
+is what makes deferring OPA safe rather than merely convenient. **No ADR was written**, because
+nothing here contradicts an existing Accepted decision; ADR-0016 already names OPA as the eventual
+mechanism and this slice does not reverse that.
+
+### The guard evaluation
+
+| Candidate | Verdict | Why |
+|---|---|---|
+| Policy consumers depend on the port only | **NEW** | Exactly Guard G's shape for RBAC. A stage importing a concrete engine binds enforcement to one policy source - which would also make deferring OPA meaningless, since substituting it is the port's whole purpose |
+| Policy engines decide policy only (8 targets) | **NEW** | Nothing previously restricted `gateway.adapters.policy`. Each forbidden target is one claim: no routing, no `AgentRuntime`, no provider invocation, no cost authorship, no budget, no retry, no permission resolution, no dependency on Slice 12 |
+| Policy stage cannot import authorization resolvers | **REUSED, unchanged** | Guard G (Slice 5) already forbids `adapters.pipeline` -> `adapters.authorization`, and was proven to catch a violation planted in `policy_stage.py`. Adding a policy-specific duplicate would have inflated the count without enforcing anything new |
+| Policy cannot construct `RoutingDecision` / reach `AgentRuntime` | **REUSED, unchanged** | Both whole-repo AST scans; proven against `policy_stage.py` and `local_policy_engine.py` respectively |
+| Policy adapter implementations mutually independent | **NOT APPLICABLE** | Exactly one implementation exists. An independence contract needs two modules to be independent *of*; writing one now would name a module that does not exist |
+| Policy construction confined to composition root | **REDUNDANT** | `check_resolver_construction.py` and the blanket adapter contracts already confine adapter construction, and `LocalPolicyEngine` holds no shared state or deployment-wide authority the way `RequestDeduplicator`/`RetryPolicy` do |
+
+### Enforcement (each violated, mutation verified present, observed failing, restored, observed passing)
+
+| Guard | Violation planted | Observed |
+|---|---|---|
+| Policy consumers depend on the port only (new) | `policy_stage.py` imports `adapters.policy.local_policy_engine` | 30 kept / 1 broken |
+| Policy engines decide policy only (new) | `local_policy_engine.py` imports `application.routing.engine` | 30/1 |
+| ...same | ...`application.agents.runtime` | 30/1 |
+| ...same | ...`application.providers.provider_executor` | 30/1 |
+| ...same | ...`application.accounting.cost_accountant` | 30/1 |
+| ...same | ...`application.ports.ledger` | 30/1 |
+| ...same | ...`application.reflection.retry_policy` | 30/1 |
+| ...same | ...`application.evaluation.runner` | 30/1 |
+| ...same | ...`adapters.authorization.null_resolver` | 30/1 |
+| Guard G / RBAC consumers (reused) | `policy_stage.py` imports `adapters.authorization.null_resolver` | 30 kept / 1 broken |
+| `RoutingDecision` construction (reused) | `policy_stage.py` constructs `RoutingDecision(...)` | exit 1 |
+| Guard L / `AgentRuntime` (reused) | `local_policy_engine.py` references `AgentRuntime` | exit 1 |
+
+### Design decisions recorded as decisions, not defaults
+
+- **`PolicyVerdict`, not `PolicyDecision`.** `PolicyDecision` already exists in
+  `domain/routing/models.py` as PolicyAgent's routing contribution. Reusing or shadowing that name
+  would have made two different concepts look like one in every stack trace and import list.
+- **`PolicyEffect` has no `UNAVAILABLE` member** - see the fail-closed finding.
+- **A `DENY` verdict must carry a caller reason**, validated at construction, mirroring
+  `StageResult` requiring a reason for `BLOCK`.
+- **A missing payload key is evaluated as empty, not skipped.** Policy is not bypassed by omitting
+  an attribute - `test_a_missing_payload_is_evaluated_as_empty_not_skipped` pins this.
+- **The engine lives in `adapters/policy/`, not `application/`.** It is a named implementation of a
+  port with a future remote sibling, matching `InMemoryBudgetLedger`/`InMemoryResponseCache`
+  placement rather than the pure-logic `application/` placement used for evaluators.
+
+### Known limitations, stated rather than concealed
+
+- **One policy, one engine.** No rule composition, no policy DSL, no admin API, no policy database
+  - all explicitly out of scope, and none has a consumer.
+- **Not wired into a request path.** `PolicyStage` is composed in the container and proven by
+  tests; no pipeline runner exists to execute stages around an inference, so - like
+  `AuthorizationStage` before it - it is enforced-by-construction but not yet enforced-in-traffic.
+  This is the single largest piece of outstanding debt across Slices 5-13.
+- **No policy caching**, deliberately: no performance requirement exists, and caching a policy
+  decision introduces invalidation semantics that are not free.
+- **Policy does not consult evaluation results.** No first consumer needs it, and coupling the two
+  would collapse capabilities that were deliberately kept independent.
+
+### Decision
+
+**No action against ADR-0016** (frozen, byte-unchanged). **No new ADR for either slice** - neither
+contradicts an existing Accepted decision, and ADR-0016 already anticipates both capabilities.
+Writing ADRs here would be ceremony rather than governance, in contrast to Slices 9 and 10 where a
+genuine conflict with ADR-0004/ADR-0006 existed.
+
+### Lessons
+
+- **A Tier-2 prediction can be confirmed by two different mechanisms, and saying which one applies
+  matters.** Policy consumed `PipelineStage` exactly as ADR-0016 imagined; evaluation confirmed the
+  same Tier-2 claim while deliberately *not* becoming a stage, because it is post-hoc rather than
+  interceptive and the stage route would have been less type-safe. Recording the difference keeps
+  the ADR's claim testable instead of turning "Tier 2" into a synonym for "a stage".
+- **Choosing the first capability instance from existing data is what keeps a foundation honest.**
+  Both slices had to reject the more impressive option - LLM-as-judge, OPA, data classification -
+  because none had data or a consumer. What remained was smaller and genuinely useful.
+- **A restore step is part of a guard proof, and untracked files break the usual one.**
+  `git checkout --` silently cannot restore a file git does not track, which let one mutation
+  survive into the next proof. Verifying the mutation *and* verifying the restore is the complete
+  discipline; only verifying the mutation is not.

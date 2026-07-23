@@ -364,6 +364,85 @@ source_modules = ["gateway.application.execution"]
 forbidden_modules = ["gateway.application.authorization", "gateway.adapters.authorization"]
 
 [[tool.importlinter.contracts]]
+# Slice 13 Guard 1 - policy consumers depend on the PolicyEnginePort only. Exactly the shape of
+# Guard G for RBAC (Slice 5): a stage that imports a concrete engine has bound enforcement to one
+# policy source, and the port stops being a seam - which would also make deferring OPA
+# meaningless, since substituting it is the whole reason the port exists.
+name = "policy consumers depend on the PolicyEnginePort only"
+type = "forbidden"
+source_modules = ["gateway.adapters.pipeline", "gateway.application"]
+forbidden_modules = ["gateway.adapters.policy"]
+
+[[tool.importlinter.contracts]]
+# Slice 13 Guard 2 - a policy engine answers "is this request permitted" and nothing else. It must
+# not become a second router, a second authorizer, or an owner of money. Each forbidden target is
+# one claim the slice makes:
+#   - application.routing / agents -> policy cannot route or reach AgentRuntime (Guard L also bars
+#     the runtime by name; this bars the whole routing capability)
+#   - application.providers        -> policy cannot invoke a provider
+#   - application.accounting / ports.ledger -> policy cannot author cost or move budget
+#   - application.reflection       -> a policy denial cannot trigger a retry
+#   - adapters.authorization       -> policy cannot resolve permissions; RBAC owns that question
+#   - application.evaluation       -> policy does not depend on Slice 12 (no consumer needs it,
+#     and coupling them would collapse two capabilities meant to stay independent)
+name = "policy engines decide policy only"
+type = "forbidden"
+source_modules = ["gateway.adapters.policy"]
+forbidden_modules = [
+    "gateway.application.routing",
+    "gateway.application.agents",
+    "gateway.application.providers",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.reflection",
+    "gateway.application.evaluation",
+    "gateway.adapters.authorization",
+]
+
+[[tool.importlinter.contracts]]
+# Slice 12 Guard 1 - evaluation OBSERVES a completed inference and participates in nothing.
+# Forbidding these directly is what makes the slice's central claims structural rather than
+# reviewed, one forbidden target per claim:
+#   - application.providers   -> evaluation cannot invoke a provider
+#   - application.accounting  -> evaluation cannot author cost or settle spend
+#   - ports.ledger            -> evaluation cannot reserve/settle/release budget
+#   - application.routing.engine -> evaluation cannot route (Guard L already bars AgentRuntime)
+#   - application.reflection  -> an evaluation verdict cannot trigger a retry
+#   - application.authorization -> evaluation cannot make an authorization decision
+# allow_indirect_imports: evaluation -> execution.inference_coordinator -> accounting/providers is
+# the intended path (it must name the outcome/response types it judges). Only a direct
+# reach-around is a violation, which is exactly what this contract catches. Adapters are NOT
+# listed: the blanket "application is framework-free and inward-only" contract already forbids
+# gateway.application -> gateway.adapters, so repeating it here would be redundant.
+name = "evaluation observes only and reaches no other capability"
+type = "forbidden"
+source_modules = ["gateway.application.evaluation"]
+forbidden_modules = [
+    "gateway.application.providers",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.routing.engine",
+    "gateway.application.reflection",
+    "gateway.application.authorization",
+]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+# Slice 12 Guard 2 - evaluator implementations are mutually independent. Same reasoning as the
+# ProviderClient (Slice 7), BudgetLedgerPort (Slice 9) and ResponseCachePort (Slice 10)
+# independence contracts: one importing the other would make the pair a single implementation
+# wearing two names, and the Rule-4 proof (a second implementation validates the port with no
+# protocol change) would be comparing an implementation against itself. It also underwrites the
+# runner's composition tests - "one evaluator's verdict cannot erase another's" is only meaningful
+# if the two cannot reach each other.
+name = "evaluator implementations are mutually independent"
+type = "independence"
+modules = [
+    "gateway.application.evaluation.response_completeness",
+    "gateway.application.evaluation.usage_consistency",
+]
+
+[[tool.importlinter.contracts]]
 # Slice 11 Guard 1 - reflection owns retry policy and attempt orchestration, nothing else. It
 # reaches every other capability exclusively through its one sanctioned collaborator,
 # InferenceCoordinator. Forbidding these four *directly* is what makes the slice's central claims

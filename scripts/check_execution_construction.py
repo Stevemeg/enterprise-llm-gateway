@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Guard 1 (Slice 10, extended Slice 11) - the execution-orchestration capability may only be
+"""Guard 1 (Slice 10, extended Slice 11 and 12) - the execution-path capabilities may only be
 constructed in the composition root: concrete cache adapters, the deduplicator, the inference
-coordinator, and the reflective executor with its retry policy (ADR-0016 Slice 10/11).
+coordinator, the reflective executor with its retry policy, and the evaluation runner
+(ADR-0016 Slice 10/11/12).
 
 Same pattern as every construction guard before it (Guards 1/K/L, Slices 6-9): import-linter
 answers *dependency* questions, but the composition root must import these legitimately, so the
@@ -12,11 +13,19 @@ more classes inside an existing one - the same distinction that made Slice 9 cor
 ``check_accounting_construction.py`` (ledger classes are more accounting) while Slice 7 and 8 each
 added their own new file (provider execution and accounting are not one another).
 
-Slice 11 *extends* this script rather than adding a parallel one, applying that same test in the
-other direction: reflection orchestrates execution attempts through the coordinator, so it sits
-inside this capability's construction boundary, and the invariant ("only the composition root may
-build one") is identical in shape. A second script would have duplicated this one's logic under a
-different name and inflated the guard count without enforcing anything new.
+Slices 11 and 12 *extend* this script rather than adding parallel ones, applying that same test in
+the other direction: reflection orchestrates execution attempts through the coordinator and
+evaluation judges their outcomes, so both sit on the execution path this guard already fences, and
+the invariant ("only the composition root may build one") is identical in shape. A second or third
+script would have duplicated this one's logic under a different name and inflated the guard count
+without enforcing anything new.
+
+``EvaluationRunner`` is confined for a specific reason, not by analogy: it owns *which* evaluators
+run. A component that built its own would silently evaluate against a different - or empty - set,
+and every report it produced would look exactly as authoritative as the deployment-wide one. The
+two evaluator classes themselves are deliberately NOT confined: they are stateless, pure, and hold
+no configuration authority, so constructing one elsewhere decides nothing (recorded as NOT
+APPLICABLE in the evidence log rather than guarded for symmetry).
 
 A second, narrower reason ``RequestDeduplicator`` specifically needs this: it holds process-local
 in-flight state that only provides its coalescing guarantee if every caller shares the *same*
@@ -44,6 +53,7 @@ TARGETS = frozenset(
         "InferenceCoordinator",
         "ReflectiveExecutor",
         "RetryPolicy",
+        "EvaluationRunner",
     }
 )
 ALLOWED = ("gateway/config/container.py",)
@@ -54,6 +64,7 @@ IMPLEMENTATIONS = (
     "inference_coordinator.py",
     "reflective_executor.py",
     "retry_policy.py",
+    "runner.py",
 )
 
 
@@ -96,18 +107,19 @@ def main(argv: list[str]) -> int:
     offenders = audit(src)
     if offenders:
         print(
-            "FAIL: cache/dedup/coordination constructed outside the composition root:",
+            "FAIL: execution-path capability constructed outside the composition root:",
             file=sys.stderr,
         )
         for offender in offenders:
             print(f"  - {offender}", file=sys.stderr)
         print(
-            f"\nOnly {ALLOWED[0]} may construct a cache adapter, the deduplicator, or the "
-            "inference coordinator. Consumers must receive one by injection (ADR-0016 Slice 10).",
+            f"\nOnly {ALLOWED[0]} may construct a cache adapter, the deduplicator, the inference "
+            "coordinator, the reflective executor or the evaluation runner. Consumers must "
+            "receive one by injection (ADR-0016 Slice 10/11/12).",
             file=sys.stderr,
         )
         return 1
-    print("PASS: cache/dedup/coordination is constructed only in the composition root.")
+    print("PASS: execution-path capabilities are constructed only in the composition root.")
     return 0
 
 
