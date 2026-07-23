@@ -418,3 +418,44 @@ async def test_unreachable_store_fails_closed() -> None:
             await ledger.reserve(uuid4(), "corr-1", _money("10"))
     finally:
         await broken_engine.dispose()
+
+
+async def test_reserving_again_after_release_genuinely_re_holds_the_budget(
+    engine: AsyncEngine, ledger: SqlBudgetLedger, org: UUID
+) -> None:
+    """Regression (found in Slice 11): a RELEASED reservation must not replay as a phantom hold.
+
+    ``reserve``'s idempotent-replay branch originally matched *any* existing row regardless of
+    status, so re-reserving a released ``correlation_id`` returned RESERVED while incrementing
+    nothing - the caller believed it held budget, the budget believed nothing was held, and the
+    full limit stayed reservable by someone else. Reachable from Slice 10's coordinator today
+    (reserve -> provider fails -> release -> the same correlation id is submitted again).
+    """
+    await _seed_budget(engine, org, "100")
+    await ledger.reserve(org, "corr-1", _money("60"))
+    await ledger.release(org, "corr-1")
+
+    again = await ledger.reserve(org, "corr-1", _money("60"))
+
+    assert again.outcome is ReservationOutcome.RESERVED
+    row = await _org_budget_row(engine, org)
+    assert row["reserved"] == Decimal("60"), "the re-reservation must actually hold budget"
+    # Only 40 remains, so a competing request for the full limit must now be denied.
+    competing = await ledger.reserve(org, "corr-2", _money("100"))
+    assert competing.outcome is ReservationOutcome.EXCEEDED
+
+
+async def test_a_re_held_reservation_can_be_settled_normally(
+    engine: AsyncEngine, ledger: SqlBudgetLedger, org: UUID
+) -> None:
+    """Re-activation must leave the row in a genuinely settleable state, not a half-reset one."""
+    await _seed_budget(engine, org, "100")
+    await ledger.reserve(org, "corr-1", _money("60"))
+    await ledger.release(org, "corr-1")
+    await ledger.reserve(org, "corr-1", _money("60"))
+
+    await ledger.settle(org, "corr-1", _detail("55"))
+
+    row = await _org_budget_row(engine, org)
+    assert row["spent"] == Decimal("55")
+    assert row["reserved"] == Decimal("0")

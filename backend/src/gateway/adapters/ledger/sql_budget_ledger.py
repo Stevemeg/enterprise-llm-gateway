@@ -19,6 +19,13 @@ lock keyed on ``(organization_id, correlation_id)`` (there is no row to lock yet
 cannot serve this purpose) - the second caller blocks until the first fully commits, then correctly
 finds the existing reservation and replays it idempotently.
 
+The idempotent-replay branch covers a *live* (``reserved``) or already-settled (``committed``) row
+only. A ``released`` row is deliberately excluded and re-activated instead (``_hold``): its hold was
+already returned to the budget, so replaying it would report ``RESERVED`` while holding nothing -
+a phantom hold leaving the full limit reservable by someone else. Found in Slice 11 while analysing
+retry semantics; reachable from Slice 10's coordinator today (reserve -> provider fails -> release
+-> the same ``correlation_id`` is submitted again), so it is a fix, not a retry-only accommodation.
+
 ``settle`` and ``release`` are a different shape - branch-on-status, not a single conditional
 write - so each locks its ``budget_reservation`` row explicitly with ``SELECT ... FOR UPDATE``
 before reading ``status``. Without it, two concurrent calls for the same ``correlation_id`` could
@@ -43,9 +50,10 @@ from __future__ import annotations
 
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, insert, select, text, update
+from sqlalchemy import RowMapping, func, insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from gateway.adapters.persistence.ledger_tables import budget_reservation, cost_ledger, org_budget
 from gateway.adapters.persistence.uow import UnitOfWorkFactory
@@ -60,7 +68,9 @@ from gateway.application.ports.ledger import (
 )
 from gateway.application.ports.money import Money
 
-_TERMINAL_STATUSES = ("committed", "released")
+_RELEASED = "released"
+_COMMITTED = "committed"
+_TERMINAL_STATUSES = (_COMMITTED, _RELEASED)
 
 
 class SqlBudgetLedger(BudgetLedgerPort):
@@ -68,6 +78,47 @@ class SqlBudgetLedger(BudgetLedgerPort):
 
     def __init__(self, uow_factory: UnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
+
+    @staticmethod
+    async def _hold(
+        session: AsyncSession,
+        existing: RowMapping | None,
+        organization_id: UUID,
+        correlation_id: str,
+        estimated_cost: Money,
+    ) -> None:
+        """Record the hold: insert a fresh reservation, or re-activate a previously RELEASED one.
+
+        A released row must be re-activated rather than left alone, because ``reserve``'s
+        idempotent-replay branch deliberately does not cover it: its hold was already returned to
+        the budget, so replaying it would report RESERVED while holding nothing (a phantom hold
+        that leaves the full limit reservable by someone else - see the Slice-11 evidence record).
+        The advisory lock taken at the top of ``reserve`` serializes concurrent callers on this
+        exact key, so the read-then-write here cannot race another reservation of the same id.
+        """
+        if existing is None:
+            await session.execute(
+                insert(budget_reservation).values(
+                    id=uuid4(),
+                    organization_id=organization_id,
+                    correlation_id=correlation_id,
+                    estimated_cost=estimated_cost.amount,
+                    currency=estimated_cost.currency,
+                    status="reserved",
+                )
+            )
+            return
+        await session.execute(
+            update(budget_reservation)
+            .where(budget_reservation.c.id == existing["id"])
+            .values(
+                status="reserved",
+                estimated_cost=estimated_cost.amount,
+                currency=estimated_cost.currency,
+                actual_cost=None,
+                settled_at=None,
+            )
+        )
 
     async def reserve(
         self, organization_id: UUID, correlation_id: str, estimated_cost: Money
@@ -94,7 +145,10 @@ class SqlBudgetLedger(BudgetLedgerPort):
                     (
                         await session.execute(
                             select(
-                                budget_reservation.c.estimated_cost, budget_reservation.c.currency
+                                budget_reservation.c.id,
+                                budget_reservation.c.estimated_cost,
+                                budget_reservation.c.currency,
+                                budget_reservation.c.status,
                             ).where(
                                 budget_reservation.c.organization_id == organization_id,
                                 budget_reservation.c.correlation_id == correlation_id,
@@ -104,9 +158,12 @@ class SqlBudgetLedger(BudgetLedgerPort):
                     .mappings()
                     .first()
                 )
-                if existing is not None:
+                if existing is not None and existing["status"] != _RELEASED:
                     await uow.commit()
-                    # Idempotent replay: the original decision stands, never re-evaluated.
+                    # Idempotent replay: the original decision stands, never re-evaluated. Only
+                    # a *live* ("reserved") or already-settled ("committed") row replays - a
+                    # RELEASED row is deliberately excluded and falls through to be re-held
+                    # below, because its hold was already given back to the budget.
                     return ReservationResult(
                         outcome=ReservationOutcome.RESERVED,
                         organization_id=organization_id,
@@ -132,15 +189,8 @@ class SqlBudgetLedger(BudgetLedgerPort):
                 if budget_row is None:
                     # No budget configured for this org - ordinary, allowed, unbounded (Slice 8's
                     # BudgetPort.snapshot()->None posture, carried over here).
-                    await session.execute(
-                        insert(budget_reservation).values(
-                            id=uuid4(),
-                            organization_id=organization_id,
-                            correlation_id=correlation_id,
-                            estimated_cost=estimated_cost.amount,
-                            currency=estimated_cost.currency,
-                            status="reserved",
-                        )
+                    await self._hold(
+                        session, existing, organization_id, correlation_id, estimated_cost
                     )
                     await uow.commit()
                     return ReservationResult(
@@ -186,16 +236,7 @@ class SqlBudgetLedger(BudgetLedgerPort):
                         remaining=remaining,
                     )
 
-                await session.execute(
-                    insert(budget_reservation).values(
-                        id=uuid4(),
-                        organization_id=organization_id,
-                        correlation_id=correlation_id,
-                        estimated_cost=estimated_cost.amount,
-                        currency=estimated_cost.currency,
-                        status="reserved",
-                    )
-                )
+                await self._hold(session, existing, organization_id, correlation_id, estimated_cost)
                 await uow.commit()
                 return ReservationResult(
                     outcome=ReservationOutcome.RESERVED,

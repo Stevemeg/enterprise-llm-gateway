@@ -16,9 +16,17 @@ from gateway.application.routing.catalog import ProviderDescriptor
 
 @dataclass
 class FakeProviderClient:
-    """Scripted responses keyed by provider name, plus a call log for assertions."""
+    """Scripted responses keyed by provider name, plus a call log for assertions.
+
+    ``sequence`` (Slice 11) scripts responses *per call* rather than per provider, so a caller can
+    exercise "fails twice, then succeeds" - the shape a retry layer exists to handle, and one a
+    provider-keyed dict cannot express because it answers every call identically. The final entry
+    repeats once the sequence is exhausted, so a policy that keeps retrying keeps seeing the same
+    terminal state rather than silently falling through to different behaviour.
+    """
 
     responses: dict[str, ProviderResponse] = field(default_factory=dict)
+    sequence: list[ProviderResponse] = field(default_factory=list)
     unreachable: bool = False
     calls: list[tuple[ProviderDescriptor, InferenceRequest]] = field(default_factory=list)
 
@@ -30,6 +38,9 @@ class FakeProviderClient:
             return ProviderResponse(
                 ok=False, error="simulated provider unreachable", provider=provider.name
             )
+        if self.sequence:
+            index = min(len(self.calls), len(self.sequence)) - 1
+            return self.sequence[index]
         scripted = self.responses.get(provider.name)
         if scripted is None:
             return ProviderResponse(

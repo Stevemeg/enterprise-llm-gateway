@@ -71,8 +71,11 @@ class InMemoryBudgetLedger(BudgetLedgerPort):
         ledger = self._ledger_for(organization_id)
 
         existing = ledger.reservations.get(correlation_id)
-        if existing is not None:
-            # Idempotent replay: the original decision stands, never re-evaluated.
+        if existing is not None and existing.status != "released":
+            # Idempotent replay: the original decision stands, never re-evaluated. Only a *live*
+            # ("reserved") or already-settled ("committed") reservation replays - a released one
+            # is deliberately excluded and re-held below, because its hold was already given back
+            # (replaying it would report RESERVED while holding nothing). Mirrors SqlBudgetLedger.
             return ReservationResult(
                 outcome=ReservationOutcome.RESERVED,
                 organization_id=organization_id,

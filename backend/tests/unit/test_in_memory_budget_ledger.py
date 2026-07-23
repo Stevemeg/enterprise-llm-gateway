@@ -174,3 +174,17 @@ async def test_unavailable_store_fails_closed_on_reserve() -> None:
 
     with pytest.raises(LedgerUnavailableError):
         await ledger.reserve(ORG_A, "corr-1", _money("10"))
+
+
+async def test_reserving_again_after_release_genuinely_re_holds_the_budget() -> None:
+    """Parity with SqlBudgetLedger's Slice-11 regression fix: a released reservation must be
+    re-held, not replayed as a phantom hold that leaves the full limit reservable."""
+    ledger = InMemoryBudgetLedger({ORG_A: _money("100")})
+    await ledger.reserve(ORG_A, "corr-1", _money("60"))
+    await ledger.release(ORG_A, "corr-1")
+
+    again = await ledger.reserve(ORG_A, "corr-1", _money("60"))
+
+    assert again.outcome is ReservationOutcome.RESERVED
+    competing = await ledger.reserve(ORG_A, "corr-2", _money("100"))
+    assert competing.outcome is ReservationOutcome.EXCEEDED

@@ -36,6 +36,16 @@ def sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def sha256_bytes(value: str) -> bytes:
+    """SHA-256 of a UTF-8 string, as the raw 32-byte digest.
+
+    Used where the digest is stored/compared as bytes rather than displayed (e.g. a cache
+    identity keyed against a ``bytea`` column) - ``sha256_hex`` exists for the display/storage
+    case, this one for the binary-identity case, both over the same sanctioned boundary.
+    """
+    return hashlib.sha256(value.encode("utf-8")).digest()
+
+
 def hash_secret(secret: str) -> str:
     """Hash a high-entropy secret (API key / refresh token) for storage.
 

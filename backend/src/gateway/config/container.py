@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from gateway.adapters.audit.composite_sink import CompositeAuthAuditSink
 from gateway.adapters.audit.logging_sink import LoggingAuthAuditSink
 from gateway.adapters.budget.in_memory_budget_store import InMemoryBudgetStore
+from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
+from gateway.adapters.cache.sql_response_cache import SqlResponseCache
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.ledger.sql_budget_ledger import SqlBudgetLedger
 from gateway.adapters.persistence.engine import create_database_engine, create_session_factory
@@ -37,20 +39,25 @@ from gateway.application.agents.planner import PlannerAgent
 from gateway.application.agents.policy import PolicyAgent
 from gateway.application.agents.provider import ProviderAgent
 from gateway.application.agents.runtime import AgentRuntime
+from gateway.application.execution.deduplicator import RequestDeduplicator
+from gateway.application.execution.inference_coordinator import InferenceCoordinator
 from gateway.application.ports.auth import AuthAuditSink
 from gateway.application.ports.budget import BudgetPort
+from gateway.application.ports.cache import ResponseCachePort
 from gateway.application.ports.ledger import BudgetLedgerPort
 from gateway.application.ports.pricing import PricingPort
 from gateway.application.ports.providers import ProviderClient
 from gateway.application.ports.routing import RoutingEngine
 from gateway.application.ports.secrets import SecretNotFoundError, SecretsResolver
 from gateway.application.providers.provider_executor import ProviderExecutor
+from gateway.application.reflection.reflective_executor import ReflectiveExecutor
+from gateway.application.reflection.retry_policy import RetryPolicy
 from gateway.application.routing.catalog import InMemoryProviderCatalog
 from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
 from gateway.config.settings import AuthSettings, Settings
 from gateway.delivery.http.ops.health import HealthRegistry
 from gateway.observability.logging import configure_logging, get_logger
-from gateway.shared.clock import Clock, SystemClock
+from gateway.shared.clock import AsyncioSleeper, Clock, Sleeper, SystemClock
 from gateway.shared.secrets import generate_token
 
 
@@ -137,6 +144,12 @@ class Container:
     budget_enforcer: BudgetEnforcer
     ledger_port: BudgetLedgerPort
     reservation_service: ReservationService
+    cache_port: ResponseCachePort
+    deduplicator: RequestDeduplicator
+    inference_coordinator: InferenceCoordinator
+    sleeper: Sleeper
+    retry_policy: RetryPolicy
+    reflective_executor: ReflectiveExecutor
 
     @classmethod
     def create(
@@ -216,6 +229,28 @@ class Container:
         )
         reservation_service = ReservationService(ledger_port, pricing_port, cost_accountant)
 
+        # --- response cache / request deduplication object graph (ADR-0016 Slice 10) -----
+        # Same rationale as ledger_port above: the cache's tenant-isolation claim (RLS) only
+        # holds against real Postgres (ADR-0018). The in-memory fallback satisfies Rule 4's
+        # second implementation and lets InferenceCoordinator be exercised without a database,
+        # but proves nothing about RLS - only the Postgres path does.
+        cache_port: ResponseCachePort = (
+            SqlResponseCache(uow_factory, clock) if rls_enabled else InMemoryResponseCache(clock)
+        )
+        deduplicator = RequestDeduplicator()
+        inference_coordinator = InferenceCoordinator(
+            cache_port, deduplicator, reservation_service, provider_executor
+        )
+
+        # --- reflection / bounded retry object graph (ADR-0016 Slice 11) -----------------
+        # The coordinator is reflection's ONLY collaborator: every attempt goes back through
+        # the same cache -> budget -> provider path, so a retry cannot bypass any of them.
+        # Defaults are conservative (3 attempts, 100ms exponential base) and typed, not magic
+        # numbers scattered through the executor.
+        sleeper: Sleeper = AsyncioSleeper()
+        retry_policy = RetryPolicy()
+        reflective_executor = ReflectiveExecutor(inference_coordinator, retry_policy, sleeper)
+
         health = HealthRegistry(version=settings.service_version, clock=clock)
         health.register("database", DatabaseHealthCheck(engine))
 
@@ -249,6 +284,12 @@ class Container:
             budget_enforcer=budget_enforcer,
             ledger_port=ledger_port,
             reservation_service=reservation_service,
+            cache_port=cache_port,
+            deduplicator=deduplicator,
+            inference_coordinator=inference_coordinator,
+            sleeper=sleeper,
+            retry_policy=retry_policy,
+            reflective_executor=reflective_executor,
         )
 
     async def dispose(self) -> None:

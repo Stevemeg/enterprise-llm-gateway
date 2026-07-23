@@ -57,6 +57,9 @@ uv run python ../scripts/check_provider_construction.py src/gateway || fail "Pro
 step "Accounting construction guard (only the composition root may build one)"
 uv run python ../scripts/check_accounting_construction.py src/gateway || fail "Accounting construction guard failed (ADR-0016 Slice 8)."
 
+step "Execution construction guard (cache/dedup/coordinator only in the composition root)"
+uv run python ../scripts/check_execution_construction.py src/gateway || fail "Execution construction guard failed (ADR-0016 Slice 10)."
+
 step "migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
 uv run python ../scripts/check_migration_guardrails.py migrations/sql || fail "Tenant-table RLS guardrail failed (ADR-0002/0014)."
 

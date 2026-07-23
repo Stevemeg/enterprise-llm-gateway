@@ -36,12 +36,33 @@ evidence log - not a new ADR (ADR-0016's Rule 2 sequence governs a seam's *birth
 existing capability-owned seam evolving under Rule 5, the same shape as ``PipelineStage`` gaining
 ``@runtime_checkable`` in Slice 2). The field is additive and optional (default ``None``): every
 Slice 7 construction of ``ProviderResponse`` remains valid unchanged.
+
+## Rule 5 event (Slice 11): ``ProviderErrorCategory`` added to ``ProviderResponse``
+
+**Active consumer:** ``application/reflection/retry_policy.py`` (new in Slice 11) - it must decide
+whether a failed attempt is worth retrying, and a bare ``error: str`` cannot answer that without
+string-matching a free-form message, which is exactly the silent, undocumented convention Rule 3
+exists to prevent.
+
+**Why the existing protocol was insufficient:** ``ProviderResponse`` distinguished only success
+from failure. "Rate-limited" and "malformed request" are both ``ok=False``, but retrying the first
+is correct and retrying the second is a guaranteed-useless second charge against the tenant.
+
+**Why the change does not belong in the consumer instead:** the category is observable only *by the
+provider client, at the moment of the call* (HTTP status, timeout, transport error). The reflection
+layer receiving the response has no independent way to reconstruct why the call failed - identical
+reasoning to Slice 8's ``usage`` field, so the classification must travel with the response.
+
+Additive and optional (default ``None``): every prior construction remains valid, and ``None``
+means **not classified**, which the retry policy deliberately treats as *non*-retryable (fail
+closed - an error nobody classified is not known to be transient).
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 from gateway.application.routing.catalog import ProviderDescriptor
@@ -78,6 +99,23 @@ class ProviderUsage:
         return self.prompt_tokens + self.completion_tokens
 
 
+class ProviderErrorCategory(StrEnum):
+    """Why a provider call failed, in terms a retry policy can act on (Rule 3: the reflection
+    layer and every ``ProviderClient`` implementation must agree on this, and a free-form
+    ``error`` string would make that agreement a convention rather than a type).
+
+    Closed vocabulary, safe as a metric label. Only categories an actual consumer distinguishes
+    exist - there is no ``UNKNOWN`` member, because "not classified" is already expressible as
+    ``error_category=None`` and a second spelling of the same fact would be two sources of truth.
+    """
+
+    TIMEOUT = "timeout"
+    RATE_LIMITED = "rate_limited"
+    SERVER_ERROR = "server_error"
+    INVALID_REQUEST = "invalid_request"
+    AUTHENTICATION = "authentication"
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderResponse:
     """Outcome of a provider call. Failure is data, not an exception (mirrors ``McpResult``).
@@ -85,6 +123,9 @@ class ProviderResponse:
     ``usage`` is ``None`` exactly when no usage was ever incurred - a provider failure before any
     tokens were consumed. Cost accounting must treat that as "nothing to account for", never as
     zero-cost usage: those are different facts (see ``MissingUsageError``).
+
+    ``error_category`` is meaningful only when ``ok`` is ``False``; ``None`` means the failure was
+    not classified, which the retry policy treats as non-retryable (fail closed).
     """
 
     ok: bool
@@ -92,6 +133,7 @@ class ProviderResponse:
     error: str | None = None
     provider: str = ""
     usage: ProviderUsage | None = None
+    error_category: ProviderErrorCategory | None = None
 
 
 @runtime_checkable

@@ -875,3 +875,419 @@ demands it.
   surface.** Three of five relevant guards required zero new code - a sign the prior slices'
   contracts were drawn at the right level of generality, not that this slice skipped enforcement.
 
+## Evidence Record - Phase 4 Slice 10: Semantic-Safe Response Caching & Request Deduplication
+
+**Classification:** Capability milestone. **Evidence strength: STRONG** - the Rule 5 determination,
+the cache-identity-vs-deduplication-identity distinction, and the schema-reuse finding were all
+determined and stated before any caching code was written.
+
+**Pre-registered prediction.** Exact-match response caching and process-local request
+deduplication can be built entirely as a capability consuming existing seams (`RoutingExecution`,
+`ProviderExecutor`, `ReservationService`, `UnitOfWork`/RLS), without widening any Tier-1 protocol,
+without treating a cache hit as provider execution, and without conflating cache identity with
+deduplication identity.
+
+**Falsification conditions**
+
+- If a cache lookup could only be expressed by widening `RoutingDecision`, `RoutingExecution`,
+  `PipelineStage`, `BaseAgent`, `ToolRegistry` or `McpGateway`, **Rule 5 would be triggered against
+  Tier 1** and the milestone would stop before implementation.
+- If caching and request deduplication turned out to be the same concept (the brief's explicit
+  instruction: assume NO until proven otherwise), building one port/mechanism for both would be the
+  correct move; if they are genuinely different, building one for both would silently conflate a
+  durable, content-keyed identity with a transient, correlation-keyed one.
+- If a cache hit could not be represented without incurring `ProviderUsage`, cost, or a budget
+  reservation, "semantic-safe" caching would not be achievable without either fabricating usage
+  data or bypassing budget enforcement - either would be a defect, not a feature.
+- If genuine, distributed (cross-process) request deduplication were required for correctness (not
+  merely desirable), and this milestone had no evidence demanding it, building Redis infrastructure
+  for it would repeat exactly the speculative-infrastructure mistake ADR-0017 already identified and
+  avoided for the budget ledger.
+- If the pre-existing `semantic_cache_entry` table required fabricating unconsumed catalog/scope
+  data (mirroring Slice 9's finding about `budget`/`reservation`), a new, narrower table would be
+  required instead.
+
+**Outcome: prediction held on every condition; one condition (distributed dedup) evaluated to "not
+required" rather than "impossible", so nothing was built for it, per GP-1.**
+
+| Item | Result |
+|---|---|
+| Rule 5 against Tier 1 | **NOT TRIGGERED** - zero diff on `domain/`, `application/ports/routing.py`, `pipeline.py`, `tools.py`, `mcp.py`, `agents.py`, `application/agents/runtime.py`, and `docs/adr/0016-*.md` (verified by `git diff --stat`); `InferenceRequest`/`ProviderResponse`/`RoutingExecution` themselves are unmodified |
+| Caching vs. deduplication - same concept? | **Confirmed different, by construction** - cache identity is `(organization_id, provider, model, canonical payload)` (`compute_cache_key`), deliberately excludes `correlation_id`; deduplication identity is `(organization_id, correlation_id)` (`RequestDeduplicator`), deliberately content-blind. Proven distinct by `test_different_organizations_with_the_same_correlation_id_do_not_coalesce` (dedup) and `test_different_organization_produces_a_different_key_even_for_identical_content` (cache) exercising opposite axes |
+| Cache hit represented without fabricated usage/cost/budget | **Confirmed** - `InferenceCoordinator` returns `ProviderResponse(usage=None)` on a hit and never calls `ReservationService.reserve/settle` for it; proven by `test_a_cache_hit_reports_no_usage` and `test_a_cache_hit_never_calls_the_provider_or_touches_budget` |
+| Distributed deduplication required? | **Not required by this milestone - not built (GP-1)** - `RequestDeduplicator` is process-local (`asyncio.Task`-based single-flight); the gap (two replicas, same `correlation_id`, same moment) is documented, not hidden, and closed only for double-*charging* by Slice 9's existing durable idempotency, not for a double provider *call* |
+| Phase-1 table reusable as-is | **Confirmed reusable, no new migration (ADR-0018)** - unlike Slice 9's finding, `semantic_cache_entry`'s nullable `project_id`/`model_id`/`embedding_id`/`prompt_fingerprint` require no fabricated data; its `organization_id uuid NOT NULL`/`request_hash bytea NOT NULL`/`response jsonb NOT NULL`/`expires_at` shape already fits exact-match caching, and it already carries RLS + `app_rw` grants from `0001_initial.sql`/`0003_database_roles.sql` |
+| Rule 4 | Satisfied by two real implementations (`SqlResponseCache`, `InMemoryResponseCache`) - the in-memory one proves the port's business semantics without a database but is documented as not proving RLS, mirroring `InMemoryBudgetLedger`'s own disclaimer in Slice 9 |
+| Validation | **Gate 1 + Gate 2: 440 passed, 0 skipped, 96% coverage** - full pass, including every Postgres-backed RLS/TTL/malformed-entry/outage test |
+
+### What is safe to cache, what must never be cached, and where a lookup sits in the execution path
+
+Answered explicitly before implementation, per the brief's numbered questions:
+
+1. **Safe to cache:** a successful (`ok=True`) provider response for a request whose entire
+   canonicalized payload, provider, and model exactly match a prior cached request under the same
+   organization. "Exact match" includes every field a caller sent, including any
+   temperature/randomness setting - nothing here tries to guess which fields are "safe" to ignore.
+2. **Never cached:** authorization decisions, budget decisions, `RoutingDecision`, exceptions,
+   policy denials, authentication state, tenant context, secrets/credentials, and any failed
+   (`ok=False`) provider response. Enforced structurally: `InferenceCoordinator` only calls
+   `cache.put()` after a successful settlement, never on the failure branch, never on a denial
+   branch, and the cache package cannot import the authorization or budget-ledger seams at all
+   (import-linter Guards 2/3, Slice 10).
+3. **Where a lookup can occur without bypassing authorization or budget:** after `AuthorizationStage`
+   has already run (upstream, in the pipeline - this package never imports that seam) and after
+   `RoutingEngine`/`AgentRuntime` have already resolved a provider (a cache hit needs to know
+   *which* provider/model would have been called, which only routing decides). A hit is not a
+   bypass of budget enforcement, because a hit spends nothing there is anything to enforce against.
+4. **Does a cache hit represent provider execution?** No - `ProviderExecutor.execute` is never
+   called on a hit.
+5. **Should a hit create `ProviderUsage`?** No - none was observed; fabricating it would
+   misrepresent an event that never happened (the same discipline `CostAccountant.MissingUsageError`
+   already applies to a different case).
+6. **Should a hit create cost?** No - `ReservationService.settle` is never called for a hit.
+7. **Should a hit reserve budget?** No - `ReservationService.reserve` is never called for a hit;
+   there is nothing to gate because nothing will be spent.
+8. **Tenant isolation in cache identity:** `organization_id` is baked directly into the SHA-256
+   digest (defence in depth), the in-memory adapter additionally keys its map by
+   `(organization_id, digest)`, and the SQL adapter is RLS-bound via the same
+   `AsyncUnitOfWork(tenant_id=...)` mechanism every other tenant table uses - proven even for a
+   deliberately colliding raw key by
+   `test_cross_tenant_lookup_is_isolated_by_rls_even_for_a_colliding_key`.
+9. **Provider/model/request semantics in cache identity:** `provider.name`, `provider.model`, and
+   the entire canonicalized request payload all participate in the digest.
+10. **What request fields affect semantic equivalence?** All of them - the entire payload is
+    canonicalized and hashed; nothing is selectively excluded (Rule 3: no undocumented convention
+    about which fields "don't matter").
+11. **Is `correlation_id` part of cache identity or deduplication identity?** Deduplication identity
+    only. It is explicitly excluded from the cache key.
+12. **Are caching and deduplication the same concept?** No - see the outcome table above.
+13. **Can this be implemented without changing Tier-1 protocols?** Yes - confirmed by the zero-diff
+    check above.
+
+### The reused/new/redundant/vacuous guard evaluation
+
+| Candidate | Verdict | Why |
+|---|---|---|
+| `ResponseCachePort` implementations mutually independent | **Genuinely new** | Two real implementations now exist (`SqlResponseCache`, `InMemoryResponseCache`); nothing previously prevented one importing the other |
+| Cache/dedup/coordinator classes constructed only in the composition root | **Genuinely new script** | Classified NEW rather than extending `check_accounting_construction.py`/`check_provider_construction.py`: caching is a new capability boundary (new port, new adapter package, new application package), not more classes inside an existing one - the same distinction that made Slice 9 correctly *extend* an existing script instead of adding a new one |
+| Cache adapters must not depend on accounting, budget ledger, or authorization | **Genuinely new contract** | Nothing previously restricted `gateway.adapters.cache`; without it, a future edit could have the cache adapter itself decide "was this authorized" or "does this affect spend" |
+| Inference coordination must not depend on authorization | **Genuinely new contract** | Structural proof that cache/dedup/coordination "cannot bypass authorization": it has nothing to bypass, because it cannot even import the seam |
+| `RoutingDecision` constructed only by `AgentRuntime` | **Already enforced, reused unchanged** | `check_routing_decision_construction.py` (Slice 6) is a whole-repo AST scan with no target-file allowlist beyond `agents/runtime.py` - it automatically covers every new Slice-10 file with zero changes, proven by planting a construction call in `inference_coordinator.py` and observing FAIL |
+| `AgentRuntime` referenced only by the routing engine | **Already enforced, reused unchanged** | `check_routing_engine.py` Guard L scans for *any* reference to the name `AgentRuntime`, not just calls - automatically covers Slice 10, proven the same way |
+| Application layer stays framework-free (no `sqlalchemy`/adapters) | **Already enforced, reused unchanged** | The general "application is framework-free and inward-only" contract (pre-existing) automatically covers `gateway.application.execution`; proven by planting `import sqlalchemy` in `deduplicator.py` and observing BROKEN |
+| Tenant isolation on `semantic_cache_entry` | **Not applicable - no migration to guard** | This slice added no migration (ADR-0018); `check_migration_guardrails.py` has nothing new to scan. RLS on the table predates this slice (`0001_initial.sql`) and was verified, not (re)built |
+| A `DeduplicationPort` protocol with two implementations | **Considered, rejected as vacuous/premature** | Exactly one correct implementation exists (process-local `asyncio.Task` coalescing); a `Protocol` with a single conceivable implementation and no second one to prove substitutability would be exactly the speculative-abstraction Rule 4/GP-1 warns against. `RequestDeduplicator` is a concrete class, not a port, mirroring `ReservationService`/`ProviderExecutor` |
+
+### Enforcement (each violated, observed failing, restored, observed passing)
+
+| Guard | Mechanism | Violation | Observed |
+|---|---|---|---|
+| Response cache independence (new) | import-linter (independence) | `in_memory_response_cache.py` imports `sql_response_cache.py` | 25 kept / 1 broken; 26/26 after revert |
+| Cache adapters vs. accounting/ledger/authorization (new) | import-linter (forbidden) | `sql_response_cache.py` imports `gateway.application.accounting.cost_accountant` | 25 kept / 1 broken; 26/26 after revert |
+| Inference coordination vs. authorization (new) | import-linter (forbidden) | `inference_coordinator.py` imports `gateway.application.authorization.requirements` | 25 kept / 1 broken; 26/26 after revert |
+| Execution construction (new script) | AST scan (`check_execution_construction.py`) | `cache_key.py` constructs `InferenceCoordinator` | exit 1, offender named; PASS after removal |
+| `RoutingDecision` construction (reused) | AST scan (`check_routing_decision_construction.py`) | `inference_coordinator.py` constructs `RoutingDecision(...)` | exit 1, offender named; PASS after removal |
+| `AgentRuntime` reference (reused) | AST scan (`check_routing_engine.py`) | `inference_coordinator.py` references bare name `AgentRuntime` | exit 1 (`[L]` offender named); PASS after removal |
+| Application framework-free (reused, general) | import-linter (forbidden) | `deduplicator.py` imports `sqlalchemy` | 25 kept / 1 broken; 26/26 after revert |
+
+A first attempt at proving the `RoutingDecision` construction guard used a bare name reference
+(`_bad = RoutingDecision`) rather than a call - this correctly did **not** trip the guard, because
+the guard is deliberately scoped to *construction* (`RoutingDecision(...)`), not *reference*
+(unlike Guard L for `AgentRuntime`, which is deliberately scoped to any reference). Recorded here
+rather than silently corrected, because it is itself evidence the guard's AST logic was actually
+exercised, not assumed - the mutation had to genuinely trigger the code path the guard scans for.
+
+### Design decisions recorded as decisions, not defaults
+
+- **Exact-match only, no embedding/semantic-similarity tier.** ADR-0006 decided a two-tier
+  (Redis exact + `pgvector` semantic) cache; no Redis client, embedding pipeline, or event-bus
+  consumer exists anywhere in this codebase. Building either for a milestone with no
+  similarity-threshold or hit-rate requirement would be the same speculative-infrastructure mistake
+  ADR-0017 already identified for Redis Lua reserve/commit. See ADR-0018.
+- **`semantic_cache_entry` reused as-is, no new migration.** Unlike Slice 9's `budget`/
+  `reservation` tables, this table's nullable dimensions (`project_id`, `model_id`, `embedding_id`,
+  `prompt_fingerprint`) do not force fabricating unused catalog data, and its NOT NULL columns
+  (`organization_id`, `request_hash`, `response`) are exactly what exact-match caching needs.
+- **Cache identity is a SHA-256 digest via a new `shared.secrets.sha256_bytes` helper, not a raw
+  `hashlib` call in the cache module.** The existing "low-level crypto primitives only via
+  `shared.secrets`" import-linter contract (predates this slice) forbids importing `hashlib`
+  outside that boundary; a raw-bytes-digest sibling to the existing `sha256_hex` was added there
+  rather than carving an exception into the guard.
+- **Deduplication wraps only the cache-miss path.** A hit is a pure read with no side effects;
+  wrapping it in `RequestDeduplicator.coalesce` would add coordination overhead for a case that
+  needs none.
+- **`InferenceCoordinator` is a new orchestrator, not a merge into `ReservationService` or
+  `ProviderExecutor`.** It composes both unchanged, plus the new cache/dedup capabilities - the
+  first real, tested proof of the full reserve/execute/settle sequence those two classes'
+  docstrings had described but left to "a future delivery-layer handler" since Slice 9.
+- **`RequestDeduplicator.coalesce` uses `asyncio.shield`, not a bare `await task`.** Without it, a
+  caller whose own request is independently cancelled (e.g. its timeout) would cancel the
+  underlying operation for every other caller sharing it - proven by
+  `test_a_cancelled_waiter_does_not_cancel_the_operation_for_other_waiters`.
+
+### Known limitations, stated rather than concealed
+
+- **No near-duplicate ("semantic similarity") caching.** Only literal exact matches hit; a prompt
+  differing by one character is a full miss. Explicitly deferred to a future milestone with evidence
+  of a near-duplicate hit-rate opportunity (ADR-0018).
+- **No cross-process (distributed) deduplication.** `RequestDeduplicator` is process-local; two
+  gateway replicas receiving the same `correlation_id` at the same moment could each call the
+  provider once. Slice 9's durable ledger idempotency still prevents double-*charging* in that case,
+  but not the double provider *call* itself. Deferred until running more than one replica is an
+  actual deployment shape (GP-1).
+- **No "cache stampede" protection across different correlation ids with identical content.** Two
+  different logical requests (different `correlation_id`) with identical payloads arriving
+  concurrently before either has populated the cache will both miss and both call the provider -
+  deduplication is keyed on correlation identity, not content identity, by design (see the
+  cache-vs-dedup finding above). Documented as a known, explicitly out-of-scope limitation, not a
+  defect.
+- **No explicit purge or model/version-driven invalidation.** Only TTL expiry (default one hour)
+  exists; ADR-0006's FR-058 (explicit purge, model/version change) is not implemented.
+- **`hit_count` and `prompt_fingerprint` are not populated.** Real, pre-existing columns on
+  `semantic_cache_entry` that this slice's adapter does not maintain - left at their defaults
+  rather than fabricated, matching ADR-0017's precedent for `org_budget`'s unused dimensions.
+
+### Decision
+
+**No action against ADR-0016** (frozen, unchanged). **New ADR-0018 accepted**, scoping (not
+reversing) ADR-0006: PostgreSQL-backed exact-match caching plus process-local deduplication is the
+current, verified mechanism; Redis exact-tier and `pgvector` semantic-tier caching remain the
+documented future mechanism for when evidence demands them.
+
+### Lessons
+
+- **Not every schema-reuse finding goes the same direction.** Slice 9 found the Phase-1 tables
+  needed replacing; Slice 10 found the Phase-1 table needed no changes at all. Reading the actual
+  column shape and constraints each time - not applying the prior slice's conclusion by analogy -
+  was what caught the difference.
+- **A concept split (cache identity vs. deduplication identity) prevented a subtler bug than either
+  concept alone would have.** Building one mechanism for both would likely have "worked" in the
+  common case and failed exactly at a cross-tenant correlation-id collision or a stale-cache-served-
+  as-a-duplicate edge - the kind of defect that passes review and fails in production.
+- **Choosing not to build something is itself a recorded, falsifiable decision.** Distributed
+  deduplication was evaluated, found not required by any concrete requirement in this milestone,
+  and explicitly not built - the same GP-1 discipline ADR-0017 established for Redis Lua
+  reserve/commit, applied a second time to a different capability.
+
+## Evidence Record - Phase 4 Slice 11: Reflection / Retry Layer
+
+**Classification:** Capability milestone. **Evidence strength: STRONG** - the Rule 5 determination,
+the retry classification, the no-rerouting decision and the attempt-identity analysis were all
+determined and stated before any reflection code was written. The slice also *falsified its own
+pre-registered prediction on one point* (a capability-owned protocol did have to change) and, while
+analysing retry semantics, found a genuine pre-existing defect in Slice 9's ledger that was
+reachable from Slice 10's coordinator - both recorded below rather than smoothed over.
+
+**Pre-registered prediction.** Bounded, explainable retry can be built entirely as a capability
+consuming existing seams (`InferenceCoordinator`, `RoutingExecution`, `Sleeper`), without widening
+any Tier-1 protocol, without creating a second routing engine/provider executor/explanation model,
+and without a hidden unbounded loop.
+
+**Falsification conditions**
+
+- If retry could only be expressed by widening `RoutingDecision`, `RoutingExecution`,
+  `PipelineStage`, `BaseAgent`, `ToolRegistry` or `McpGateway`, **Rule 5 would be triggered against
+  Tier 1** and the milestone would stop before implementation.
+- If deciding *whether* to retry required reflection to select a provider, reroute, or otherwise
+  make a routing decision, the responsibility boundary would be violated and the slice would stop
+  and report rather than build a second routing authority.
+- If classifying a failure as transient-vs-permanent could not be done from typed data, the only
+  alternative would be string-matching a free-form `error` message - a silent convention Rule 3
+  forbids - and the slice would have to report that instead of shipping it.
+- If retry across attempts could not keep budget reservation and cost accounting correct, the
+  slice would stop rather than ship a retry path that double-charges or under-charges a tenant.
+
+**Outcome: prediction held on Tier 1 and on responsibility separation; falsified (honestly) on the
+"no protocol change at all" clause.**
+
+| Item | Result |
+|---|---|
+| Rule 5 against Tier 1 | **NOT TRIGGERED** - zero diff on `domain/`, `application/ports/routing.py`, `pipeline.py`, `tools.py`, `mcp.py`, `agents.py`, `application/agents/runtime.py`, `application/routing/engine.py`, and `docs/adr/0016-*.md` (verified by `git diff --stat`) |
+| Rule 5 against a **capability-owned** port | **TRIGGERED AND SATISFIED** - `ProviderErrorCategory` + `ProviderResponse.error_category` added to `application/ports/providers.py`. Active consumer: `application/reflection/retry_policy.py`. Recorded here, not as a new ADR - identical in shape to Slice 8 adding `usage` to the same port (ADR-0016 Rule 2 governs a seam's *birth*; this is an existing capability-owned seam evolving under Rule 5). Additive and optional: every prior construction remains valid |
+| Second routing engine / executor / explanation created? | **No** - reflection's only collaborator is `InferenceCoordinator`. It cannot import `application.providers`, `application.accounting`, `ports.ledger` or `application.routing.engine` (new import-linter contract, all four proven independently), so no path exists by which a retry could reach a provider without also passing the budget gate |
+| Rerouting | **Deliberately not built** - see the finding below. Reflection retries the *same* `RoutingExecution` |
+| Unbounded loop possible? | **No, by construction** - the loop is `for attempt in range(1, policy.max_attempts + 1)`, a finite range; `RetryPolicy` rejects `max_attempts < 1` at construction |
+| Original `RoutingDecision` mutated? | **No** - it is a frozen dataclass, carried through untouched and asserted identical (`is`) by `test_the_original_routing_decision_is_carried_through_unmodified` |
+| Validation | **Gate 1 + Gate 2: 485 passed, 0 skipped, 97% coverage** - coverage *rose* one point rather than being held flat |
+
+### Finding: a genuine pre-existing defect in Slice 9's `reserve()`, found by analysing retry - and reachable without retry
+
+Designing attempt-scoped budget identity required reading `SqlBudgetLedger.reserve()` closely
+enough to ask what a *second* reservation of the same `correlation_id` does after the first was
+released. It replayed it: the idempotent-replay branch matched **any** existing row regardless of
+`status`, so `reserve -> release -> reserve` returned `RESERVED` while incrementing nothing.
+
+This was verified empirically against real PostgreSQL before any fix was written - the probe
+showed `reserved=0E-8` after the re-reservation, and a competing request for the **full** limit was
+then still admitted. The caller believed it held budget; the budget believed nothing was held.
+
+Critically, **this is not a retry-only concern**: it is reachable through Slice 10's coordinator
+today, with no reflection involved, whenever a provider call fails (which releases the hold) and a
+client resubmits the same `correlation_id`. It was therefore fixed as a defect in its own right,
+not accommodated as a retry special case:
+
+- `reserve()`'s replay branch now covers a *live* (`reserved`) or already-settled (`committed`) row
+  only. A `released` row falls through and is genuinely re-held, via a new `_hold` helper that
+  re-activates the existing row instead of inserting a duplicate (the `UNIQUE (organization_id,
+  correlation_id)` constraint makes a second INSERT impossible anyway).
+- The advisory lock `reserve()` already takes (Slice 9's own pre-commit fix) serializes concurrent
+  callers on the same key, so the new read-then-reactivate cannot race another reservation.
+- `InMemoryBudgetLedger` carried the identical bug and was fixed for parity.
+- Regression tests: `test_reserving_again_after_release_genuinely_re_holds_the_budget` (Postgres and
+  in-memory) and `test_a_re_held_reservation_can_be_settled_normally`.
+
+A `committed` row deliberately still replays as `RESERVED`. That case is a *caller* defect (reusing
+a completed correlation id) and its exposure is an under-charge rather than an overspend, because
+`settle()` is idempotent - stated here as a known limitation rather than silently widened, since no
+consumer needs it and changing it would alter the documented port contract.
+
+### Finding: rerouting was evaluated and deliberately not built
+
+The obvious "reflection feature" is: this provider failed, try a different one. It was not built,
+and that is a decision, not an omission.
+
+Provider selection belongs to `ProviderAgent` inside `AgentRuntime`, and the routing architecture
+does not delegate it here. Building rerouting would require either fabricating a provider choice
+outside the only component permitted to explain one (directly violating invariant 3), or invoking
+routing again to obtain a **second** `RoutingDecision` for one logical request - two explanations of
+the same request, which is precisely the failure `RoutingExecution`'s own design note exists to
+prevent. Neither has a consumer in this milestone, so neither was built (Rule 5). The structural
+consequence is enforced, not merely intended: reflection cannot import `application.routing.engine`
+at all, proven by deliberate violation.
+
+### Finding: retry needs attempt-scoped budget identity, and Slice 10's identity split made that free
+
+Budget reservation and settlement key on `(organization_id, correlation_id)` (Slice 9). Had every
+attempt reused the caller's bare `correlation_id`, attempt 2's `reserve` would have collided with
+attempt 1's finished reservation and attempt 2's `settle` would have been swallowed as a duplicate -
+the tenant receiving a provider call it was never charged for. Each attempt therefore executes under
+a derived id, `<correlation_id>#<attempt>`.
+
+That derivation is safe against both Slice-10 identities *because* Slice 10 kept them separate:
+
+- **Cache identity ignores `correlation_id` entirely** (content-keyed), so retrying does not change
+  which cache entry an attempt reads or writes.
+- **Deduplication identity is `(organization_id, correlation_id)`**, so N concurrent duplicate
+  callers derive the *same* attempt id at each step and coalesce at every attempt - the provider
+  sees one call per attempt, not N. Proven by
+  `test_concurrent_duplicates_do_not_trigger_independent_retry_storms` (3 duplicate callers x 3
+  attempts = 3 provider calls, not 9).
+
+Had Slice 10 conflated the two identities, this slice would have had to choose between breaking
+caching and breaking deduplication. The concept split paid for itself one slice later.
+
+### Retry classification (stated before implementation)
+
+| Condition | Verdict | Why |
+|---|---|---|
+| Success (`EXECUTED` + `ok`) | SUCCEEDED | - |
+| Cache hit | SUCCEEDED | A cached response is a complete, correct answer; reflection stops immediately with zero provider calls |
+| Policy denial / no candidate / all unhealthy (`NOT_ROUTED`) | TERMINAL | Decisions already made and already explained by `RoutingDecision`; a retry asks a settled question hoping for a different answer |
+| Authorization denial | TERMINAL (unreachable here) | Decided upstream in the pipeline; never reaches this layer. Structurally guaranteed - reflection cannot import the authorization seam |
+| Budget denied | TERMINAL | The tenant is out of money; the answer is guaranteed identical |
+| Budget store unavailable | TERMINAL | Already a fail-closed denial (ADR-0009 row 1); retrying aims more load at a struggling ledger |
+| Provider `TIMEOUT` / `RATE_LIMITED` / `SERVER_ERROR` | RETRY | Transient by definition |
+| Provider `INVALID_REQUEST` / `AUTHENTICATION` | TERMINAL | Permanent until a human changes something |
+| Provider error with **no** category | TERMINAL | Fail closed - an error nobody classified is not known to be transient |
+| Malformed provider output (missing/negative usage) | Not a retry signal at all | Surfaces as `MissingUsageError`/`MalformedUsageError` raised by `CostAccountant`, which that module documents as *a defect a human must fix*. Reflection does not catch exceptions as retry signals: retrying a defect is precisely wrong, and converting one into a silent retry would erase the signal |
+
+### The guard evaluation
+
+| Candidate | Verdict | Why |
+|---|---|---|
+| Reflection cannot bypass `ProviderExecutor`, author cost, move budget, or reroute | **Genuinely new (one contract, four targets)** | Nothing previously restricted `gateway.application.reflection`. `allow_indirect_imports = true` is essential and deliberate: reflection -> coordinator -> accounting/providers is the *intended* path, so only a direct reach-around is a violation. All four forbidden targets proven to trip it independently |
+| Reflection classes constructed only in the composition root | **Reused, extended** | `check_execution_construction.py` (Slice 10) is a generic AST scan over a name list; reflection sits inside the same execution-orchestration construction boundary and the invariant is identical in shape. Extended with `ReflectiveExecutor`/`RetryPolicy` rather than writing a second script with identical logic - the same call Slice 9 made for the accounting script |
+| Reflection cannot construct `RoutingDecision` | **Already enforced, reused unchanged** | Whole-repo AST scan with no per-slice allowlist; proven to catch a planted construction in `reflective_executor.py` with zero script changes |
+| Reflection cannot invoke `AgentRuntime` | **Already enforced, reused unchanged** | Guard L scans for *any* reference to the name; proven the same way |
+| Reflection cannot import provider adapter implementations | **Already enforced, redundant to add separately** | The blanket "application is framework-free and inward-only" contract already forbids `gateway.application` -> `gateway.adapters`; proven against `reflective_executor.py`. A reflection-specific adapter contract would have checked the same thing twice under a different name |
+| A `RetryClassifier` / `ReflectionPort` protocol | **Considered, rejected as vacuous** | Exactly one correct classification exists and there is no second implementation to substitute; a `Protocol` here would be an abstraction with no consumer for its abstractness (Rule 4/GP-1). `classify()` is a pure function; `ReflectiveExecutor` is a concrete orchestrator, mirroring `ReservationService`/`ProviderExecutor`/`InferenceCoordinator` |
+
+### Enforcement (each violated, observed failing, restored, observed passing)
+
+| Guard | Mechanism | Violation | Observed |
+|---|---|---|---|
+| Reflection boundary (new) | import-linter (forbidden, `allow_indirect_imports`) | `retry_policy.py` imports `application.providers.provider_executor` | 26 kept / 1 broken; 27/27 after revert |
+| Reflection boundary (new) | same | `reflective_executor.py` imports `application.accounting.cost_accountant` | 26 kept / 1 broken; restored |
+| Reflection boundary (new) | same | `reflective_executor.py` imports `application.ports.ledger` | 26 kept / 1 broken; restored |
+| Reflection boundary (new) | same | `reflective_executor.py` imports `application.routing.engine` | 26 kept / 1 broken; restored |
+| Execution construction (reused, extended) | AST scan (`check_execution_construction.py`) | `routing/engine.py` constructs `ReflectiveExecutor` | exit 1, offender named; PASS after removal |
+| Execution construction (reused, extended) | same | `config/settings.py` constructs `RetryPolicy` | exit 1, offender named; PASS after removal |
+| `RoutingDecision` construction (reused) | AST scan | `reflective_executor.py` constructs `RoutingDecision(...)` | exit 1; PASS after removal |
+| `AgentRuntime` reference (reused) | AST scan (Guard L) | `reflective_executor.py` references `AgentRuntime` | exit 1 (`[L]` offender); PASS after removal |
+| Application framework-free (reused, general) | import-linter | `reflective_executor.py` imports `adapters.providers.fake_client` | 26 kept / 1 broken; restored |
+
+**A failed proof attempt is recorded here as evidence rather than quietly corrected.** The first
+attempt to prove the extended construction guard planted `ReflectiveExecutor(...)` and
+`RetryPolicy(...)` inside `inference_coordinator.py` - and the guard **passed**, which initially
+looked like a broken guard. It was not: that file is in the script's `IMPLEMENTATIONS` exemption
+list, so the mutation never reached the code path being tested. Re-planting the same violations in
+non-exempt files (`routing/engine.py`, `config/settings.py`) produced the expected exit 1. This is
+exactly the "verify the mutation actually occurred and actually triggered the guard" discipline the
+project's enforcement philosophy demands - a proof that passes for the wrong reason is worth less
+than no proof, because it manufactures false confidence.
+
+That episode also surfaced a **known limitation of the construction-guard pattern**, shared by all
+four such scripts (Slices 7-11): the `IMPLEMENTATIONS` exemption is file-name-based and exempts a
+file from *every* target in the list, not just the class it defines. So `inference_coordinator.py`
+could legitimately construct a `SqlResponseCache` without tripping the guard. This is pre-existing
+and consistent across the project rather than introduced here; it is recorded as an observed
+limitation rather than silently rewritten across four scripts in a slice that has no consumer
+demanding the tightening.
+
+### Design decisions recorded as decisions, not defaults
+
+- **`ProviderErrorCategory` has no `UNKNOWN` member.** "Not classified" is already expressible as
+  `error_category=None`; a second spelling of the same fact would be two sources of truth for one
+  condition (Rule 3).
+- **An unclassified failure is non-retryable.** The fail-closed direction: retrying a failure
+  nobody has classified spends the tenant's money on a guess.
+- **`Sleeper` is a separate protocol from `Clock`, not a method on it.** Reading time and elapsing
+  it are different capabilities, and most `Clock` consumers must never be able to block.
+- **`max_attempts` counts total attempts, not retries.** `1` therefore means "never retry" and is
+  the validated floor - an off-by-one here would silently double every tenant's provider spend.
+- **Exponential backoff, no jitter.** Jitter de-synchronises a fleet of callers; this project has
+  no such fleet and no requirement describing one, so it would be an untestable knob with no
+  consumer (Rule 5). The delay sequence is deterministic and asserted exactly.
+- **`FakeProviderClient` gained a per-call `sequence`.** A provider-keyed dict answers every call
+  identically and structurally cannot express "fails twice, then succeeds" - the exact shape a
+  retry layer exists to handle. Real consumer in this slice; the final entry repeats so an
+  over-eager policy keeps seeing the same terminal state rather than falling through to different
+  behaviour.
+
+### Known limitations, stated rather than concealed
+
+- **No rerouting.** A retry always targets the same provider the original routing decision selected.
+  See the finding above - this is a deliberate boundary, revisited only if the routing architecture
+  explicitly delegates provider selection to reflection.
+- **No cross-process retry coordination.** Two replicas each running a reflection loop for the same
+  request would each retry independently; deduplication is process-local (Slice 10's documented
+  limitation, inherited unchanged).
+- **A `committed` reservation still replays as `RESERVED`.** Documented above; an under-charge on a
+  caller defect, not an overspend.
+- **Reflection is not wired into any request path yet.** Like `ReservationService` and
+  `InferenceCoordinator` before it, it is constructed in the composition root and proven by tests;
+  no HTTP handler consumes it, because no inference endpoint exists yet in this project.
+- **No per-tenant or per-route retry policy.** One deployment-wide `RetryPolicy`; nothing consumes
+  a per-tenant variant, so none is built (Rule 5).
+
+### Decision
+
+**No action against ADR-0016** (frozen, unchanged). **No new ADR** - unlike Slices 9 and 10, this
+slice contradicts no existing Accepted decision and introduces no mechanism an ADR had already
+decided differently, so writing one would be ceremony rather than governance. The one protocol
+change is a Rule 5 event on a capability-owned port, recorded here, exactly as Slice 8's `usage`
+field was.
+
+### Lessons
+
+- **Analysing a new capability is one of the better ways to audit an old one.** The phantom-hold
+  defect had survived Slice 9's own pre-commit review, its concurrency test suite, and all of Slice
+  10 - because every existing test released *or* re-reserved, never both in sequence. Asking "what
+  does retry need from this?" exposed it in minutes.
+- **A prediction that is falsified in a small, specific way is more useful than one that holds
+  vacuously.** "No protocol change at all" turned out to be wrong: classification genuinely could
+  not be expressed without typed data on the response. Recording the trigger and its justification
+  is what keeps Rule 5 a live check rather than a box to tick.
+- **The previous slice's discipline paid its own cost back.** Slice 10's insistence that cache
+  identity and deduplication identity are different concepts is precisely what let attempt-scoped
+  retry identity be introduced without breaking either.

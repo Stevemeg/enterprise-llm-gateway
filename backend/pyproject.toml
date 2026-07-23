@@ -324,3 +324,65 @@ modules = [
     "gateway.adapters.ledger.sql_budget_ledger",
     "gateway.adapters.ledger.in_memory_budget_ledger",
 ]
+
+[[tool.importlinter.contracts]]
+# Slice 10 Guard 1 - ResponseCachePort implementations are mutually independent. Same reasoning
+# as Guard C for BudgetLedgerPort (Slice 9): one importing the other would make the pair a single
+# implementation wearing two names, and the Rule-4 proof (a second backend validates the port
+# with no protocol change) would be comparing a backend against itself.
+name = "response cache implementations are mutually independent"
+type = "independence"
+modules = [
+    "gateway.adapters.cache.sql_response_cache",
+    "gateway.adapters.cache.in_memory_response_cache",
+]
+
+[[tool.importlinter.contracts]]
+# Slice 10 Guard 2 - cache adapters store bytes and JSON; they must never author accounting, hold
+# a budget/ledger, or make an authorization decision. Same reasoning as Guard B (ProviderExecutor
+# / accounting, Slice 8): without this, nothing stops a future edit from having the cache adapter
+# itself decide "was this authorized" or "does this affect spend" - exactly the responsibility
+# blur these seams exist to prevent structurally rather than by review.
+name = "cache adapters do not depend on accounting, budget ledger, or authorization"
+type = "forbidden"
+source_modules = ["gateway.adapters.cache"]
+forbidden_modules = [
+    "gateway.application.accounting",
+    "gateway.adapters.ledger",
+    "gateway.application.authorization",
+    "gateway.adapters.authorization",
+]
+
+[[tool.importlinter.contracts]]
+# Slice 10 Guard 3 - inference coordination (cache + dedup + the reserve/execute/settle sequence)
+# never touches the authorization seam. It has nothing to bypass because it has no way to reach
+# the seam at all: authorization is decided upstream, in the pipeline, before anything in this
+# package runs (ADR-0016 invariant 2 applied to a new capability).
+name = "inference coordination does not depend on authorization"
+type = "forbidden"
+source_modules = ["gateway.application.execution"]
+forbidden_modules = ["gateway.application.authorization", "gateway.adapters.authorization"]
+
+[[tool.importlinter.contracts]]
+# Slice 11 Guard 1 - reflection owns retry policy and attempt orchestration, nothing else. It
+# reaches every other capability exclusively through its one sanctioned collaborator,
+# InferenceCoordinator. Forbidding these four *directly* is what makes the slice's central claims
+# structural rather than reviewed:
+#   - application.providers  -> a retry cannot bypass ProviderExecutor (and therefore cannot skip
+#                               the budget gate that precedes it inside the coordinator)
+#   - application.accounting -> reflection cannot author a CostRecord or move budget itself
+#   - ports.ledger           -> reflection cannot reserve, settle or release directly
+#   - application.routing    -> reflection cannot reroute; provider selection stays with the
+#                               routing engine / AgentRuntime (Guard L already bars the runtime)
+# allow_indirect_imports: reflection -> execution -> accounting/providers is the *intended* path.
+# Only a direct reach-around is a violation, which is exactly what this contract catches.
+name = "reflection reaches other capabilities only through its coordinator"
+type = "forbidden"
+source_modules = ["gateway.application.reflection"]
+forbidden_modules = [
+    "gateway.application.providers",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.routing.engine",
+]
+allow_indirect_imports = true

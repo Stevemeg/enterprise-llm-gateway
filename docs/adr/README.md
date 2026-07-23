@@ -34,6 +34,7 @@ traceability, as mandated by the project workflow.
 | [0015](0015-oidc-login-state-storage.md) | OIDC login-state storage & RLS bootstrapping | Accepted | (schema change) |
 | [0016](0016-enterprise-ai-os-architecture.md) | Evolution to an Enterprise AI Operating System | Proposed | (architecture) |
 | [0017](0017-postgres-transactional-budget-reservation.md) | PostgreSQL-transactional reserve/commit as the interim hard-budget mechanism | Accepted | (scopes ADR-0004's mechanism, does not reverse it) |
+| [0018](0018-exact-match-response-cache-and-request-deduplication.md) | Exact-match response caching and process-local request deduplication | Accepted | (scopes ADR-0006's mechanism, does not reverse it) |
 
 All nine Phase-1 architecture-blocking questions are resolved by the ADRs marked in **bold**. A
 tabular cross-reference of every decision is in

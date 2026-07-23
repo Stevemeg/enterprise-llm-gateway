@@ -189,6 +189,8 @@ No members added; no superseding ADR required. Recorded in the evidence log.
 | **Phase 4 Slice 7 — Provider Execution** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 315 passed, 0 skipped, 96% coverage** |
 | **Phase 4 Slice 8 — Usage Metering, Cost Accounting & Budget Enforcement** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 352 passed, 0 skipped, 96% coverage** |
 | **Phase 4 Slice 9 — Persistent Usage Ledger & Atomic Budget Settlement** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 397 passed, 0 skipped, 96% coverage** |
+| **Phase 4 Slice 10 — Semantic-Safe Response Caching & Request Deduplication** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 440 passed, 0 skipped, 96% coverage** |
+| **Phase 4 Slice 11 — Reflection / Retry Layer** | **Capability** | **✅ COMPLETE** | **✅ Gate 1 + Gate 2 PASS: 485 passed, 0 skipped, 97% coverage** |
 | MCP Gateway | Foundation | ⏳ | — |
 | RBAC | Capability | ⏳ | — |
 
@@ -403,3 +405,128 @@ import-linter 23 kept / 0 broken.** Alembic at head (`0006_budget_ledger`); runt
 including the new concurrency and append-only-enforcement tests, executed against real PostgreSQL
 16 + pgvector, none skipped.
 
+### Slice 10 — Semantic-Safe Response Caching & Request Deduplication — ✅ COMPLETE
+
+Rule 5 **not triggered against Tier 1** (zero diff on `domain/`, `ports/routing.py`, `pipeline.py`,
+`tools.py`, `mcp.py`, `agents.py`, `application/agents/runtime.py`, `docs/adr/0016-*.md`).
+`RoutingDecision`/`RoutingExecution`/`InferenceRequest`/`ProviderResponse` are all unmodified.
+Caching and request deduplication were confirmed to be different concepts (content-keyed vs.
+correlation-keyed identity) before any code was written — see Architecture_Evidence_Log.md. New
+**ADR-0018** adopted: PostgreSQL-backed exact-match caching plus process-local deduplication as the
+current, verified mechanism, scoping — not reversing — ADR-0006's two-tier (Redis exact +
+`pgvector` semantic) decision (no Redis client, embedding pipeline, or event-bus consumer exists
+anywhere in this codebase; building either now would be speculative infrastructure with no active
+consumer). **No new migration required** — unlike Slice 9's finding for the budget/reservation
+tables, the pre-existing `semantic_cache_entry` table (`0001_initial.sql`) already fits exact-match
+caching exactly, already RLS-protected, already granted to `app_rw`.
+
+| Component | Module | Role |
+|---|---|---|
+| Port (capability-owned, new) | `application/ports/cache.py` | `ResponseCachePort`, `CacheKey`, `CachedResponse`, `CacheUnavailableError` — fails **open**, not closed (contrast `BudgetLedgerPort`) |
+| Cache-key canonicalization (new) | `application/execution/cache_key.py` | `compute_cache_key()` — deterministic SHA-256 over `(organization_id, provider, model, canonical payload)`; deliberately excludes `correlation_id` |
+| Deduplicator (new, concrete, not a port) | `application/execution/deduplicator.py` | `RequestDeduplicator`; process-local `asyncio.Task`-based single-flight coalescing keyed on `(organization_id, correlation_id)` |
+| Coordinator (new) | `application/execution/inference_coordinator.py` | `InferenceCoordinator`; the first real, tested caller of the full cache → dedup → reserve → execute → settle/release sequence `ReservationService`/`ProviderExecutor` had left to "a future delivery-layer handler" |
+| Shared crypto primitive (extended) | `shared/secrets.py` | `sha256_bytes()` added alongside the existing `sha256_hex()` — routes the new cache-key digest through the project's single audited crypto boundary |
+| Validation implementation (Rule 4, real) | `adapters/cache/sql_response_cache.py` | `SqlResponseCache`; TTL-expiring, tenant-bound via `AsyncUnitOfWork`, against real PostgreSQL |
+| Validation implementation (Rule 4, fast double) | `adapters/cache/in_memory_response_cache.py` | `InMemoryResponseCache`; process-local, documented as NOT proving RLS |
+| SQLAlchemy Core table (new, reused table) | `adapters/persistence/cache_tables.py` | Points at the pre-existing `semantic_cache_entry`; only the columns this slice uses are declared |
+| Composition root | `config/container.py` | Constructs `cache_port` (`SqlResponseCache` if `rls_enabled` else `InMemoryResponseCache`), `deduplicator`, `inference_coordinator` (new Guard 1) |
+| Guard 1 (new script) | `scripts/check_execution_construction.py` | Construction of the two cache adapters, `RequestDeduplicator`, `InferenceCoordinator` confined to the composition root — classified NEW (new capability boundary), not an extension of Slice 8/9's accounting-construction script |
+| Guard (new) | `pyproject.toml` import-linter | `SqlResponseCache`/`InMemoryResponseCache` mutually independent |
+| Guard (new) | `pyproject.toml` import-linter | `gateway.adapters.cache` forbidden from importing accounting, the ledger adapters, or authorization |
+| Guard (new) | `pyproject.toml` import-linter | `gateway.application.execution` forbidden from importing authorization |
+| `RoutingDecision` construction (reused, unchanged) | `scripts/check_routing_decision_construction.py` | Whole-repo AST scan with no per-slice allowlist to update — proven to catch a planted violation in `inference_coordinator.py` with zero script changes |
+| `AgentRuntime` sole-caller (reused, unchanged) | `scripts/check_routing_engine.py` Guard L | Proven the same way |
+| Application framework-free (reused, general) | `pyproject.toml` import-linter | Pre-existing blanket contract, proven to catch `import sqlalchemy` planted in `deduplicator.py` |
+
+A `DeduplicationPort` protocol was considered and rejected as premature: exactly one correct
+implementation exists (process-local coalescing), and a `Protocol` with no second implementation to
+prove substitutability would be exactly the speculative abstraction Rule 4/GP-1 warn against —
+`RequestDeduplicator` is a concrete class, mirroring `ReservationService`/`ProviderExecutor`.
+
+**Documented limitations (not omissions):** exact-match only, no near-duplicate/semantic-similarity
+caching (deferred to ADR-0006's Tier 2, pending evidence); no cross-process deduplication guarantee
+(`RequestDeduplicator` is process-local — Slice 9's ledger idempotency still prevents
+double-*charging* across processes, but not a double provider *call*); no "cache stampede"
+protection across different `correlation_id`s with identical content (deduplication is
+correlation-keyed, not content-keyed, by design); no explicit purge/invalidation beyond TTL expiry;
+`hit_count`/`prompt_fingerprint` on the reused table are not populated.
+
+Tests: `test_cache_key.py` (9), `test_in_memory_response_cache.py` (7), `test_deduplicator.py` (7),
+`test_inference_coordinator.py` (12), plus `test_container.py` (+2) for the wired seams (unit); 8
+tests in `test_response_cache_postgres.py` (integration) covering hit/miss, TTL expiry, a malformed
+stored entry failing open, cross-tenant RLS isolation (including a deliberately colliding raw key),
+and a connection outage failing open with `CacheUnavailableError`.
+
+**Gate 1 + Gate 2: PASS — 440 passed, 0 skipped, 96% coverage, mypy strict clean (206 files),
+import-linter 26 kept / 0 broken.** Alembic head unchanged at `0006_budget_ledger` (no migration
+this slice); runtime role verified `app_rw`, `rolsuper=False`, `rolbypassrls=False`. All
+Postgres-backed integration/security tests, including the new cache RLS/TTL/outage tests, executed
+against real PostgreSQL 16 + pgvector, none skipped.
+
+### Slice 11 — Reflection / Retry Layer — ✅ COMPLETE
+
+Rule 5 **not triggered against Tier 1** (zero diff on `domain/`, `ports/routing.py`, `pipeline.py`,
+`tools.py`, `mcp.py`, `agents.py`, `application/agents/runtime.py`, `application/routing/engine.py`,
+`docs/adr/0016-*.md`). **Triggered and satisfied** against the Slice-7/8 capability-owned
+`ProviderResponse`: an additive, optional `error_category: ProviderErrorCategory | None = None`,
+consumed by the new retry classifier — every prior construction remains valid unchanged, exactly
+the shape of Slice 8's `usage` addition to the same port. **No new ADR** — this slice contradicts no
+existing Accepted decision, so a companion ADR (as Slices 9 and 10 needed) would be ceremony rather
+than governance. **No migration.**
+
+Analysing retry semantics also surfaced a **genuine pre-existing defect in Slice 9's ledger**,
+reachable from Slice 10's coordinator with no reflection involved: `reserve()`'s idempotent-replay
+branch matched any existing row regardless of `status`, so `reserve → release → reserve` returned
+`RESERVED` while holding nothing (verified empirically against real Postgres: `reserved=0E-8`, and
+the full limit still admissible to a competing request). Fixed in both ledger adapters and covered
+by regression tests. See [Architecture_Evidence_Log.md](Architecture_Evidence_Log.md).
+
+| Component | Module | Role |
+|---|---|---|
+| Port (widened, Rule 5) | `application/ports/providers.py` | `ProviderErrorCategory` (TIMEOUT/RATE_LIMITED/SERVER_ERROR/INVALID_REQUEST/AUTHENTICATION); `ProviderResponse.error_category`. No `UNKNOWN` member — "not classified" is already `None` |
+| Time abstraction (extended) | `shared/clock.py` | `Sleeper` protocol + `AsyncioSleeper`; separate from `Clock` because reading time and elapsing it are different capabilities |
+| Retry policy + classifier (new) | `application/reflection/retry_policy.py` | `RetryPolicy` (typed bounds, validates `max_attempts >= 1`, exponential backoff, no jitter), `RetryVerdict`, `classify()` — fail-closed: only positively-transient outcomes retry |
+| Reflection orchestrator (new) | `application/reflection/reflective_executor.py` | `ReflectiveExecutor`, `AttemptRecord`, `ReflectionResult`; bounded loop over `InferenceCoordinator`, its **only** collaborator |
+| Test double (extended) | `adapters/providers/fake_client.py` | Per-call `sequence` — a provider-keyed dict answers every call identically and cannot express "fails twice, then succeeds" |
+| Ledger defect fix | `adapters/ledger/{sql,in_memory}_budget_ledger.py` | A `released` reservation is now genuinely re-held (new `_hold` helper), not replayed as a phantom hold |
+| Composition root | `config/container.py` | Constructs `sleeper`, `retry_policy`, `reflective_executor` (Guard 1, extended) |
+| Guard (new) | `pyproject.toml` import-linter | `gateway.application.reflection` forbidden from `application.providers`, `application.accounting`, `ports.ledger`, `application.routing.engine` — with `allow_indirect_imports = true`, because reflection → coordinator → those is the *intended* path and only a direct reach-around is a violation |
+| Guard 1 (reused, extended) | `scripts/check_execution_construction.py` | `TARGETS`/`IMPLEMENTATIONS` extended with `ReflectiveExecutor`/`RetryPolicy` — same script, same pattern as Slice 9's extension of the accounting guard |
+| `RoutingDecision` construction (reused, unchanged) | `scripts/check_routing_decision_construction.py` | Proven to catch a planted construction in `reflective_executor.py` with zero script changes |
+| Guard L (reused, unchanged) | `scripts/check_routing_engine.py` | Proven the same way against an `AgentRuntime` reference |
+| Application framework-free (reused, general) | `pyproject.toml` import-linter | Pre-existing blanket contract, proven to catch an adapter import planted in `reflective_executor.py` |
+
+**Responsibility boundaries held.** Reflection decides *whether another attempt is warranted* and
+nothing else. It does not reroute (provider selection stays with `ProviderAgent`/`AgentRuntime` —
+building rerouting would require a second `RoutingDecision` for one logical request, i.e. two
+explanations, so it was deliberately not built), does not construct or mutate `RoutingDecision`
+(carried through frozen and asserted identical by `is`), does not call `AgentRuntime`, does not
+invoke provider adapters, does not author cost, and cannot bypass `ProviderExecutor` or the budget
+gate — every attempt goes back through `InferenceCoordinator`, structurally enforced by the new
+contract rather than by review.
+
+**Attempt identity.** Each attempt executes under `<correlation_id>#<attempt>` so it reserves,
+settles or releases independently (Slice 9 keys on `(organization_id, correlation_id)`; reusing the
+bare id would have made attempt 2's `settle` a swallowed duplicate — a provider call the tenant was
+never charged for). This is safe against both Slice-10 identities *because* Slice 10 kept them
+separate: cache identity ignores `correlation_id` entirely, and deduplication identity uses it, so
+N concurrent duplicates derive the same attempt id and coalesce at every attempt — 3 duplicate
+callers × 3 attempts is 3 provider calls, not 9.
+
+**Documented limitations (not omissions):** no rerouting; no cross-process retry coordination
+(process-local dedup, inherited from Slice 10); a `committed` reservation still replays as
+`RESERVED` (a caller defect whose exposure is an under-charge, not an overspend); reflection is
+constructed and tested but not yet wired into a request path (no inference endpoint exists yet);
+one deployment-wide `RetryPolicy`, no per-tenant variant (Rule 5 — no consumer).
+
+Tests: `test_retry_policy.py` (16), `test_reflective_executor.py` (20), `test_clock.py` (4), plus
+`test_container.py` (+2) for the wired seams and 3 ledger regression tests (2 Postgres, 1 in-memory).
+No test sleeps in real wall-clock time: the sleeper is injected and records the delays it was asked
+for, so backoff is asserted exactly (`[100ms, 200ms, 400ms]`) rather than approximately.
+
+**Gate 1 + Gate 2: PASS — 485 passed, 0 skipped, 97% coverage, mypy strict clean (212 files),
+import-linter 27 kept / 0 broken.** Alembic head unchanged at `0006_budget_ledger` (no migration
+this slice); runtime role verified `app_rw`, `rolsuper=False`, `rolbypassrls=False`. All
+Postgres-backed integration/security tests, including the new ledger regression tests, executed
+against real PostgreSQL 16 + pgvector, none skipped.
