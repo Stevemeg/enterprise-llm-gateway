@@ -1620,3 +1620,301 @@ genuine conflict with ADR-0004/ADR-0006 existed.
   `git checkout --` silently cannot restore a file git does not track, which let one mutation
   survive into the next proof. Verifying the mutation *and* verifying the restore is the complete
   discipline; only verifying the mutation is not.
+
+## Evidence Record - Phase 4 Slice 14: Request Admission Pipeline
+
+**Milestone type: Foundation** - and the one place in Phase 4 where "a Foundation milestone with no
+ADR is suspect" does not apply. Rule 2 requires ADR -> protocol -> CI enforcement before
+implementation. ADR-0016 is the ADR, `PipelineStage` has been the protocol since Slice 1, and this
+slice supplies the third artifact that invariant 5's own enforcement column always demanded and
+never had: **"stage registration + ordering"**. No new seam is born here, so no new ADR is written;
+what changes is that the existing seam finally executes.
+
+### The roadmap discrepancy, recorded rather than worked around
+
+The brief named `Phase4_Master_Execution_Plan.md` and `AIOS_Architecture.md`. **Neither exists in
+this repository.** ADR-0016 line 242 says it "establishes the framing for the Phase-4 Master
+Execution Plan" - a document that was never committed. The authoritative roadmap is therefore
+ADR-0016's Tier-1 table plus its Tier-2 list, reconciled against this log. Read that way, the next
+slice was not a matter of interpretation:
+
+| Source | What it says |
+|---|---|
+| ADR-0016 invariant 5 | CI enforcement = "stage **registration + ordering** + protocol tests" - never built |
+| This log, Slice 13 | "the single largest piece of outstanding debt across Slices 5-13" is that no runner exists |
+| `noop_stage.py` docstring (Slice 1) | exists "to give ordering/registration tests something concrete" - a consumer anticipated for 13 slices |
+| `ports/evaluation.py` (Slice 12) | declined to become a stage partly because "no pipeline runner exists yet" |
+| Container, before this slice | `AuthorizationStage` **was not constructed anywhere at all** |
+
+### Rule 5 determination
+
+| Question | Result |
+|---|---|
+| Rule 5 against Tier 1 | **NOT TRIGGERED** - zero diff on `domain/`, `ports/pipeline.py`, `ports/tools.py`, `ports/mcp.py`, `ports/agents.py`, `agents/`, ADR-0016 |
+| Rule 5 against any capability-owned port | **NOT TRIGGERED** - the runner consumes `PipelineStage`, `StageContext`, `StageResult` and `StageAction` exactly as they already exist and adds no field to any of them |
+| Migration / persistence | **None** - admission decides; it stores nothing. Alembic head unchanged |
+
+### Finding: `StageResult` documents an invariant it does not enforce
+
+`StageResult`'s docstring states that `BLOCK` "must carry a `reason`", because "a stage that blocks
+without saying why produces an unexplainable denial". The dataclass has **no `__post_init__` and
+never checked it**. For thirteen slices nothing executed a stage, so nothing could observe the gap.
+
+**Rule 5 was applied and came back NOT TRIGGERED, deliberately.** Rule 5's third question - why the
+change does not belong in the consumer instead - answers itself here: `RequestPipeline` is the only
+component that will ever read a `StageResult`, so compensating in the runner closes the gap
+completely, whereas adding validation to a frozen Tier-1 type would invalidate previously legal
+constructions across three slices of existing stages and buy no additional guarantee. An unexplained
+block stays a block: the generic reason is substituted and `unexplained_block` recorded for audit.
+It is never upgraded to admission.
+
+### Finding: ordering was derived from side effects, not from intuition
+
+The obvious ordering (authorization -> policy -> routing) turns out to be right for a reason that is
+checkable rather than aesthetic. Routing is the **only** admission stage with a real downstream
+effect: `AgentRoutingStage` invokes the routing engine, which runs the entire five-agent chain.
+Authorization and policy are pure decisions. Routing therefore runs last not because it is "least
+important" but because it is the one stage a denial must be able to prevent - and
+`test_an_authorization_denial_means_no_policy_evaluation_and_no_routing` asserts exactly that
+against a spy wrapping the *real* engine.
+
+The rejected alternative is recorded too: policy before authorization. It is cheaper (pure local
+computation vs. a resolver call), but it would evaluate a deployment's request limits for a caller
+who may not act at all, and a policy denial discloses that a threshold exists. Identity first.
+
+### Finding: stages must not communicate through the context
+
+Each stage receives its own copy of `StageContext.attributes`. Stricter than today's three stages
+need - none reads another's output - and chosen for a concrete reason: `attributes` is opaque by
+contract *and caller-supplied*, so a shared mutable bag would let a stage, or a caller crafting an
+attribute shaped like a stage's annotation, influence a control that runs after it. Annotations come
+back in the per-stage audit record, where they cannot be mistaken for request input.
+
+### The guard evaluation
+
+| Candidate | Classification | Reasoning |
+|---|---|---|
+| `RequestPipeline` construction confined to the composition root | **NEW** (`check_pipeline_construction.py`) | A new file, applying `check_execution_construction.py`'s own stated test: extend for more classes inside a boundary it already fences, new file for a new boundary. Admission is not execution - different package, different question, and it runs before the execution guard's subjects exist. It is also the **strongest** version of the invariant in the codebase: every earlier construction guard confines a component that chooses *how* something is done; this one confines the component that chooses **which controls run at all** |
+| The request pipeline reaches no capability (import-linter, 10 forbidden targets) | **NEW** | Makes "the runner executes and decides nothing" structural. Deliberately **not** `allow_indirect_imports` - unlike the Slice 11/12 contracts this package has no sanctioned collaborator to reach through, so any path at all is a violation |
+| Permission-resolver construction (Guard I, Slice 5) | **REUSED - and exercised for the first time** | Guard I was never *vacuous* (it could always fail), but it was **unexercised**: no resolver was constructed anywhere in `src/gateway`, so it guarded code that did not exist. Wiring `NullPermissionResolver` gives it a real subject. Re-proven here |
+| `RoutingDecision` construction / Guard L | **REUSED, unchanged** | Whole-repo AST scans; proven against the new `application/pipeline/runner.py` |
+| The stages themselves confined to the composition root | **NOT APPLICABLE** | A stage holds no authority over whether it is consulted - only membership in the pipeline makes a control run, and the pipeline is confined. Guarding them would inflate the count without enforcing anything new |
+| `application.pipeline` must not import `adapters` | **REDUNDANT** | Already covered by "application is framework-free and inward-only". Not added, not counted |
+
+### Enforcement (each violated, mutation verified present, observed failing, restored, restore verified, observed passing)
+
+**15/15 proven.** Restores were verified by content comparison rather than `git checkout --`, because
+`runner.py` is untracked and git cannot restore it - the Slice-12 lesson, applied.
+
+| Guard | Violation planted | Observed |
+|---|---|---|
+| Pipeline construction (new) | `RequestPipeline([])` in `routing/engine.py` | exit 1 |
+| ...same | ...in `config/settings.py` | exit 1 |
+| Runner reaches no capability (new) | one direct import per forbidden target, 10 proven separately | 31 kept / 1 broken, each |
+| Guard I (reused) | `NullPermissionResolver()` in `routing/engine.py` | exit 1 |
+| `RoutingDecision` (reused) | `RoutingDecision(...)` in `pipeline/runner.py` | exit 1 |
+| Guard L (reused) | `AgentRuntime` referenced in `pipeline/runner.py` | exit 1 |
+
+Both planting sites for the construction guard are outside its `ALLOWED` **and** `IMPLEMENTATIONS`
+lists - the Slice-11 false-positive trap, avoided by construction.
+
+### Known limitations, stated rather than concealed
+
+- **`after_response` and `on_error` are still not executed by anything.** Deliberate: this slice has
+  no response and no error to hand a stage, and building both halves with no consumer would be the
+  speculative shape GP-1 forbids. Slice 15 is their first real consumer.
+- **The default composed pipeline denies every request** (`NullPermissionResolver` grants nothing; no
+  endpoint declares a requirement). That is the fail-closed direction and the same "nothing
+  configured yet" posture as the empty provider catalog and price table - and it is asserted, not
+  assumed, by `test_the_default_deployment_admits_nothing`.
+- **No HTTP endpoint.** Admission runs around an application-layer call, not around a route. The
+  delivery surface remains outstanding debt.
+
+### Decision
+
+**No action against ADR-0016** (frozen, byte-unchanged). **No new ADR** - see the milestone-type
+note above. Validation at Slice-14 completion: **583 passed, 0 skipped, 97% coverage, mypy strict
+clean (227 files), import-linter 32 kept / 0 broken**, `runner.py` at 100% line coverage.
+
+## Evidence Record - Phase 4 Slice 15: Served Inference Path
+
+**Milestone type: Capability.** It consumes seams that already exist and introduces no extension
+point: `PipelineStage` (Tier 1, untouched), `RequestPipeline` (Slice 14), `ReflectiveExecutor`
+(Slice 11), `EvaluationRunner` (Slice 12). No new ADR.
+
+### Rule 5 determination
+
+| Question | Result |
+|---|---|
+| Rule 5 against Tier 1 | **NOT TRIGGERED** - zero diff on `domain/`, `ports/pipeline.py`, `ports/tools.py`, `ports/mcp.py`, `ports/agents.py`, `agents/`, ADR-0016. `StageResult.annotations` stays `dict[str, Any]`; no protocol method, field or signature changed |
+| Rule 5 against a capability-owned port | **TRIGGERED, and satisfied** - `ROUTING_EXECUTION_KEY` added to `application/ports/routing.py`. Recorded below |
+| Migration / persistence | **None.** Alembic head unchanged at `0006_budget_ledger` |
+
+#### Rule 5 event: `ROUTING_EXECUTION_KEY` declared in `ports/routing.py`
+
+1. **Active consumer:** `application/serving/inference_service.py`, new in this slice - the first
+   component that reads a routing result back out of an admitted request in order to execute it.
+2. **Why the current arrangement was insufficient:** the key was a private constant inside
+   `adapters/pipeline/routing_stage.py`. An application-layer consumer cannot import it (Clean
+   Architecture forbids application -> adapters, CI-enforced), so the only alternative was to
+   re-declare the literal at the consumer - two spellings of one contract, drifting silently the
+   first time either changed. Exactly the failure Rule 3 exists to prevent.
+3. **Why it does not belong in the consumer instead:** producer and consumer must agree, and the
+   agreement belongs beside the type being transported. Mirrors `REQUEST_PAYLOAD_KEY` in
+   `ports/policy.py` (Slice 13) and `REQUIRED_PERMISSIONS_KEY` in
+   `application/authorization/requirements.py` (Slice 5).
+
+Capability-owned port, so this is a Rule 5 event recorded here rather than a new ADR - the same
+shape as `ProviderUsage` (Slice 8) and `ProviderErrorCategory` (Slice 11).
+
+### Finding: the first end-to-end integration exposed a real defect in Slice 6's transport
+
+`AgentRoutingStage` published `execution.decision` and dropped `execution.provider`. That reads as
+correct - the decision is the sole explanation, and the stage's contract is to transport an
+explanation rather than adjudicate. But `RoutingExecution.routed` means "SELECTED **and** a provider
+was resolved", so the transported half could report that a provider had been chosen while carrying
+nothing capable of calling it. **A lossy transport, invisible for nine slices because nothing ever
+executed the pipeline.**
+
+Fixed at the smallest correct boundary: the stage transports the whole `RoutingExecution`. Still one
+annotation, still one source of truth, and `decision` remains reachable as `execution.decision`. The
+rejected alternative - a second key beside the first - would have put two views of one result into
+the attributes bag, which is the shape the stage's own docstring warns against. Pinned by
+`test_the_transported_selection_carries_the_provider_it_resolved_to`.
+
+This is a **prediction that fired**: ADR-0016 Rule 4 says a seam is unproven until one real
+implementation exists behind it. The corollary this slice supplies is that a *transport* is unproven
+until something on the far side consumes what it carries.
+
+### Finding: a guard extension silently weakened the guard it extended
+
+Adding `InferenceService` to `check_pipeline_construction.py` also added
+`serving/inference_service.py` to its `IMPLEMENTATIONS` exemption list - and that list is
+**per-file, not per-target**. The service file thereby gained permission to construct a
+`RequestPipeline` too: it could have assembled its own admission chain with the guard still printing
+PASS.
+
+**Caught by re-proving the Slice-14 target after the Slice-15 extension** - the proof came back
+`exit 0` where it had to be `exit 1`. Nothing else would have noticed; both the guard and the whole
+suite were green. Fixed by making the exemption per-class: a defining module is exempt for its own
+class only.
+
+The same flat-list weakness exists in the four earlier construction guards
+(`check_execution_construction.py`, `check_accounting_construction.py`,
+`check_provider_construction.py`, `check_resolver_construction.py`). Each is effectively
+single-purpose per file today, so none is currently exposed; recorded here as deferred debt rather
+than fixed in this slice, because rewriting four guards is not what this slice's evidence supports.
+
+**This is the second time this project has produced a guard that passed while unable to fail, and
+the second time only a deliberate-failure proof found it.** The rule that caught it is the one worth
+restating: extending a guard obliges you to re-prove what it already caught, not merely to prove the
+new thing.
+
+### Finding: a refusal must not be dressed as a provider failure
+
+`ServedInference` returns `reflection=None` and `evaluation=None` for a refused request rather than
+synthesizing `ProviderResponse(ok=False, ...)`. Synthesizing one would make an admission decision
+indistinguishable from a provider outage to every downstream reader, and would feed the evaluators a
+call that never happened - inviting precisely the double-counting `UsageAccountingConsistencyEvaluator`
+was built to catch. "Denied at admission", "routed nowhere", "denied by budget" and "the provider
+failed" stay four distinguishable facts.
+
+For the same reason a refusal is **not evaluated at all**: evaluation observes completed inferences,
+and a request that never entered the system produced none. Emitting `NOT_APPLICABLE` verdicts for
+rejected traffic would make every quality metric a function of how much traffic was rejected.
+
+### Ordering, derived from existing semantics
+
+    admit (authorization -> policy -> routing)   Slice 14
+      -> reflect (bounded retry)                 Slice 11
+        -> coordinate (cache -> reserve -> execute -> settle/release)   Slices 9, 10
+      -> evaluate the final result, once         Slice 12
+
+Two points were derived rather than assumed. **Cache before budget** is Slice 10's existing
+semantics, unchanged: a hit spends nothing, so there is nothing to gate. **Evaluation after the
+retry loop, not per attempt**, because reflection may make several attempts under attempt-scoped
+identities; evaluating each would count one logical request several times and would report a
+transient failure a retry already recovered from as a quality problem
+(`test_a_transient_failure_a_retry_recovered_is_not_reported_as_a_quality_problem`).
+
+### The guard evaluation
+
+| Candidate | Classification | Reasoning |
+|---|---|---|
+| `InferenceService` construction confined to the composition root | **REUSED-EXTENDED** (`check_pipeline_construction.py`) | The service chooses *which pipeline guards a request*, plus which executor and evaluator chain follow it - the identical authority one step further out. A second script would have duplicated this one's logic under another name. The extension exposed and fixed the per-file exemption defect above |
+| The served path composes capabilities and owns none (import-linter, 7 forbidden targets) | **NEW** | One forbidden target per ownership claim. `allow_indirect_imports` **is** set here, unlike Slice 14's runner contract: serving -> reflection -> execution -> accounting/providers is the intended path, so only a direct reach-around is a violation - the Slice 11/12 shape, for the Slice 11/12 reason |
+| `RoutingDecision` construction / Guard L | **REUSED, unchanged** | Proven against `serving/inference_service.py` |
+| A guard that "evaluation runs exactly once" | **NOT APPLICABLE** (static analysis cannot express it) | A call-count invariant is a runtime property. Enforced by test (`test_evaluation_runs_exactly_once_on_the_final_result`, `test_retries_go_through_the_coordinator_and_are_evaluated_only_once_at_the_end`) and recorded as such rather than dressed up as a guard |
+| A contract forbidding `serving` -> `adapters` | **REDUNDANT** | Covered by "application is framework-free and inward-only". Not added, not counted |
+
+### Enforcement (each violated, mutation verified present, observed failing, restored, restore verified, observed passing)
+
+**13/13 proven**, plus all **15/15** Slice-14 proofs re-run and still green after the guard change.
+
+| Guard | Violation planted | Observed |
+|---|---|---|
+| Pipeline construction, extended | `InferenceService(...)` in `routing/engine.py` | exit 1 |
+| ...same | ...in `config/settings.py` | exit 1 |
+| ...**regression check** | `RequestPipeline([])` in `serving/inference_service.py` | exit 1 (was **exit 0** before the fix - see the finding above) |
+| Served path owns nothing (new) | one direct import per forbidden target, 7 proven separately | 32 kept / 1 broken, each |
+| `RoutingDecision` (reused) | `RoutingDecision(...)` in `serving/inference_service.py` | exit 1 |
+| Guard L (reused) | `AgentRuntime` referenced in `serving/inference_service.py` | exit 1 |
+| Slice-14 contract still live | `import ...routing.engine` in `pipeline/runner.py` | 32 kept / 1 broken |
+
+### Negative evidence produced by this slice
+
+Every one of these was previously unassertable, because nothing composed admission with execution.
+
+| Property | Test |
+|---|---|
+| authorization denial -> no policy call, no routing, no reservation, no provider call, no evaluation | `test_an_authorization_denial_reaches_nothing_downstream` |
+| policy denial -> same | `test_a_policy_denial_reaches_nothing_downstream` |
+| budget rejection -> provider never called, nothing settled | `test_a_budget_denial_means_the_provider_is_never_called` |
+| provider failure -> reservation released, nothing settled | `test_a_provider_failure_releases_the_reservation_and_settles_nothing` |
+| cache hit -> no provider call, no second reservation or settlement, `usage is None` | `test_a_cache_hit_calls_no_provider_and_accounts_no_second_time` |
+| retries stay inside the coordinator, each attempt independently reserved/settled/released | `test_retries_go_through_the_coordinator_and_are_evaluated_only_once_at_the_end` |
+| evaluation runs exactly once, on the final result | `test_evaluation_runs_exactly_once_on_the_final_result` |
+| admitted but unroutable -> no provider call, no budget movement, still evaluated | `test_an_admitted_but_unroutable_request_calls_no_provider_and_is_still_evaluated` |
+| the service reads routing from the pipeline rather than routing again | `test_the_service_reads_routing_from_the_pipeline_rather_than_routing_again` |
+
+Spies **wrap the real collaborators** rather than replacing them: "the provider was not called" and
+"budget was not touched" are only evidence if the things that did not happen are the components that
+would really have done them.
+
+### Known limitations, stated rather than concealed
+
+- **Still no HTTP endpoint.** `InferenceService` is called by tests and the container, not by a
+  route. Admission now genuinely gates the inference path, but "real inference traffic" in the sense
+  of an inbound request over the network does not exist yet. This is the largest remaining piece of
+  the original debt and it is deliberately not closed here: an endpoint pulls in request/response
+  schemas, the API error model and streaming, none of which this slice's evidence speaks to.
+- **The default deployment still denies everything** - inherited from Slice 14, unchanged.
+- **`PipelineStage.after_response` and `on_error` remain unexecuted.** Slice 15 turned out **not** to
+  be their first consumer after all: the service composes admission around an application call whose
+  response is a typed `ReflectionResult`, and pushing that through the opaque `attributes` bag to
+  reach `after_response` is the same Rule 3 violation Slice 12 rejected. They stay unexecuted, and
+  saying so is more useful than manufacturing a consumer for them.
+- **`RoutingTransportError` is a defect path, not a request outcome.** Reachable only by composing a
+  pipeline with no routing stage - a real misconfiguration, tested through the public `serve()` call
+  rather than by reaching into the private helper.
+
+### Decision
+
+**No action against ADR-0016** (frozen, byte-unchanged). **No new ADR** - the Rule 5 event is on a
+capability-owned port, and nothing here contradicts an Accepted decision. Validation at Slice-15
+completion: **606 passed, 0 skipped, 97% coverage, mypy strict clean (230 files), import-linter 33
+kept / 0 broken**; `serving/inference_service.py` and `pipeline/runner.py` both at 100% line
+coverage.
+
+### Lessons
+
+- **A transport is unproven until something consumes what it carries.** Rule 4 says a seam needs one
+  real implementation; nine slices of green validation hid a routing annotation that dropped half its
+  payload, because "one real implementation" existed on the producing side only.
+- **Extending a guard obliges you to re-prove what it already caught.** The per-file exemption defect
+  was introduced and detected inside one slice, and only because the extension's proof included a
+  regression check rather than only the new target.
+- **The debt was not "a missing runner" but "a missing consumer".** Every capability from Slice 5
+  onward was correct in isolation and unreachable in composition. Two slices of pure wiring - no new
+  capability, no new ADR, no migration - converted thirteen slices of construction-time correctness
+  into enforcement.

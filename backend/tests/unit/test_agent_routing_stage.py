@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from gateway.adapters.pipeline.routing_stage import ROUTING_DECISION_KEY, AgentRoutingStage
+from gateway.adapters.pipeline.routing_stage import AgentRoutingStage
 from gateway.application.agents.cost import CostAgent
 from gateway.application.agents.health import HealthAgent
 from gateway.application.agents.planner import PlannerAgent
@@ -13,6 +13,7 @@ from gateway.application.agents.policy import PolicyAgent
 from gateway.application.agents.provider import ProviderAgent
 from gateway.application.agents.runtime import AgentRuntime
 from gateway.application.ports.pipeline import PipelineStage, StageAction, StageContext
+from gateway.application.ports.routing import ROUTING_EXECUTION_KEY, RoutingExecution
 from gateway.application.routing.catalog import InMemoryProviderCatalog, ProviderDescriptor
 from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
 from gateway.domain.routing.models import RoutingDecision, RoutingOutcome
@@ -53,10 +54,24 @@ async def test_selection_annotates_the_pipeline_with_the_decision() -> None:
 
     assert result.action is StageAction.ANNOTATE
     assert result.blocked is False
-    decision = result.annotations[ROUTING_DECISION_KEY]
+    execution = result.annotations[ROUTING_EXECUTION_KEY]
+    assert isinstance(execution, RoutingExecution)
+    decision = execution.decision
     assert isinstance(decision, RoutingDecision)
     assert decision.is_selection is True
     assert decision.selected_provider == "openai"
+
+
+async def test_the_transported_selection_carries_the_provider_it_resolved_to() -> None:
+    """Slice 15 defect: the stage published only the decision, so a 'routed' annotation could
+    name a chosen provider while carrying nothing able to execute it."""
+    result = await _stage().before_request(_context())
+
+    execution = result.annotations[ROUTING_EXECUTION_KEY]
+    assert execution.routed is True
+    assert execution.provider is not None
+    assert execution.provider.name == "openai"
+    assert execution.provider.model == "gpt-4o"
 
 
 async def test_non_selection_is_transported_not_adjudicated() -> None:
@@ -69,15 +84,17 @@ async def test_non_selection_is_transported_not_adjudicated() -> None:
 
     assert result.action is StageAction.ANNOTATE
     assert result.blocked is False
-    decision = result.annotations[ROUTING_DECISION_KEY]
-    assert decision.outcome is RoutingOutcome.BLOCKED_BY_POLICY
-    assert decision.reasoning_steps
+    execution = result.annotations[ROUTING_EXECUTION_KEY]
+    assert execution.decision.outcome is RoutingOutcome.BLOCKED_BY_POLICY
+    assert execution.decision.reasoning_steps
+    assert execution.routed is False
+    assert execution.provider is None
 
 
 async def test_missing_tenant_context_transports_nothing_and_does_not_block() -> None:
     result = await _stage().before_request(StageContext(correlation_id="c", organization_id=None))
     assert result.blocked is False
-    assert ROUTING_DECISION_KEY not in result.annotations
+    assert ROUTING_EXECUTION_KEY not in result.annotations
 
 
 async def test_after_response_and_on_error_are_inert() -> None:

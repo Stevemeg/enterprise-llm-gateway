@@ -60,6 +60,9 @@ uv run python ../scripts/check_accounting_construction.py src/gateway || fail "A
 step "Execution construction guard (cache/dedup/coordinator only in the composition root)"
 uv run python ../scripts/check_execution_construction.py src/gateway || fail "Execution construction guard failed (ADR-0016 Slice 10)."
 
+step "Pipeline construction guard (the request path is composed only in the composition root)"
+uv run python ../scripts/check_pipeline_construction.py src/gateway || fail "Pipeline construction guard failed (ADR-0016 invariant 5)."
+
 step "migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
 uv run python ../scripts/check_migration_guardrails.py migrations/sql || fail "Tenant-table RLS guardrail failed (ADR-0002/0014)."
 

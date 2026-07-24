@@ -1,7 +1,7 @@
 # Security Traceability
 
 **Phase:** 5 — Backend · Living document (started Milestone 3)
-**Last updated:** 2026-07-23
+**Last updated:** 2026-07-24
 
 Maps each **security control** to the ADR that mandates it, the STRIDE threat it mitigates, the
 requirements it satisfies, the tests that verify it, and the module that implements it. Extremely
@@ -53,7 +53,7 @@ the authentication implementation step (this milestone, pending design approval)
 
 ## 4. Phase 4 architectural enforcement (ADR-0016)
 
-Architecture-only; no new security controls. Listed here because these guards protect properties
+Architecture-only through Slice 13; no new security controls. Listed here because these guards protect properties
 that security depends on later — explainable decisions are what make an authorization denial
 auditable.
 
@@ -159,3 +159,35 @@ auditable.
 | Tenant context reaches the policy engine unchanged | ADR-0002, ADR-0016 Slice 13 | `PolicyQuery` carries `organization_id`/`correlation_id` verbatim from `StageContext` | ✅ `test_tenant_context_reaches_the_engine_unchanged` |
 | A downstream failure is never recorded as a policy decision | ADR-0016 Slice 13 | `PolicyStage.on_error` returns CONTINUE — converting an unrelated error into a policy block would put a decision nobody made into the audit trail | ✅ `test_a_downstream_error_is_not_turned_into_a_policy_block` |
 
+## 5. Phase 4 request-path enforcement (Slices 14-15)
+
+**The section above stops being architecture-only here.** Through Slice 13 every stage was
+enforced by construction and unenforced in traffic: `AuthorizationStage` was not constructed
+anywhere at all, `PolicyStage` was constructed but never run, and no component executed a stage
+chain. Slice 14 supplied the executor ADR-0016 invariant 5 always specified, and Slice 15 joined
+it to the execution path — so these rows describe controls that now actually stop requests.
+
+| Control | ADR | Enforcement | Proven to fail / verified by |
+|---|---|---|---|
+| A stage that exists is not a control until something runs it | ADR-0016 inv. 5, Slice 14 | `RequestPipeline` executes the registered chain; `AuthorizationStage` (Slice 5) and `PolicyStage` (Slice 13) were enforced-by-construction and unenforced-in-traffic until this slice — `AuthorizationStage` was not even constructed | ✅ `test_the_admission_chain_runs_authorization_then_policy_then_routing`, `test_every_wired_admission_stage_satisfies_the_tier_1_stage_protocol` |
+| An authorization denial reaches no downstream control or side effect | ADR-0008, ADR-0016 Slice 14/15 | First-block-wins: no later stage's `before_request` runs, and `InferenceService` returns before the executor exists in the call path | ✅ `test_an_authorization_denial_means_no_policy_evaluation_and_no_routing`, `test_an_authorization_denial_reaches_nothing_downstream` (asserts no policy call, no routing, no reservation, no provider call, no evaluation) |
+| A policy denial or policy outage reaches no downstream control or side effect | ADR-0009 row 1, ADR-0016 Slice 13/14/15 | `PolicyStage` blocks; the runner stops the chain before `AgentRoutingStage` invokes the engine | ✅ `test_a_policy_denial_means_no_routing`, `test_a_policy_engine_outage_means_no_routing`, `test_a_policy_denial_reaches_nothing_downstream` |
+| A defective stage cannot admit a request | ADR-0009, ADR-0016 Slice 14 | Four fail-closed paths: BLOCK; a stage that raises; a return that is not a `StageResult`; a BLOCK carrying no reason (an invariant `StageResult` documents but never enforced) | ✅ `test_a_stage_that_raises_blocks_rather_than_propagating`, `test_a_stage_returning_the_wrong_type_blocks_rather_than_being_treated_as_allow`, `test_an_unexplained_block_is_still_a_block` |
+| A stage cannot influence a control that runs after it | ADR-0016 Rule 3, Slice 14 | Each stage receives its own copy of `StageContext.attributes`; annotations are returned per-stage in the audit record, never merged into request input | ✅ `test_a_stage_cannot_alter_what_a_later_stage_sees`, `test_one_stage_s_annotations_do_not_become_another_stage_s_input`, `test_the_caller_s_context_is_not_mutated_by_the_pipeline` |
+| An admission denial is always attributable and always explained | ADR-0016 Slice 14 | `AdmissionOutcome` rejects a block with no stage or no reason at construction; `records` is never empty | ✅ `test_a_block_must_name_a_reason`, `test_an_outcome_must_record_at_least_one_stage`, `test_an_admitted_request_cannot_carry_a_block_reason` |
+| A refusal discloses no permission, rule, threshold or stage internals | ADR-0008, ADR-0016 Slice 14 | Stage-authored reasons are already caller-safe; runner-generated blocks use a generic reason naming no stage or exception, with detail confined to audit annotations | ✅ `test_a_denial_reason_does_not_disclose_the_missing_permission`, `test_a_runner_generated_block_reason_names_no_stage_rule_or_threshold`, `test_a_refused_request_exposes_the_caller_visible_reason_only` |
+| Two controls cannot answer to one name in the audit trail | ADR-0016 Slice 14 | Duplicate stage names rejected at construction; names resolved once at registration so a stage cannot rename itself out of its own records | ✅ `test_duplicate_stage_names_are_refused_at_construction`, `test_a_name_that_changes_after_registration_does_not_change_the_audit_trail` |
+| An unconfigured deployment denies rather than admits | ADR-0009, ADR-0016 Slice 14 | `NullPermissionResolver` grants nothing and no endpoint declares a requirement, so the composed default refuses every request | ✅ `test_the_default_deployment_admits_nothing`, `test_the_wired_pipeline_does_not_route_a_request_it_refuses` |
+| A grant in one tenant does not admit a request in another | ADR-0002, ADR-0008, Slice 14 | `PermissionResolver` is keyed on `(organization_id, principal_id)`; proven through the composed chain, not just the resolver | ✅ `test_a_grant_in_one_tenant_does_not_admit_a_request_in_another` |
+| Concurrent admissions cannot observe one another | ADR-0016 Slice 14 | `RequestPipeline` holds no per-request state; records accumulate per call | ✅ `test_concurrent_admissions_do_not_interleave_their_records` (suspension point inside the stage, so the two genuinely interleave) |
+| Only the composition root decides which controls guard a request | ADR-0016 inv. 5, Slice 14/15 | `scripts/check_pipeline_construction.py` — a component building its own `RequestPipeline` or `InferenceService` would select its own controls and return an equally authoritative-looking outcome | ✅ construction planted in `routing/engine.py` and `config/settings.py` → exit 1 each; per-class exemption regression proven after the Slice-15 extension |
+| The admission runner cannot itself authorize, route or spend | ADR-0016 Slice 14 | import-linter: `gateway.application.pipeline` forbidden from 10 capability targets, with **no** `allow_indirect_imports` | ✅ all 10 planted independently → 31 kept / 1 broken each |
+| A budget denial means the provider is never called | ADR-0004, ADR-0017, Slice 15 | `ReservationService.reserve` gates inside `InferenceCoordinator`, reached only via `ReflectiveExecutor` | ✅ `test_a_budget_denial_means_the_provider_is_never_called` (spy wraps the real client) |
+| A provider failure releases the hold and settles nothing | ADR-0017, ADR-0009, Slice 15 | Release-on-failure proven through the full composed path rather than against the coordinator alone | ✅ `test_a_provider_failure_releases_the_reservation_and_settles_nothing` |
+| A cache hit calls no provider and is never accounted twice | ADR-0018, Slice 15 | A hit returns `usage=None` and no `CostRecord`; no second reservation or settlement occurs | ✅ `test_a_cache_hit_calls_no_provider_and_accounts_no_second_time` |
+| Retries cannot bypass the budget gate or the provider boundary | ADR-0016 Slice 11/15 | Every attempt re-enters through `InferenceCoordinator` under an attempt-scoped identity, each independently reserved/settled/released | ✅ `test_retries_go_through_the_coordinator_and_are_evaluated_only_once_at_the_end` |
+| Evaluation runs exactly once, on the final result, and never on a refused request | ADR-0016 Slice 12/15 | The runner is invoked once after the retry loop; a refusal returns before it. Evaluating rejected traffic would make quality metrics a function of rejection volume | ✅ `test_evaluation_runs_exactly_once_on_the_final_result`, `test_a_cache_hit_is_still_evaluated_exactly_once`, `test_an_authorization_denial_reaches_nothing_downstream` |
+| A refusal is not reported as a provider failure | ADR-0016 Slice 15 | `ServedInference` leaves `reflection`/`evaluation` absent rather than synthesizing `ProviderResponse(ok=False)`; validated at construction in both directions | ✅ `test_a_refusal_is_not_reported_as_a_provider_failure`, `test_an_admitted_request_must_record_an_execution`, `test_a_refused_request_cannot_carry_an_execution` |
+| The served path cannot re-route, re-authorize, or move money itself | ADR-0016 Slice 15 | import-linter: `gateway.application.serving` forbidden from routing.engine, agents, providers, accounting, ports.ledger, execution, ports.authorization | ✅ all 7 planted independently → 32 kept / 1 broken each; plus reused `RoutingDecision` and Guard L → exit 1 |
+| A composition defect surfaces as a defect, never as a request outcome | ADR-0016 Slice 15 | An admitted request carrying no `RoutingExecution` raises `RoutingTransportError` instead of returning a failure a caller would read as a provider or budget problem | ✅ `test_an_admitted_request_with_no_transported_routing_is_a_defect_not_a_response` (driven through the public `serve()` path) |
+| Tenant identity survives the whole request path | ADR-0002, Slice 15 | `organization_id` flows `StageContext` → `RoutingDecision` → `EvaluationInput` unchanged | ✅ `test_tenant_identity_survives_the_whole_path_into_the_evaluation_record`, `test_tenant_context_reaches_the_engine_unchanged` |

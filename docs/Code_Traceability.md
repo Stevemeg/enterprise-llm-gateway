@@ -647,3 +647,114 @@ mypy strict clean (224 files), import-linter 31 kept / 0 broken.** Alembic head 
 `0006_budget_ledger` (no migration in either slice); runtime role verified `app_rw`,
 `rolsuper=False`, `rolbypassrls=False`. All Postgres-backed integration/security tests executed
 against real PostgreSQL 16 + pgvector, none skipped.
+
+### Slice 14 — Request Admission Pipeline — ✅ COMPLETE
+
+Rule 5 **not triggered** — against Tier 1 *or* any capability-owned port. Zero diff on `domain/`,
+`ports/pipeline.py`, all other Tier-1 ports, `agents/`, ADR-0016. **No migration, no persistence** —
+admission decides and stores nothing.
+
+**Foundation, and the one milestone where "no ADR" is correct rather than suspect.** ADR-0016
+invariant 5 has always specified CI enforcement of "stage **registration + ordering**"; the protocol
+shipped in Slice 1 and three stages implement it, but **nothing had ever executed one**. This slice
+supplies the missing artifact, so no seam is born and no ADR is written. Before it,
+`AuthorizationStage` (Slice 5) was **not constructed anywhere in the codebase at all**, and
+`PolicyStage` (Slice 13) was constructed but never run.
+
+*(Note: `Phase4_Master_Execution_Plan.md` and `AIOS_Architecture.md` do not exist in this repo —
+ADR-0016 anticipates the former but it was never committed. The roadmap was reconciled from
+ADR-0016's tier tables plus the evidence log; see the Slice-14 evidence record.)*
+
+| Component | Module | Role |
+|---|---|---|
+| Runner (new) | `application/pipeline/runner.py` | `RequestPipeline`, `AdmissionOutcome`, `StageRecord`, `GENERIC_BLOCK_REASON` — registration, ordering, first-block-wins, fail-closed normalisation |
+| Composition root | `config/container.py` | Constructs `permission_resolver`, `authorization_stage`, `request_pipeline` (authorization → policy → agent_routing) |
+| Guard (new) | `scripts/check_pipeline_construction.py` | Only the composition root may assemble the admission chain — the component that decides *which controls run at all* |
+| Guard (new) | `pyproject.toml` import-linter | `gateway.application.pipeline` forbidden from authorization, ports.policy, routing, agents, providers, execution, accounting, ports.ledger, reflection, evaluation. **No** `allow_indirect_imports`: this package has no sanctioned collaborator, so any path is a violation |
+| Guard I (reused, first real subject) | `scripts/check_resolver_construction.py` | Never vacuous, but **unexercised** until now — no resolver was constructed anywhere in `src/gateway`. Re-proven |
+| `RoutingDecision` / Guard L (reused, unchanged) | AST scans | Both proven against `application/pipeline/runner.py` |
+
+**Fail closed in four distinct ways**, each tested: a BLOCK verdict; a stage that raises; a stage
+returning something that is not a `StageResult`; and a stage that blocks with no reason —
+`StageResult` documents that invariant but has no `__post_init__` enforcing it, a gap nothing could
+observe until a runner existed. Fixed **in the consumer, not the Tier-1 type**, as a deliberate
+Rule 5 outcome.
+
+**Ordering derived, not assumed.** Routing runs last because it is the only admission stage with a
+real downstream effect (it invokes the engine, which runs the five-agent chain); authorization and
+policy are pure decisions. Policy-before-authorization was considered and rejected: it would
+evaluate a deployment's limits for a caller who may not act, and a policy denial discloses that a
+threshold exists.
+
+**Stages cannot communicate through the context** — each receives its own copy of
+`StageContext.attributes`, so neither a stage nor a caller crafting an attribute shaped like a
+stage's annotation can influence a control that runs later.
+
+**Documented limitations:** `after_response`/`on_error` still executed by nothing (no consumer in
+this slice); the default composed pipeline **denies every request** (`NullPermissionResolver` grants
+nothing, no endpoint declares a requirement) — the fail-closed direction, asserted rather than
+assumed; no HTTP endpoint.
+
+Tests: `test_request_pipeline.py` (32), plus `test_container.py` (+5).
+
+**Gate 1 + Gate 2 at Slice-14 completion: PASS — 583 passed, 0 skipped, 97% coverage, mypy strict
+clean (227 files), import-linter 32 kept / 0 broken.** `runner.py` at 100% line coverage.
+
+### Slice 15 — Served Inference Path — ✅ COMPLETE
+
+Rule 5 **not triggered against Tier 1** (zero diff on `domain/`, `ports/pipeline.py`, all other
+Tier-1 ports, `agents/`, ADR-0016). Rule 5 **triggered and satisfied on a capability-owned port**:
+`ROUTING_EXECUTION_KEY` moved into `application/ports/routing.py`, first consumer
+`application/serving/inference_service.py`. Recorded in the evidence log, **not** a new ADR — same
+shape as `ProviderUsage` (Slice 8) and `ProviderErrorCategory` (Slice 11). No migration.
+
+**Capability milestone: it composes and owns nothing.**
+
+    admit (authorization → policy → routing)   Slice 14
+      → reflect (bounded retry)                Slice 11
+        → coordinate (cache → reserve → execute → settle/release)   Slices 9, 10
+      → evaluate the final result, once        Slice 12
+
+| Component | Module | Role |
+|---|---|---|
+| Service (new) | `application/serving/inference_service.py` | `InferenceService`, `ServedInference`, `RoutingTransportError` — holds the order; contributes no judgement |
+| Port constant (Rule 5) | `application/ports/routing.py` | `ROUTING_EXECUTION_KEY`, beside the `RoutingExecution` it names |
+| Transport fix | `adapters/pipeline/routing_stage.py` | Now annotates the whole `RoutingExecution`, not just `.decision` |
+| Composition root | `config/container.py` | Constructs `inference_service` from the *same* pipeline, executor and evaluator chain it wired |
+| Guard (reused-extended) | `scripts/check_pipeline_construction.py` | `InferenceService` added; per-file exemptions replaced with per-class ones after the extension was found to have weakened the guard |
+| Guard (new) | `pyproject.toml` import-linter | `gateway.application.serving` forbidden from routing.engine, agents, providers, accounting, ports.ledger, execution, ports.authorization (`allow_indirect_imports` — reflection is the sanctioned path) |
+| `RoutingDecision` / Guard L (reused, unchanged) | AST scans | Proven against `serving/inference_service.py` |
+
+**A real defect in Slice 6's transport, exposed by the first end-to-end integration.**
+`AgentRoutingStage` published `execution.decision` and dropped `execution.provider` — yet
+`RoutingExecution.routed` means "SELECTED *and* a provider was resolved", so the annotation could
+report a chosen provider while carrying nothing able to call it. Invisible for nine slices because
+nothing executed the pipeline. Fixed at the smallest correct boundary: transport the whole object.
+
+**A guard extension that silently weakened the guard it extended.** Adding `InferenceService` also
+added its file to a **per-file** exemption list, letting that file construct a `RequestPipeline`
+unnoticed. Caught by *re-proving the Slice-14 target after the extension* (exit 0 where exit 1 was
+required); fixed by exempting each defining module for its own class only. The same flat-list
+weakness exists in four earlier construction guards, none currently exposed — recorded as debt.
+
+**A refusal is not dressed as a provider failure.** `reflection`/`evaluation` are `None` for a
+refused request rather than a synthesized `ProviderResponse(ok=False)`, so "denied at admission",
+"routed nowhere", "denied by budget" and "the provider failed" stay four distinguishable facts. For
+the same reason a refusal is **not evaluated**: emitting `NOT_APPLICABLE` verdicts for rejected
+traffic would make every quality metric a function of how much traffic was rejected.
+
+**Documented limitations:** still no HTTP endpoint (deliberately — an endpoint pulls in
+request/response schemas, the API error model and streaming, none of which this slice's evidence
+speaks to); the default deployment still denies everything; **`PipelineStage.after_response` and
+`on_error` remain unexecuted** — Slice 15 turned out *not* to be their first consumer, because
+pushing a typed `ReflectionResult` through the opaque `attributes` bag is the same Rule 3 violation
+Slice 12 rejected.
+
+Tests: `test_inference_service.py` (20), `test_agent_routing_stage.py` (+1), plus
+`test_container.py` (+3).
+
+**Gate 1 + Gate 2 (combined, both slices present): PASS — 606 passed, 0 skipped, 97% coverage, mypy
+strict clean (230 files), import-linter 33 kept / 0 broken.** Alembic head unchanged at
+`0006_budget_ledger` (no migration in either slice); runtime role verified `app_rw`,
+`rolsuper=False`, `rolbypassrls=False`. All Postgres-backed integration/security tests executed
+against real PostgreSQL 16 + pgvector, none skipped.

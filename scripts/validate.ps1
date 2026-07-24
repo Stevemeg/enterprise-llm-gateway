@@ -64,6 +64,10 @@ Write-Host "==> Execution construction guard (cache/dedup/coordinator only in th
 uv run python ..\scripts\check_execution_construction.py src\gateway
 if ($LASTEXITCODE -ne 0) { throw "Execution construction guard failed (ADR-0016 Slice 10)." }
 
+Write-Host "==> Pipeline construction guard (the request path is composed only in the composition root)"
+uv run python ..\scripts\check_pipeline_construction.py src\gateway
+if ($LASTEXITCODE -ne 0) { throw "Pipeline construction guard failed (ADR-0016 invariant 5)." }
+
 Write-Host "==> migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
 uv run python ..\scripts\check_migration_guardrails.py migrations\sql
 if ($LASTEXITCODE -ne 0) { throw "Tenant-table RLS guardrail failed (ADR-0002/0014)." }

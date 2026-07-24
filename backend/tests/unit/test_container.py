@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
+from gateway.adapters.pipeline.authorization_stage import AuthorizationStage
 from gateway.adapters.pipeline.policy_stage import PolicyStage
 from gateway.application.accounting.budget_enforcer import BudgetEnforcer
 from gateway.application.accounting.cost_accountant import CostAccountant
@@ -11,17 +14,20 @@ from gateway.application.accounting.reservation_service import ReservationServic
 from gateway.application.evaluation.runner import EvaluationRunner
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import InferenceCoordinator
+from gateway.application.pipeline.runner import RequestPipeline
+from gateway.application.ports.authorization import PermissionResolver
 from gateway.application.ports.budget import BudgetPort
 from gateway.application.ports.cache import ResponseCachePort
 from gateway.application.ports.evaluation import Evaluator
 from gateway.application.ports.ledger import BudgetLedgerPort
-from gateway.application.ports.pipeline import PipelineStage
+from gateway.application.ports.pipeline import PipelineStage, StageContext
 from gateway.application.ports.policy import PolicyEnginePort
 from gateway.application.ports.pricing import PricingPort
-from gateway.application.ports.providers import ProviderClient
+from gateway.application.ports.providers import InferenceRequest, ProviderClient
 from gateway.application.providers.provider_executor import ProviderExecutor
 from gateway.application.reflection.reflective_executor import ReflectiveExecutor
 from gateway.application.reflection.retry_policy import RetryPolicy
+from gateway.application.serving.inference_service import InferenceService
 from gateway.config.container import Container
 from gateway.config.settings import Settings
 from gateway.delivery.http.ops.health import HealthRegistry
@@ -142,3 +148,94 @@ def test_policy_and_evaluation_are_wired_as_separate_capabilities(test_settings:
     assert not any("policy" in m for m in evaluator_modules)
     assert type(container.policy_engine).__module__.startswith("gateway.adapters.policy")
     assert type(container.policy_stage).__module__.startswith("gateway.adapters.pipeline")
+
+
+def test_container_wires_the_request_admission_pipeline(test_settings: Settings) -> None:
+    """Slice 14: the stage seam finally has an executor, and the stages are in it."""
+    container = Container.create(test_settings)
+    assert isinstance(container.permission_resolver, PermissionResolver)
+    assert isinstance(container.authorization_stage, AuthorizationStage)
+    assert isinstance(container.request_pipeline, RequestPipeline)
+
+
+def test_the_admission_chain_runs_authorization_then_policy_then_routing(
+    test_settings: Settings,
+) -> None:
+    """Ordering is the enforcement. Routing runs last because it is the stage with a real
+    downstream side effect - it invokes the engine, which runs the whole agent chain."""
+    container = Container.create(test_settings)
+    assert container.request_pipeline.stage_names == ("authorization", "policy", "agent_routing")
+
+
+def test_every_wired_admission_stage_satisfies_the_tier_1_stage_protocol(
+    test_settings: Settings,
+) -> None:
+    container = Container.create(test_settings)
+    for stage in (
+        container.authorization_stage,
+        container.policy_stage,
+        container.routing_stage,
+    ):
+        assert isinstance(stage, PipelineStage)
+
+
+async def test_the_default_deployment_admits_nothing(test_settings: Settings) -> None:
+    """RBAC has no storage yet, so the wired resolver grants nothing and no endpoint declares a
+    requirement. The composed default therefore denies every request - deliberately the
+    fail-closed direction, and the same 'nothing configured yet' posture as the empty provider
+    catalog and empty price table."""
+    container = Container.create(test_settings)
+
+    outcome = await container.request_pipeline.admit(
+        StageContext(correlation_id="c-1", organization_id=uuid4(), principal_id=uuid4())
+    )
+
+    assert outcome.admitted is False
+    assert outcome.blocked_by == "authorization"
+
+
+async def test_the_wired_pipeline_does_not_route_a_request_it_refuses(
+    test_settings: Settings,
+) -> None:
+    """The composed form of the property Slices 5-13 could only assert on unwired objects."""
+    container = Container.create(test_settings)
+
+    outcome = await container.request_pipeline.admit(
+        StageContext(correlation_id="c-1", organization_id=uuid4(), principal_id=uuid4())
+    )
+
+    assert outcome.stages_run == ("authorization",)
+    assert "agent_routing" not in outcome.stages_run
+
+
+def test_container_wires_the_served_inference_path(test_settings: Settings) -> None:
+    """Slice 15: admission and execution are finally one object."""
+    container = Container.create(test_settings)
+    assert isinstance(container.inference_service, InferenceService)
+
+
+async def test_the_wired_service_refuses_before_touching_the_execution_path(
+    test_settings: Settings,
+) -> None:
+    """The composed default denies, and a denial reaches neither the executor nor evaluation."""
+    container = Container.create(test_settings)
+
+    served = await container.inference_service.serve(
+        StageContext(correlation_id="c-1", organization_id=uuid4(), principal_id=uuid4()),
+        InferenceRequest(correlation_id="c-1", payload={"prompt": "hello"}),
+    )
+
+    assert served.admitted is False
+    assert served.reflection is None
+    assert served.evaluation is None
+
+
+def test_the_service_runs_the_wired_pipeline_and_evaluators(test_settings: Settings) -> None:
+    """Not a second composition: the service must hold the same objects the container built,
+    or the deployment would enforce one chain and serve requests through another."""
+    container = Container.create(test_settings)
+    service = container.inference_service
+
+    assert service._pipeline is container.request_pipeline
+    assert service._executor is container.reflective_executor
+    assert service._evaluation_runner is container.evaluation_runner

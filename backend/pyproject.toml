@@ -465,3 +465,73 @@ forbidden_modules = [
     "gateway.application.routing.engine",
 ]
 allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+# Slice 14 Guard 2 - the request pipeline EXECUTES stages and decides nothing itself. It knows
+# only the Tier-1 stage protocol; every capability reaches it as a PipelineStage or not at all.
+# One forbidden target per claim the slice makes:
+#   - application.authorization / ports.policy -> the runner cannot resolve a permission or
+#     evaluate a policy itself. It obeys the stage that owns each question; a runner that could
+#     also decide would be a second authorizer sitting above the controls it runs.
+#   - application.routing / agents -> the runner cannot route or reach AgentRuntime (Guard L bars
+#     the runtime by name; this bars the whole routing capability)
+#   - application.providers / execution / accounting / ports.ledger -> admission cannot invoke a
+#     provider, run the reserve/execute/settle sequence, author cost or move budget. Admission
+#     happens strictly before any of that, and a runner that could reach it would make "denied
+#     requests cause no downstream side effect" a claim rather than a structural fact.
+#   - application.reflection -> a blocked request cannot be retried into admission
+#   - application.evaluation -> admission does not consult post-hoc verdicts
+# NOT allow_indirect_imports, unlike the reflection and evaluation contracts: those two have a
+# sanctioned collaborator they must reach through, and this one has none. application.pipeline
+# imports application.ports.pipeline and nothing else, so any path at all is a violation.
+name = "the request pipeline executes stages and decides nothing itself"
+type = "forbidden"
+source_modules = ["gateway.application.pipeline"]
+forbidden_modules = [
+    "gateway.application.authorization",
+    "gateway.application.ports.policy",
+    "gateway.application.routing",
+    "gateway.application.agents",
+    "gateway.application.providers",
+    "gateway.application.execution",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.reflection",
+    "gateway.application.evaluation",
+]
+
+[[tool.importlinter.contracts]]
+# Slice 15 Guard 1 - the served request path COMPOSES capabilities and owns none of them. Every
+# forbidden target is one ownership claim the slice makes, and each names the component that keeps
+# the question instead:
+#   - application.routing.engine -> serving cannot route. Routing arrives already decided, in the
+#     RoutingExecution the admission pipeline transported; a service that could call the engine
+#     would be able to re-route an admitted request and produce a second explanation of it.
+#   - application.agents         -> serving cannot reach AgentRuntime (Guard L bars it by name too)
+#   - application.providers      -> serving cannot call a provider; only ProviderExecutor may, and
+#     only from behind the budget gate inside InferenceCoordinator
+#   - application.accounting / ports.ledger -> serving cannot reserve, settle, release or author
+#     cost. Money stays with ReservationService and CostAccountant.
+#   - application.execution      -> serving reaches the cache/reserve/execute/settle sequence ONLY
+#     through ReflectiveExecutor. Importing the coordinator directly would let a request skip the
+#     retry boundary while looking identical from outside.
+#   - application.ports.authorization / adapters.authorization -> serving cannot resolve a
+#     permission. It obeys the admission outcome; a service that could also ask would be a second
+#     authorizer able to disagree with the pipeline that already ran.
+# allow_indirect_imports: serving -> reflection -> execution -> accounting/providers is the
+# intended path, and serving -> ports.routing -> routing.catalog is how it names the transported
+# type. Only a direct reach-around is a violation - the same shape as the Slice 11 and Slice 12
+# contracts, and for the same reason.
+name = "the served request path composes capabilities and owns none of them"
+type = "forbidden"
+source_modules = ["gateway.application.serving"]
+forbidden_modules = [
+    "gateway.application.routing.engine",
+    "gateway.application.agents",
+    "gateway.application.providers",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.execution",
+    "gateway.application.ports.authorization",
+]
+allow_indirect_imports = true

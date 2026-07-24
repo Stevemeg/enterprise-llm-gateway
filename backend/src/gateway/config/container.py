@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from gateway.adapters.audit.composite_sink import CompositeAuthAuditSink
 from gateway.adapters.audit.logging_sink import LoggingAuthAuditSink
+from gateway.adapters.authorization.null_resolver import NullPermissionResolver
 from gateway.adapters.budget.in_memory_budget_store import InMemoryBudgetStore
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
 from gateway.adapters.cache.sql_response_cache import SqlResponseCache
@@ -21,6 +22,7 @@ from gateway.adapters.ledger.sql_budget_ledger import SqlBudgetLedger
 from gateway.adapters.persistence.engine import create_database_engine, create_session_factory
 from gateway.adapters.persistence.health import DatabaseHealthCheck
 from gateway.adapters.persistence.uow import UnitOfWorkFactory
+from gateway.adapters.pipeline.authorization_stage import AuthorizationStage
 from gateway.adapters.pipeline.policy_stage import PolicyStage
 from gateway.adapters.pipeline.routing_stage import AgentRoutingStage
 from gateway.adapters.policy.local_policy_engine import LocalPolicyEngine
@@ -46,7 +48,9 @@ from gateway.application.evaluation.runner import EvaluationRunner
 from gateway.application.evaluation.usage_consistency import UsageAccountingConsistencyEvaluator
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import InferenceCoordinator
+from gateway.application.pipeline.runner import RequestPipeline
 from gateway.application.ports.auth import AuthAuditSink
+from gateway.application.ports.authorization import PermissionResolver
 from gateway.application.ports.budget import BudgetPort
 from gateway.application.ports.cache import ResponseCachePort
 from gateway.application.ports.evaluation import Evaluator
@@ -61,6 +65,7 @@ from gateway.application.reflection.reflective_executor import ReflectiveExecuto
 from gateway.application.reflection.retry_policy import RetryPolicy
 from gateway.application.routing.catalog import InMemoryProviderCatalog
 from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
+from gateway.application.serving.inference_service import InferenceService
 from gateway.config.settings import AuthSettings, Settings
 from gateway.delivery.http.ops.health import HealthRegistry
 from gateway.observability.logging import configure_logging, get_logger
@@ -161,6 +166,10 @@ class Container:
     evaluation_runner: EvaluationRunner
     policy_engine: PolicyEnginePort
     policy_stage: PolicyStage
+    permission_resolver: PermissionResolver
+    authorization_stage: AuthorizationStage
+    request_pipeline: RequestPipeline
+    inference_service: InferenceService
 
     @classmethod
     def create(
@@ -281,6 +290,46 @@ class Container:
         policy_engine: PolicyEnginePort = LocalPolicyEngine()
         policy_stage = PolicyStage(policy_engine)
 
+        # --- request admission pipeline (ADR-0016 invariant 5, Slice 14) -----------------
+        # The executor invariant 5 always required ("stage registration + ordering") and never
+        # had. Until this line, AuthorizationStage (Slice 5) was not constructed anywhere and
+        # PolicyStage (Slice 13) was constructed but never run: both were enforced by
+        # construction and unenforced in traffic.
+        #
+        # RBAC has no storage yet, so the resolver grants nothing (Rule 4's validating
+        # implementation, and the safe one - an unwired RBAC subsystem must deny every request,
+        # never allow every one). Combined with AuthorizationStage's refusal of an undeclared
+        # request, the default chain therefore denies everything until an endpoint declares its
+        # requirements and a real resolver is wired. That is the same "nothing configured yet"
+        # posture as the empty provider catalog and empty price table above, and here it is
+        # deliberately the fail-closed direction.
+        #
+        # Order is derived, not assumed:
+        #   1. authorization - may this principal act at all? The cheapest question that can
+        #      refuse, and the one whose answer does not depend on the request's content. A
+        #      caller who may not act should never reach a control that reveals what the
+        #      deployment's limits are.
+        #   2. policy        - is this request admissible? Identity-independent, and its denial
+        #      discloses a threshold (indirectly), so it runs behind authorization.
+        #   3. routing       - transports a RoutingDecision. It runs LAST among the three and
+        #      only for an admitted request, because it is the one stage with a real downstream
+        #      side effect: it invokes the routing engine, which runs the entire agent chain.
+        #      "Authorization denial => no routing" is exactly this ordering plus the runner's
+        #      first-block-wins rule, and it is what closes the Slice 5-13 bypass.
+        permission_resolver: PermissionResolver = NullPermissionResolver()
+        authorization_stage = AuthorizationStage(permission_resolver)
+        request_pipeline = RequestPipeline((authorization_stage, policy_stage, routing_stage))
+
+        # --- served inference path (ADR-0016 Slice 15) -----------------------------------
+        # Joins admission to the execution path that has existed since Slice 9 but was reachable
+        # only from tests. Three collaborators, each already the owner of its question; this
+        # object adds none of its own. A refused request never reaches the executor at all, so
+        # "denied => no reservation, no provider call, no settlement" is a structural property of
+        # the composition rather than a rule someone has to remember.
+        inference_service = InferenceService(
+            request_pipeline, reflective_executor, evaluation_runner
+        )
+
         health = HealthRegistry(version=settings.service_version, clock=clock)
         health.register("database", DatabaseHealthCheck(engine))
 
@@ -324,6 +373,10 @@ class Container:
             evaluation_runner=evaluation_runner,
             policy_engine=policy_engine,
             policy_stage=policy_stage,
+            permission_resolver=permission_resolver,
+            authorization_stage=authorization_stage,
+            request_pipeline=request_pipeline,
+            inference_service=inference_service,
         )
 
     async def dispose(self) -> None:
