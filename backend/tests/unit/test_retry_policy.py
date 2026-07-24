@@ -11,9 +11,9 @@ from datetime import timedelta
 import pytest
 
 from gateway.application.execution.inference_coordinator import (
-    ExecutionOutcome,
     InferenceExecutionResult,
 )
+from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.providers import ProviderErrorCategory, ProviderResponse
 from gateway.application.reflection.retry_policy import RetryPolicy, RetryVerdict, classify
 

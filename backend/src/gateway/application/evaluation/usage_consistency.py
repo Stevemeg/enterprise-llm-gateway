@@ -24,12 +24,12 @@ Deterministic, pure, no I/O, no model.
 
 from __future__ import annotations
 
-from gateway.application.execution.inference_coordinator import ExecutionOutcome
 from gateway.application.ports.evaluation import (
     EvaluationInput,
     EvaluationOutcome,
     EvaluationResult,
 )
+from gateway.application.ports.execution import ExecutionOutcome
 
 
 class UsageAccountingConsistencyEvaluator:

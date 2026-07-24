@@ -20,12 +20,12 @@ everything else is outside its scope, and saying so is more honest than a verdic
 
 from __future__ import annotations
 
-from gateway.application.execution.inference_coordinator import ExecutionOutcome
 from gateway.application.ports.evaluation import (
     EvaluationInput,
     EvaluationOutcome,
     EvaluationResult,
 )
+from gateway.application.ports.execution import ExecutionOutcome
 
 _DELIVERING_OUTCOMES = (ExecutionOutcome.EXECUTED, ExecutionOutcome.CACHE_HIT)
 

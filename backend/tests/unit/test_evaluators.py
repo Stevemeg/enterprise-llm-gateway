@@ -12,13 +12,13 @@ import pytest
 
 from gateway.application.evaluation.response_completeness import ResponseCompletenessEvaluator
 from gateway.application.evaluation.usage_consistency import UsageAccountingConsistencyEvaluator
-from gateway.application.execution.inference_coordinator import ExecutionOutcome
 from gateway.application.ports.evaluation import (
     EvaluationInput,
     EvaluationOutcome,
     EvaluationResult,
     Evaluator,
 )
+from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.providers import ProviderResponse, ProviderUsage
 
 ORG = uuid4()

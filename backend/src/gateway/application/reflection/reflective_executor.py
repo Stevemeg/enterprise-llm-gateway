@@ -55,13 +55,14 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from gateway.application.execution.inference_coordinator import (
-    ExecutionOutcome,
     InferenceCoordinator,
     InferenceExecutionResult,
 )
+from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.providers import InferenceRequest, ProviderErrorCategory
 from gateway.application.ports.routing import RoutingExecution
 from gateway.application.reflection.retry_policy import RetryPolicy, RetryVerdict, classify
+from gateway.observability.metrics import record_reflection_attempt
 from gateway.shared.clock import Sleeper
 
 
@@ -157,6 +158,9 @@ class ReflectiveExecutor:
                     error_category=result.response.error_category,
                 )
             )
+            # Slice 16: reflection owns the retry decision, so it reports each attempt's verdict.
+            # verdict=retry counts attempts that were retried; the terminal verdict ends the loop.
+            record_reflection_attempt(verdict=verdict.value)
             if verdict is not RetryVerdict.RETRY:
                 break
 

@@ -41,6 +41,7 @@ from gateway.application.ports.evaluation import (
     EvaluationResult,
     Evaluator,
 )
+from gateway.observability.metrics import record_evaluation
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +103,12 @@ class EvaluationRunner:
         """Evaluate ``target``. Never raises: an evaluator that does is recorded as ``ERROR``."""
         results: list[EvaluationResult] = []
         for evaluator in self._evaluators:
-            results.append(await self._verdict(evaluator, target))
+            verdict = await self._verdict(evaluator, target)
+            # Slice 16: the runner owns which evaluators ran and what each said. Reporting the
+            # evaluator name keeps "10% of responses are bad" distinguishable from "one
+            # evaluator is broken" in the metric, exactly as EvaluationOutcome does in the report.
+            record_evaluation(evaluator=verdict.evaluator, outcome=verdict.outcome.value)
+            results.append(verdict)
         return EvaluationReport(
             organization_id=target.organization_id,
             correlation_id=target.correlation_id,

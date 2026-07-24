@@ -48,7 +48,6 @@ purpose (see ``deduplicator.py``).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
 from uuid import UUID
 
 from gateway.application.accounting.cost_accountant import CostRecord
@@ -61,21 +60,12 @@ from gateway.application.ports.cache import (
     CacheUnavailableError,
     ResponseCachePort,
 )
+from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.ledger import ReservationOutcome
 from gateway.application.ports.providers import InferenceRequest, ProviderResponse
 from gateway.application.ports.routing import RoutingExecution
 from gateway.application.providers.provider_executor import ProviderExecutor
-
-
-class ExecutionOutcome(StrEnum):
-    """Closed vocabulary for how one coordinated execution ended (safe as a metric label,
-    mirrors ``RoutingOutcome``)."""
-
-    CACHE_HIT = "cache_hit"
-    EXECUTED = "executed"
-    NOT_ROUTED = "not_routed"
-    BUDGET_DENIED = "budget_denied"
-    BUDGET_UNAVAILABLE = "budget_unavailable"
+from gateway.observability.metrics import record_cache_lookup, record_inference_attempt
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +98,7 @@ class InferenceCoordinator:
     ) -> InferenceExecutionResult:
         if not execution.routed or execution.provider is None:
             response = await self._provider_executor.execute(execution, request)
+            record_inference_attempt(outcome=ExecutionOutcome.NOT_ROUTED.value)
             return InferenceExecutionResult(outcome=ExecutionOutcome.NOT_ROUTED, response=response)
 
         organization_id = execution.decision.organization_id
@@ -117,10 +108,15 @@ class InferenceCoordinator:
         )
 
         cached = await self._safe_get(organization_id, key)
+        # Slice 16: this component owns the cache decision, so hit rate is reported here. A
+        # cache *outage* is a miss for this purpose - the request proceeds either way, and
+        # ``_safe_get`` has already converted the failure into "no entry".
+        record_cache_lookup(hit=cached is not None)
         if cached is not None:
             response = ProviderResponse(
                 ok=True, content=cached.content, provider=cached.provider, usage=None
             )
+            record_inference_attempt(outcome=ExecutionOutcome.CACHE_HIT.value)
             return InferenceExecutionResult(outcome=ExecutionOutcome.CACHE_HIT, response=response)
 
         return await self._deduplicator.coalesce(
@@ -147,6 +143,7 @@ class InferenceCoordinator:
                 else ExecutionOutcome.BUDGET_DENIED
             )
             response = ProviderResponse(ok=False, error=f"budget_{reservation.outcome.value}")
+            record_inference_attempt(outcome=outcome.value)
             return InferenceExecutionResult(outcome=outcome, response=response)
 
         response = await self._provider_executor.execute(execution, request)
@@ -154,6 +151,7 @@ class InferenceCoordinator:
             await self._reservation_service.release(
                 organization_id=organization_id, correlation_id=request.correlation_id
             )
+            record_inference_attempt(outcome=ExecutionOutcome.EXECUTED.value)
             return InferenceExecutionResult(outcome=ExecutionOutcome.EXECUTED, response=response)
 
         record = await self._reservation_service.settle(
@@ -169,6 +167,7 @@ class InferenceCoordinator:
                 provider=response.provider, model=provider.model, content=response.content
             ),
         )
+        record_inference_attempt(outcome=ExecutionOutcome.EXECUTED.value)
         return InferenceExecutionResult(
             outcome=ExecutionOutcome.EXECUTED, response=response, cost=record
         )

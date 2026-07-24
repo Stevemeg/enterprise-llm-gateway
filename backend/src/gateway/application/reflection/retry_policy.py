@@ -44,9 +44,9 @@ from datetime import timedelta
 from enum import StrEnum
 
 from gateway.application.execution.inference_coordinator import (
-    ExecutionOutcome,
     InferenceExecutionResult,
 )
+from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.providers import ProviderErrorCategory
 
 _RETRYABLE_PROVIDER_ERRORS = frozenset(

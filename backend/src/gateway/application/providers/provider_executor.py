@@ -15,12 +15,23 @@ from Slice 6: the routing engine remains the runtime's only caller).
 Not a Rule-4 subject itself - the port under validation is ``ProviderClient``. This class is the
 "real executor" the decision names: an orchestrator, not a protocol, so it has no null variant to
 implement or ask for.
+
+## Slice 16: this class owns provider-call latency, and measures it here
+
+Elapsed time is measured around ``client.invoke`` with a **monotonic** clock, because this is the
+only component that observes the call boundary. It is deliberately *not* a field on
+``ProviderResponse``: that would be a Rule 5 change to a capability-owned port to serve
+instrumentation, and the measurement does not need it - the caller already knows when it started
+and stopped. An unrouted execution is not timed and not counted, because no provider was called.
 """
 
 from __future__ import annotations
 
+import time
+
 from gateway.application.ports.providers import InferenceRequest, ProviderClient, ProviderResponse
 from gateway.application.ports.routing import RoutingExecution
+from gateway.observability.metrics import UNCLASSIFIED, record_provider_call
 
 
 class ProviderExecutor:
@@ -41,4 +52,17 @@ class ProviderExecutor:
             return ProviderResponse(
                 ok=False, error=f"not_routed: {execution.decision.outcome.value}"
             )
-        return await self._client.invoke(provider, request)
+
+        started = time.monotonic()
+        response = await self._client.invoke(provider, request)
+        elapsed = time.monotonic() - started
+        # The label is the *category*, never the provider's error text (NFR-SEC03). A failure the
+        # client did not classify is "unclassified" - a real state, distinct from "unknown".
+        if response.ok:
+            outcome = "ok"
+        elif response.error_category is not None:
+            outcome = response.error_category.value
+        else:
+            outcome = UNCLASSIFIED
+        record_provider_call(provider=provider.name, outcome=outcome, duration_seconds=elapsed)
+        return response

@@ -42,3 +42,23 @@ def test_metrics_exposition(test_settings: Settings) -> None:
     response = _client(test_settings).get("/metrics")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/plain")
+
+
+def test_metrics_exposition_includes_the_request_path_series(test_settings: Settings) -> None:
+    """Slice 16: ``/metrics`` was live but blind to Slices 5-15. These series make it useful."""
+    body = _client(test_settings).get("/metrics").text
+
+    for series in (
+        "gateway_admission_stage_decisions_total",
+        "gateway_served_requests_total",
+        "gateway_served_request_duration_seconds",
+        "gateway_inference_attempts_total",
+        "gateway_cache_lookups_total",
+        "gateway_provider_calls_total",
+        "gateway_provider_call_duration_seconds",
+        "gateway_reflection_attempts_total",
+        "gateway_routing_decisions_total",
+        "gateway_evaluations_total",
+        "gateway_budget_reservations_total",
+    ):
+        assert series in body

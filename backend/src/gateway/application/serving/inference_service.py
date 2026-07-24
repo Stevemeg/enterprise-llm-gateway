@@ -48,6 +48,7 @@ failure that a retry already recovered from as a quality problem.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from gateway.application.evaluation.runner import EvaluationReport, EvaluationRunner
@@ -57,6 +58,7 @@ from gateway.application.ports.pipeline import StageContext
 from gateway.application.ports.providers import InferenceRequest
 from gateway.application.ports.routing import ROUTING_EXECUTION_KEY, RoutingExecution
 from gateway.application.reflection.reflective_executor import ReflectionResult, ReflectiveExecutor
+from gateway.observability.metrics import NOT_ADMITTED, record_served_request
 
 
 class RoutingTransportError(RuntimeError):
@@ -114,11 +116,17 @@ class InferenceService:
 
     async def serve(self, context: StageContext, request: InferenceRequest) -> ServedInference:
         """Run the admission chain, and only on admission the execution and evaluation path."""
+        # Slice 16: this component owns the served request end to end, so it measures it end to
+        # end - monotonic, so a wall-clock adjustment mid-request cannot produce a negative or
+        # wild duration.
+        started = time.monotonic()
+
         admission = await self._pipeline.admit(context)
         if not admission.admitted:
             # The single most important line in this slice: everything below is unreachable for a
             # refused request, so no reservation, provider call, settlement or cache write can
             # follow a denial.
+            record_served_request(outcome=NOT_ADMITTED, duration_seconds=time.monotonic() - started)
             return ServedInference(admission=admission)
 
         execution = self._routing_execution(admission)
@@ -130,6 +138,9 @@ class InferenceService:
                 outcome=reflection.final.outcome,
                 response=reflection.final.response,
             )
+        )
+        record_served_request(
+            outcome=reflection.final.outcome.value, duration_seconds=time.monotonic() - started
         )
         return ServedInference(admission=admission, reflection=reflection, evaluation=evaluation)
 

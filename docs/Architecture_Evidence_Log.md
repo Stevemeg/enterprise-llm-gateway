@@ -1918,3 +1918,332 @@ coverage.
   onward was correct in isolation and unreachable in composition. Two slices of pure wiring - no new
   capability, no new ADR, no migration - converted thirteen slices of construction-time correctness
   into enforcement.
+
+## Evidence Record - Phase 4 Slice 16: Production Observability
+
+**Milestone type: Capability — reclassified from the planning checkpoint, and the reclassification
+is the first finding.** The checkpoint proposed "Foundation, likely ADR-0019". That was wrong.
+ADR-0016 defines Foundation as *"creates an extension point"*, and this slice creates none: no new
+port, no substitutable implementation, no new seam. Rule 1's objective admission test also fails —
+observability's absence would **not** have forced any public interface to change when it was added
+later, which is precisely what adding it now with **zero interface changes** demonstrates.
+
+The checkpoint had inferred "Foundation" from *cross-cutting and important* rather than from the
+ADR's actual definition. Correcting it dissolves the ADR question rather than answering it: a
+Capability milestone needs no ADR, and "a Foundation milestone with no ADR is suspect" never
+applies.
+
+### No new ADR, and why that is a finding rather than an omission
+
+Everything a telemetry ADR would have decided **already existed and was already Accepted**:
+
+| Decision an ADR would record | Where it already lives |
+|---|---|
+| Mechanism (module-level singletons, default registry) | `observability/metrics.py` docstring, auth milestone |
+| Exposition surface | `/metrics` route in `delivery/http/ops/router.py` |
+| Layer boundary | import-linter: "observability is cross-cutting and must not depend on delivery/config" |
+| Cardinality/sensitivity policy | `metrics.py`: *"label values must be low-cardinality and never sensitive… never from exception text, user input, tokens, or secrets (NFR-SEC03)"* |
+
+This slice extends an established mechanism to new call sites and converts that **written** policy
+into **enforced** policy. Writing an ADR to re-decide settled questions would have been ceremony —
+the same judgement Slices 12 and 13 recorded when they declined to write one.
+
+### Rule 5 determination
+
+| Question | Result |
+|---|---|
+| Rule 5 against Tier 1 | **NOT TRIGGERED** — zero diff on `domain/`, `ports/pipeline.py`, `ports/tools.py`, `ports/mcp.py`, `ports/agents.py`, `agents/`, ADR-0016 |
+| Rule 5 against a capability-owned port | **NOT TRIGGERED** — no protocol gained a field. Every fact was already published: `AdmissionOutcome.records[].action`, `RoutingDecision.outcome`, `ExecutionOutcome`, `ProviderResponse.ok/.error_category`, `AttemptRecord.verdict`, `EvaluationResult.outcome`, `ReservationResult.outcome` |
+| Latency | Measured with `time.monotonic()` **in the owning caller**. The tempting alternative — a `duration` field on `ProviderResponse` — was rejected: it would be a Rule 5 change to a capability-owned port to serve instrumentation, and the caller already knows when it started and stopped |
+| Migration / persistence | **None.** Alembic head unchanged |
+
+### Finding: instrumenting the coordinator exposed a real pre-existing defect
+
+Adding `observability.metrics` to `InferenceCoordinator` **broke the "ports declare contracts only
+(no transport or framework)" contract**, via a path nobody had noticed:
+
+    ports.evaluation -> execution.inference_coordinator -> observability.metrics -> prometheus_client
+
+The root cause is not the instrumentation. `ExecutionOutcome` was defined **inside a concrete
+orchestrator**, so three modules — including a **port** — imported an orchestrator merely to name a
+vocabulary. A port depending on a concrete application service inverts the direction the ports layer
+exists to establish, and it was the **only** outcome enum placed that way:
+
+| Enum | Home |
+|---|---|
+| `ReservationOutcome` | `ports/ledger.py` |
+| `ProviderErrorCategory` | `ports/providers.py` |
+| `EvaluationOutcome` | `ports/evaluation.py` |
+| `StageAction` | `ports/pipeline.py` |
+| `RoutingOutcome` | `domain/routing/models.py` |
+| **`ExecutionOutcome`** | **`execution/inference_coordinator.py`** ← the anomaly |
+
+**The contract was right and the placement was wrong**, so the placement changed:
+`ExecutionOutcome` moved to a new `application/ports/execution.py`. The alternative — an
+`ignore_imports` entry — would have weakened a contract to accommodate a misplaced type, which is
+exactly the erosion this project's evidence log repeatedly records as the failure mode.
+
+**This is a relocation, not a protocol change**: no member added, removed or renamed, no semantics
+altered. Rule 5 stays NOT TRIGGERED; it is prior-slice debt that this slice's first real integration
+exposed, fixed at the smallest correct boundary (10 importers repointed, nothing else touched).
+
+*A latent architectural inversion survived six slices because nothing had yet forced the two sides
+of it into the same import graph.*
+
+### Metric vocabulary (11 families, chosen to answer operational questions)
+
+| Metric | Owner | Answers |
+|---|---|---|
+| `gateway_admission_stage_decisions_total{stage,action}` | `RequestPipeline` | which control refuses, how often |
+| `gateway_served_requests_total{outcome}` | `InferenceService` | terminal outcome incl. never-admitted |
+| `gateway_served_request_duration_seconds{outcome}` | `InferenceService` | end-to-end latency |
+| `gateway_inference_attempts_total{outcome}` | `InferenceCoordinator` | per-attempt outcomes |
+| `gateway_cache_lookups_total{result}` | `InferenceCoordinator` | cache hit rate |
+| `gateway_provider_calls_total{provider,outcome}` | `ProviderExecutor` | which provider fails, and why |
+| `gateway_provider_call_duration_seconds{provider}` | `ProviderExecutor` | which provider is slow |
+| `gateway_reflection_attempts_total{verdict}` | `ReflectiveExecutor` | retry rate |
+| `gateway_routing_decisions_total{outcome}` | `AgentOrchestratedRoutingEngine` | routing refusals |
+| `gateway_evaluations_total{evaluator,outcome}` | `EvaluationRunner` | quality vs. broken evaluator |
+| `gateway_budget_reservations_total{outcome}` | `ReservationService` | denials vs. ledger outage |
+
+Deliberately **not** created: a metric per internal event. Settlement, release and dedup emit
+nothing of their own — each is already derivable from an existing series, and a metric nobody
+queries is cardinality without insight.
+
+### Finding: cardinality bounded at runtime, not merely by convention
+
+Recording goes through `record_*` functions rather than `.labels()` at call sites. Each owns three
+properties the call sites must not re-implement:
+
+1. **Runtime bounding** — a value outside its allowlist becomes `"unknown"` rather than minting a
+   new series. This is the property that actually holds under a defect, and it is what a static
+   guard cannot give.
+2. **Failure isolation** — recording is wrapped so a broken collector cannot change a request's
+   outcome. Proven twice: a unit test on the recorder, and an end-to-end test asserting an
+   identical served result with a deliberately exploding metric.
+3. **Dependency direction** — recorders take `str`, so `observability` imports no application code
+   and stays a leaf.
+
+`unclassified` and `unknown` are deliberately distinct: the first is a real state
+(`error_category is None`), the second means a value fell outside the vocabulary. Collapsing them
+would hide a genuine classification gap behind a bug indicator.
+
+### The guard evaluation
+
+| Candidate | Classification | Reasoning |
+|---|---|---|
+| Metric label cardinality/sensitivity (`check_metric_cardinality.py`) | **NEW** | Three checks: declared label names ⊆ allowlist and free of forbidden substrings; no direct `.labels()` on a request-path metric outside `metrics.py`; no forbidden identifier flows into a `record_*` call |
+| Instrumented components stay within their contracts | **REUSED** | The existing import-linter suite did the real work — it *caught the ports violation*. No new contract was needed |
+| A "metrics port" seam | **NOT APPLICABLE** | Prometheus is the established mechanism; a port would be the speculative abstraction 16.3 warns against |
+| Forbidding `application → adapters` from new code | **REDUNDANT** | Already covered by "application is framework-free and inward-only" |
+
+**Guard scope was bound to named metrics, not to files.** The first draft banned `.labels()`
+everywhere and immediately fired on three pre-existing auth-era call sites. Two options were
+rejected: rewriting approved prior-slice code to satisfy a newer convention (churn, not
+enforcement), and a per-file exemption list — the exact hazard Slice 15 recorded, where exempting a
+file exempts it from *everything*. Naming the protected objects keeps the exemption at the
+granularity of the thing being protected.
+
+### Enforcement (violated, mutation verified present, observed failing, restored to exact bytes, restore verified, observed passing)
+
+**5/5 proven**, covering all three checks:
+
+| Check | Violation planted | Observed |
+|---|---|---|
+| 1 | `labelnames=("organization_id",)` on a new metric | exit 1 |
+| 1 | undeclared label name `"shard"` | exit 1 |
+| 2 | `served_requests.labels(...)` inside `pipeline/runner.py` | exit 1 |
+| 3 | `organization_id` passed into `record_served_request` | exit 1 |
+| 3 | raw `response.error` passed into `record_provider_call` | exit 1 |
+
+**A defect in the proof harness was found and fixed before any result was accepted.** Proof 5
+initially reported `restored=False`: the marker used to confirm restoration (`record_provider_call(`)
+legitimately exists in the original file, so "marker absent" could never hold for a *replacement*
+mutation. Byte-comparison — the authoritative check — had passed. The harness now applies the
+marker check only when the marker was absent from the original. *Verifying a restore is as
+falsifiable as verifying a mutation, and a verification that cannot pass is as useless as a guard
+that cannot fail.*
+
+### Honest limits of the enforcement (stated, not implied)
+
+- **Check 3 is name-based and therefore partially heuristic.** It catches an identifier passed by
+  its own name; it cannot see through an alias (`x = organization_id; record_...(provider=x)`) or a
+  computed string. The runtime allowlist is what holds in those cases.
+- **Three labels are configuration-bounded, not enum-bounded**: `stage` (composition root's fixed
+  chain), `evaluator` (wired chain), `provider` (deployment catalog). None is request-supplied —
+  pinned by `test_a_provider_label_cannot_be_influenced_by_the_request_payload`, which sends an
+  attacker-chosen `provider` in the payload and asserts no such series appears — but their bound is
+  deployment configuration, not a Python enum. Recorded rather than claimed as closed.
+- **`model` is deliberately not a label.** No controlled vocabulary exists for it and cardinality
+  could not be proven, so the operational value did not justify the risk.
+
+### Tests
+
+`test_observability_metrics.py` (29) + `test_app.py` (+1). Prometheus isolation uses **deltas** read
+through the public `REGISTRY.get_sample_value` accessor rather than registry resets: deltas are
+order-independent and immune to cross-test leakage, which resetting global state is not.
+
+### Known limitations
+
+- **No tracing.** Deliberately out of scope: distributed tracing is a genuinely new seam (a
+  propagation format, a span boundary, an exporter) and would have made this a Foundation milestone
+  requiring an ADR. Metrics needed none of that.
+- **No dashboards, alert rules or SLOs.** Those consume metrics; they are not metrics.
+- **Business outcomes unchanged.** This slice records facts and decides nothing — no routing,
+  authorization, policy, execution, accounting, reflection or evaluation behaviour differs. The 606
+  pre-existing tests pass unmodified, which is the evidence for that claim.
+
+### Decision
+
+**No action against ADR-0016** (frozen, byte-unchanged). **No new ADR** — see above. Validation at
+Slice-16 completion: **636 passed, 0 skipped, 97% coverage, mypy strict clean (232 files),
+import-linter 33 kept / 0 broken**; `metrics.py`, `ports/execution.py` and every instrumented module
+at 100% line coverage.
+
+## Evidence Record - Phase 4 Slice 17: HTTP Inference Endpoint + Authentication Wiring
+
+**Milestone type: Capability.** It consumes existing seams and creates no extension point. No ADR.
+
+### Rule 5 determination
+
+| Question | Result |
+|---|---|
+| Rule 5 against Tier 1 | **NOT TRIGGERED** — zero diff on `domain/`, `ports/pipeline.py`, `ports/tools.py`, `ports/mcp.py`, `ports/agents.py`, `agents/`, ADR-0016 |
+| Rule 5 against a capability-owned port | **NOT TRIGGERED** — `StageContext` already carried exactly what an HTTP handler can supply: `correlation_id`, `organization_id`, `principal_id`, `attributes`. No HTTP concern (header, method, path, status) entered any application type |
+| Migration | **None.** Alembic head unchanged |
+
+The pressure Rule 5 exists to catch did appear and was declined: it is tempting to let the route
+pass HTTP details through `StageContext` "since it is a bag anyway". The route translates instead —
+it maps a `Request` into existing application objects and maps the result back into the documented
+error model, and the seam is untouched.
+
+### Finding: a control that existed, was tested, and had never executed
+
+`AuthenticationMiddleware` shipped in the authentication milestone with unit tests, and
+`build_http_app` **never added it to the app** — the factory did not even accept an authenticator.
+Nothing was exposed, because every existing route is public by design, but the middleware was
+enforced-by-nothing for the entire phase.
+
+This is the **same class of debt Slice 14 spent a whole milestone eliminating for pipeline stages**,
+recurring one layer out in delivery. It survived because both halves were individually green: the
+middleware's tests passed, and the app's tests passed, and no test asked whether the app contained
+the middleware. Slice 17 converts it from an implemented control into an executing one.
+
+### Finding: middleware ordering is load-bearing and is now pinned
+
+Starlette's `add_middleware` inserts at the **front**, so the last-added is outermost and runs
+first. `RequestContextMiddleware` must therefore be added *last*: it establishes
+`request.state.request_id`, which authentication stamps into its 401 bodies and its audit events.
+Reversing them does not crash — the lookup falls back to `"unknown"` — which is exactly why it is
+pinned by `test_the_401_body_carries_the_request_id_proving_middleware_ordering` rather than left
+to a comment. *An ordering bug whose symptom is a degraded audit trail rather than an exception is
+the kind that survives review.*
+
+### Finding: the route-auth guard was vacuous for the new route, twice over
+
+`tests/security/test_route_auth_coverage.py` has asserted since the auth milestone that an
+unauthenticated request must not receive 200. Adding the first protected route should have made it
+load-bearing. It did not — for **two independent reasons**, both found by attempting the
+deliberate-failure proof rather than by reading the code:
+
+1. **The guard's app did not contain the route.** `_app()` called `build_http_app` without an
+   `inference_service`, so `/v1/inference` was absent from the routing table it enumerated.
+2. **The guard only issued `GET`.** The first POST-only route answers 405 to a GET, and 405 is not
+   200 — so every write endpoint would have passed this guard forever.
+
+A third, subtler problem appeared once those were fixed: with a *denying* resolver the endpoint
+returns 403 whether or not it checks authentication, so the guard would still have passed for the
+wrong reason. The guard's app now wires a deliberately **permissive** service — permissions granted
+to any principal, a provider offered to any tenant, unlimited budget — so that **authentication is
+the only control that can refuse**. Only then can "the route forgot to require a principal" produce
+a 200.
+
+**The proof itself had to be corrected too.** Removing the auth check outright raises
+`AttributeError` (a 500, not a 200), which is a different bug. The planted violation models the
+mistake a developer actually makes: falling back to a fabricated default identity. That version
+fails the guard, as it must.
+
+*Three layers of vacuity in one pre-existing guard, none visible without trying to make it fail.*
+
+### The guard evaluation
+
+| Candidate | Classification | Reasoning |
+|---|---|---|
+| Route-auth coverage (`test_route_auth_coverage.py`) | **REUSED-EXTENDED, and non-vacuous for the first time** | Extended to include the inference router, to probe POST when GET is not allowed, and to be configured so only authentication can refuse. Before this slice it had no protected route and could not have failed |
+| HTTP delivery reaches inference only through `InferenceService` (import-linter, 9 targets) | **NEW** | One forbidden target per ownership claim. `application.authorization.requirements` is deliberately **not** forbidden: its own docstring names the delivery layer as the *producer* of a permission declaration, and producing one is not interpreting one |
+| `RoutingDecision` construction / Guard L | **REUSED, unchanged** | Proven against the new `delivery/http/api/inference.py` |
+| Metric cardinality (Slice 16) | **REUSED, unchanged** | The new route records nothing directly; Slice 16's owners cover the HTTP-served path |
+| A guard asserting the middleware is present in the app | **NOT APPLICABLE** to static analysis | Middleware presence is a runtime property of a constructed app. Enforced by test instead, and proven: removing the wiring fails the endpoint suite |
+| Forbidding `delivery → config` | **REDUNDANT** | Already covered by "delivery must not import the composition root" |
+
+### Enforcement (violated, mutation verified present, observed failing, restored to exact bytes, restore verified, observed passing)
+
+**12/12 proven.**
+
+| Guard | Violation planted | Observed |
+|---|---|---|
+| Route-auth coverage (extended) | route falls back to a fabricated identity | exit 1 |
+| Middleware wiring | authentication wiring disabled in `app.py` | exit 1 (endpoint suite) |
+| Delivery boundary (new) | one direct import per forbidden target, 8 proven separately | 33 kept / 1 broken, each |
+| `RoutingDecision` (reused) | `RoutingDecision(...)` in `api/inference.py` | exit 1 |
+| Guard L (reused) | `AgentRuntime` referenced in `api/inference.py` | exit 1 |
+
+### Security behaviour
+
+| Condition | Result | Proven by |
+|---|---|---|
+| No credential | 401, no routing/provider/budget | `test_an_unauthenticated_request_is_refused_and_reaches_nothing` |
+| Invalid credential | 401 **at the middleware**, never reaching the route | `test_an_invalid_credential_is_refused_by_the_middleware_before_the_route` |
+| Malformed `Authorization` header | 401 | `test_a_malformed_authorization_header_fails_closed` |
+| Malformed / empty / extra-field body | 422 before admission or execution | three tests, each asserting no downstream call |
+| Authenticated but unpermitted | 403, no routing, no provider, no reservation | `test_an_authorized_credential_without_permission_is_denied_before_routing` |
+| Policy denial | 403, no routing, no provider | `test_a_policy_denial_is_403_and_reaches_no_routing_or_provider` |
+| Budget exhausted | 402, provider never called | `test_a_budget_denial_is_402_and_the_provider_is_never_called` |
+| Nothing routable | 503, provider never called | `test_nothing_routable_is_503_and_calls_no_provider` |
+| Provider failed | 502, hold released not settled, **error text never echoed** | `test_a_provider_failure_is_502_and_never_echoes_the_provider_error_text` |
+| Success | 200, spend booked exactly once | `test_a_fully_authorized_request_executes_and_returns_200` |
+
+A denial never names the permission, the rule or the threshold
+(`test_a_denial_does_not_disclose_the_permission_rule_or_threshold`) — the route adds no detail of
+its own, so it cannot leak what the stages were careful to withhold. `extra="forbid"` keeps
+unmodelled input out of the payload the policy engine measures.
+
+### RBAC configuration: fail-closed default kept, and no new config surface
+
+The default `NullPermissionResolver` grants nothing, so the production endpoint denies every
+request. That was **not** weakened. No dev-permissive setting was added either, because none was
+required: tests build the app through `build_http_app` with explicitly injected collaborators, the
+same way the pre-existing app tests do. Durable RBAC storage remains **Slice 18**.
+
+### Known limitations, stated rather than concealed
+
+- **JWT credentials only.** `CompositeAuthenticator` (which also routes API keys) needs a
+  request-scoped `ApiKeyRepository` — Slice 18's durable storage work. An API key today fails
+  closed with a 401, which is correct for a credential type the deployment cannot verify.
+  Substituting the composite later changes one line in the composition root.
+- **The production endpoint denies every request** until permissions have storage (Slice 18).
+- **One endpoint, deliberately minimal.** No streaming/SSE, no OpenAI compatibility, no tool-calling,
+  no webhooks, pagination, SDKs, rate limiting or inference variants.
+- **`PipelineStage.after_response` / `on_error` remain unexecuted** — unchanged by this slice, and
+  still the oldest open piece of the stage protocol.
+- **`token_authenticator.py` line 39 is uncovered**: the success path is exercised through the
+  container-wired app only in production; the endpoint tests use a stub authenticator to control
+  identity. Recorded rather than papered over with a test that asserts nothing.
+
+### Decision
+
+**No action against ADR-0016** (frozen, byte-unchanged). **No new ADR.** Combined validation:
+**659 passed, 0 skipped, 97% coverage, mypy strict clean (236 files), import-linter 34 kept / 0
+broken**; `api/inference.py` at 100% line coverage.
+
+### Lessons
+
+- **A guard that has never had a subject is not a guard.** Route-auth coverage looked green for the
+  entire phase because there was no protected route to protect; three separate vacuity problems
+  surfaced the moment one existed, and only because a deliberate violation was attempted.
+- **"Implemented, tested, unwired" is this project's recurring defect, and it recurs one layer at a
+  time.** Slices 5-13 left stages unexecuted; Slice 17 found the same shape in delivery. The common
+  cause is that both halves pass their own tests and nothing asserts they are connected.
+- **The realistic mutation matters more than the convenient one.** Deleting the auth check produced
+  a crash, not a bypass; only the fallback-identity version modelled the bug the guard exists to
+  catch, and it was the version that proved the guard.

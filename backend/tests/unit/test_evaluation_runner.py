@@ -24,7 +24,6 @@ from gateway.application.evaluation.runner import EvaluationReport, EvaluationRu
 from gateway.application.evaluation.usage_consistency import UsageAccountingConsistencyEvaluator
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import (
-    ExecutionOutcome,
     InferenceCoordinator,
 )
 from gateway.application.ports.evaluation import (
@@ -32,6 +31,7 @@ from gateway.application.ports.evaluation import (
     EvaluationOutcome,
     EvaluationResult,
 )
+from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.ledger import ReservationOutcome
 from gateway.application.ports.money import Money
 from gateway.application.ports.pricing import ModelPrice

@@ -28,6 +28,7 @@ from gateway.application.ports.routing import (
 )
 from gateway.application.routing.catalog import ProviderCatalog
 from gateway.domain.routing.models import RoutingOutcome
+from gateway.observability.metrics import record_routing_decision
 
 
 class AgentOrchestratedRoutingEngine:
@@ -54,6 +55,11 @@ class AgentOrchestratedRoutingEngine:
             request=request,
             candidates=tuple(descriptor.name for descriptor in candidates),
         )
+        # Slice 16: the engine owns the routing attempt end to end, so it reports the outcome.
+        # Read off the decision the runtime already made - RoutingDecision is Tier-1 and gained
+        # no field for this.
+        record_routing_decision(outcome=decision.outcome.value)
+
         if decision.outcome is not RoutingOutcome.SELECTED:
             return RoutingExecution(decision=decision)
 

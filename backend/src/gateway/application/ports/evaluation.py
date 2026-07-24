@@ -48,7 +48,7 @@ from enum import StrEnum
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
-from gateway.application.execution.inference_coordinator import ExecutionOutcome
+from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.providers import ProviderResponse
 
 

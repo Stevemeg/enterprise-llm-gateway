@@ -758,3 +758,104 @@ strict clean (230 files), import-linter 33 kept / 0 broken.** Alembic head uncha
 `0006_budget_ledger` (no migration in either slice); runtime role verified `app_rw`,
 `rolsuper=False`, `rolbypassrls=False`. All Postgres-backed integration/security tests executed
 against real PostgreSQL 16 + pgvector, none skipped.
+
+### Slice 16 — Production Observability — ✅ COMPLETE
+
+Rule 5 **not triggered** — against Tier 1 *or* any capability-owned port. Zero diff on `domain/`,
+all Tier-1 ports, `agents/`, ADR-0016. **No migration.** **No new ADR** — and that is a determination,
+not an omission.
+
+**Reclassified Foundation → Capability.** ADR-0016 defines Foundation as *creating an extension
+point*; this slice creates none (no port, no substitutable implementation, no seam), and Rule 1's
+admission test fails because observability was added with **zero interface changes**. Everything a
+telemetry ADR would decide — mechanism, exposition route, layer boundary, and the cardinality policy
+itself — was already Accepted and already written in `observability/metrics.py`. This slice extends
+an established mechanism and converts its **written** policy into **enforced** policy.
+
+| Component | Module | Role |
+|---|---|---|
+| Vocabulary + recorders (extended) | `observability/metrics.py` | 11 request-path metric families; `record_*` functions owning runtime bounding, failure isolation and dependency direction |
+| Port (relocated) | `application/ports/execution.py` | `ExecutionOutcome` — moved out of a concrete orchestrator (see the finding below) |
+| Instrumentation (owner-local) | `pipeline/runner.py`, `serving/inference_service.py`, `execution/inference_coordinator.py`, `providers/provider_executor.py`, `reflection/reflective_executor.py`, `evaluation/runner.py`, `routing/engine.py`, `accounting/reservation_service.py` | each records only the facts it owns |
+| Guard (new) | `scripts/check_metric_cardinality.py` | label names ⊆ allowlist; no direct `.labels()` on a request-path metric; no forbidden identifier into a `record_*` call |
+
+**A genuine pre-existing defect, exposed by the first instrumentation.** Adding metrics to
+`InferenceCoordinator` broke *"ports declare contracts only"* via
+`ports.evaluation → execution.inference_coordinator → observability.metrics → prometheus_client`.
+The cause was placement, not instrumentation: `ExecutionOutcome` lived **inside a concrete
+orchestrator**, making a **port** import an orchestrator to name a vocabulary — the only outcome
+enum in the codebase placed that way (`ReservationOutcome`, `ProviderErrorCategory`,
+`EvaluationOutcome`, `StageAction` all live in ports; `RoutingOutcome` in domain). Fixed by
+relocating the enum to `ports/execution.py` and repointing 10 importers. An `ignore_imports` entry
+was rejected: it would have weakened a correct contract to accommodate a misplaced type.
+
+**Cardinality is bounded at runtime, not by convention.** A value outside its allowlist becomes
+`"unknown"` rather than minting a new series — the property that holds under a defect, which no
+static guard can provide. `unclassified` (a real state: `error_category is None`) is kept distinct
+from `unknown` (a value outside the vocabulary).
+
+**Observability is not a correctness dependency.** Recording is failure-isolated, proven both at the
+recorder and end-to-end with a deliberately exploding metric returning an identical served result.
+
+**Documented limits, stated rather than implied:** the forbidden-identifier check is name-based and
+**partially heuristic** (it cannot see through an alias); `stage`, `evaluator` and `provider` are
+**configuration-bounded, not enum-bounded** (none request-supplied — pinned by a test that sends an
+attacker-chosen provider in the payload); `model` is deliberately not a label (no controlled
+vocabulary, cardinality unprovable); no tracing, dashboards, alert rules or SLOs.
+
+Tests: `test_observability_metrics.py` (29), plus `test_app.py` (+1). Prometheus isolation by
+**delta** via the public `REGISTRY.get_sample_value`, not registry resets.
+
+**Gate 1 + Gate 2 at Slice-16 completion: PASS — 636 passed, 0 skipped, 97% coverage, mypy strict
+clean (232 files), import-linter 33 kept / 0 broken.** All 606 pre-existing tests pass unmodified,
+which is the evidence that this slice changed no business outcome.
+
+### Slice 17 — HTTP Inference Endpoint + Authentication Wiring — ✅ COMPLETE
+
+Rule 5 **not triggered** — against Tier 1 *or* any capability-owned port. `StageContext` already
+carried `correlation_id`, `organization_id`, `principal_id` and `attributes`; **no HTTP concern
+entered any application type**. Zero diff on `domain/`, all Tier-1 ports, `agents/`, ADR-0016. No
+migration. No new ADR.
+
+| Component | Module | Role |
+|---|---|---|
+| Route (new) | `delivery/http/api/inference.py` | `POST /v1/inference` — translates, delegates to `InferenceService`, maps to `API_Error_Model.md` |
+| Authenticator (new) | `adapters/security/token_authenticator.py` | `BearerTokenAuthenticator` over the existing `AccessTokenVerifier` |
+| App factory (modified) | `delivery/http/app.py` | `AuthenticationMiddleware` finally added to the chain, with pinned ordering |
+| Composition root | `config/container.py`, `config/bootstrap.py` | builds the authenticator; passes it, the audit sink and the inference service to the app |
+| Guard (reused-extended) | `tests/security/test_route_auth_coverage.py` | now includes the inference router, probes POST when GET is 405, and is configured so only authentication can refuse |
+| Guard (new) | `pyproject.toml` import-linter | `gateway.delivery` forbidden from routing, agents, providers, accounting, ports.ledger, execution, reflection, evaluation, pipeline (`allow_indirect_imports`) |
+
+**A control that existed, was tested, and had never executed.** `AuthenticationMiddleware` shipped
+in the authentication milestone; `build_http_app` never added it and did not even accept an
+authenticator. Nothing was exposed (every prior route is public by design), but this is the **same
+class of debt Slice 14 eliminated for pipeline stages**, recurring one layer out. Both halves were
+individually green; nothing asserted they were connected.
+
+**The route-auth guard was vacuous three ways, all found by trying to make it fail:** its app did
+not include the route; it only issued `GET` (a POST-only route answers 405, and 405 is not 200); and
+with a denying resolver it would have returned 403 either way. Fixed by including the router,
+probing POST, and wiring a permissive service so **authentication is the only control that can
+refuse**. The planted violation had to be realistic too — deleting the check raises `AttributeError`
+(500, not a bypass), so the proof models a fallback to a fabricated identity.
+
+**Middleware ordering is pinned, not commented.** Starlette's `add_middleware` inserts at the front,
+so `RequestContextMiddleware` is added *last* to be outermost and establish `request_id` before
+authentication stamps it into 401 bodies and audit events. Reversing them degrades the audit trail
+without raising — hence a test.
+
+**Fail-closed default kept.** The production endpoint still denies every request
+(`NullPermissionResolver`), and **no dev-permissive setting was added** because none was needed:
+tests inject collaborators through `build_http_app` exactly as the pre-existing app tests do.
+Durable RBAC storage remains **Slice 18**.
+
+**Documented limitations:** JWT credentials only (`CompositeAuthenticator` needs a request-scoped
+`ApiKeyRepository` — Slice 18); one deliberately minimal endpoint (no streaming, OpenAI
+compatibility, tool-calling, webhooks, pagination, SDKs or rate limiting);
+`PipelineStage.after_response`/`on_error` still unexecuted.
+
+Tests: `test_inference_endpoint.py` (23), plus `test_route_auth_coverage.py` (extended).
+
+**Gate 1 + Gate 2 (combined, both slices present): PASS — 659 passed, 0 skipped, 97% coverage, mypy
+strict clean (236 files), import-linter 34 kept / 0 broken.** Alembic head unchanged at
+`0006_budget_ledger`; runtime role verified `app_rw`, `rolsuper=False`, `rolbypassrls=False`.

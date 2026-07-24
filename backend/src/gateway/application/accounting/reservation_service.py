@@ -41,6 +41,7 @@ from gateway.application.ports.ledger import (
 from gateway.application.ports.pricing import PricingPort
 from gateway.application.ports.providers import InferenceRequest, ProviderResponse
 from gateway.application.routing.catalog import ProviderDescriptor
+from gateway.observability.metrics import record_budget_reservation
 
 
 class ReservationService:
@@ -70,16 +71,21 @@ class ReservationService:
         estimate = estimate_usage(request)
         _, _, estimated_cost = compute_cost(estimate, price)
         try:
-            return await self._ledger.reserve(
+            result = await self._ledger.reserve(
                 organization_id, request.correlation_id, estimated_cost
             )
         except LedgerUnavailableError:
-            return ReservationResult(
+            result = ReservationResult(
                 outcome=ReservationOutcome.UNAVAILABLE,
                 organization_id=organization_id,
                 correlation_id=request.correlation_id,
                 estimated_cost=estimated_cost,
             )
+        # Slice 16: this component owns the budget gate, so it reports the verdict. A ledger
+        # outage is visible as its own outcome rather than being folded into a denial - they are
+        # different operational facts (ADR-0009 row 1).
+        record_budget_reservation(outcome=result.outcome.value)
+        return result
 
     async def settle(
         self,

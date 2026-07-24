@@ -23,9 +23,9 @@ from gateway.application.accounting.cost_accountant import CostAccountant
 from gateway.application.accounting.reservation_service import ReservationService
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import (
-    ExecutionOutcome,
     InferenceCoordinator,
 )
+from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.ledger import ReservationOutcome, UnknownReservationError
 from gateway.application.ports.money import Money
 from gateway.application.ports.pricing import ModelPrice

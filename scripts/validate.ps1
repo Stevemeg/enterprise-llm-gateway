@@ -68,6 +68,10 @@ Write-Host "==> Pipeline construction guard (the request path is composed only i
 uv run python ..\scripts\check_pipeline_construction.py src\gateway
 if ($LASTEXITCODE -ne 0) { throw "Pipeline construction guard failed (ADR-0016 invariant 5)." }
 
+Write-Host "==> Metric cardinality guard (bounded, non-sensitive metric labels)"
+uv run python ..\scripts\check_metric_cardinality.py src\gateway
+if ($LASTEXITCODE -ne 0) { throw "Metric cardinality guard failed (NFR-SEC03)." }
+
 Write-Host "==> migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
 uv run python ..\scripts\check_migration_guardrails.py migrations\sql
 if ($LASTEXITCODE -ne 0) { throw "Tenant-table RLS guardrail failed (ADR-0002/0014)." }

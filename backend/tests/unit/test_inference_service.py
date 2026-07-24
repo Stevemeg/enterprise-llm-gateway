@@ -39,11 +39,11 @@ from gateway.application.evaluation.runner import EvaluationReport, EvaluationRu
 from gateway.application.evaluation.usage_consistency import UsageAccountingConsistencyEvaluator
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import (
-    ExecutionOutcome,
     InferenceCoordinator,
 )
 from gateway.application.pipeline.runner import AdmissionOutcome, RequestPipeline, StageRecord
 from gateway.application.ports.evaluation import EvaluationInput
+from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.ledger import BudgetLedgerPort
 from gateway.application.ports.money import Money
 from gateway.application.ports.pipeline import StageAction, StageContext

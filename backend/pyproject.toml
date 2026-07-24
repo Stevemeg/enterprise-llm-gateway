@@ -535,3 +535,42 @@ forbidden_modules = [
     "gateway.application.ports.authorization",
 ]
 allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+# Slice 17 Guard 1 - HTTP delivery TRANSLATES and reaches inference only through InferenceService.
+# The route turns an HTTP request into the existing application objects and turns the result back
+# into the documented error model; it acquires no business responsibility. One forbidden target per
+# claim, each naming the component that keeps the question instead:
+#   - application.routing / agents -> the route cannot route or reach AgentRuntime (Guard L also
+#     bars the runtime by name; this bars the whole capability)
+#   - application.providers        -> the route cannot call a provider; only ProviderExecutor may,
+#     and only from behind the budget gate inside InferenceCoordinator
+#   - application.accounting / ports.ledger -> the route cannot reserve, settle or author cost
+#   - application.execution        -> the route cannot run the cache/reserve/execute/settle
+#     sequence itself, bypassing admission entirely
+#   - application.reflection       -> the route cannot retry outside the established boundary
+#   - application.evaluation       -> the route cannot evaluate, or re-evaluate, an outcome
+#   - application.pipeline         -> the route cannot build or run a second admission chain; the
+#     composition root owns which controls guard a request (Slice 14/15 guard)
+# NOT forbidden, deliberately: `application.authorization.requirements`. Its own docstring names
+# the delivery layer as the *producer* of a permission declaration ("whoever constructs the
+# StageContext - the delivery layer, from endpoint metadata"), so declaring what an endpoint
+# requires is exactly this layer's job. Producing a requirement and interpreting one are different
+# responsibilities, and only AuthorizationStage does the latter.
+# allow_indirect_imports: delivery -> serving -> pipeline/reflection/evaluation is the intended
+# path. Only a direct reach-around is a violation - the Slice 11/12/15 shape, for the same reason.
+name = "HTTP delivery translates and reaches inference only through InferenceService"
+type = "forbidden"
+source_modules = ["gateway.delivery"]
+forbidden_modules = [
+    "gateway.application.routing",
+    "gateway.application.agents",
+    "gateway.application.providers",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.execution",
+    "gateway.application.reflection",
+    "gateway.application.evaluation",
+    "gateway.application.pipeline",
+]
+allow_indirect_imports = true

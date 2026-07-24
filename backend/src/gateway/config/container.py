@@ -33,6 +33,7 @@ from gateway.adapters.security.jwt import JwtService
 from gateway.adapters.security.key_provider import KeyProvider
 from gateway.adapters.security.keys import derive_public_pem
 from gateway.adapters.security.oidc_state import StateSigner
+from gateway.adapters.security.token_authenticator import BearerTokenAuthenticator
 from gateway.adapters.security.token_service import JwtTokenService
 from gateway.application.accounting.budget_enforcer import BudgetEnforcer
 from gateway.application.accounting.cost_accountant import CostAccountant
@@ -49,7 +50,7 @@ from gateway.application.evaluation.usage_consistency import UsageAccountingCons
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import InferenceCoordinator
 from gateway.application.pipeline.runner import RequestPipeline
-from gateway.application.ports.auth import AuthAuditSink
+from gateway.application.ports.auth import AuthAuditSink, Authenticator
 from gateway.application.ports.authorization import PermissionResolver
 from gateway.application.ports.budget import BudgetPort
 from gateway.application.ports.cache import ResponseCachePort
@@ -144,6 +145,7 @@ class Container:
     health: HealthRegistry
     key_provider: KeyProvider
     token_service: JwtTokenService
+    authenticator: Authenticator
     audit_sink: AuthAuditSink
     state_signer: StateSigner
     routing_engine: RoutingEngine
@@ -198,6 +200,10 @@ class Container:
         key_provider = _build_key_provider(auth, secrets)
         jwt_service = JwtService(issuer=auth.jwt_issuer, audience=auth.jwt_audience, clock=clock)
         token_service = JwtTokenService(jwt_service, key_provider)
+        # Slice 17: the middleware finally has an Authenticator to be wired with. JWT only -
+        # API-key credentials need a request-scoped ApiKeyRepository, which is Slice 18's durable
+        # storage work; an unverifiable credential fails closed rather than being waved through.
+        authenticator: Authenticator = BearerTokenAuthenticator(token_service)
         # Composite so the durable hash-chained audit_event sink drops in later (ADR-0009)
         # without changing any call site.
         audit_sink: AuthAuditSink = CompositeAuthAuditSink([LoggingAuthAuditSink()])
@@ -351,6 +357,7 @@ class Container:
             health=health,
             key_provider=key_provider,
             token_service=token_service,
+            authenticator=authenticator,
             audit_sink=audit_sink,
             state_signer=state_signer,
             routing_engine=routing_engine,

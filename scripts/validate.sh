@@ -63,6 +63,9 @@ uv run python ../scripts/check_execution_construction.py src/gateway || fail "Ex
 step "Pipeline construction guard (the request path is composed only in the composition root)"
 uv run python ../scripts/check_pipeline_construction.py src/gateway || fail "Pipeline construction guard failed (ADR-0016 invariant 5)."
 
+step "Metric cardinality guard (bounded, non-sensitive metric labels)"
+uv run python ../scripts/check_metric_cardinality.py src/gateway || fail "Metric cardinality guard failed (NFR-SEC03)."
+
 step "migration guardrail (tenant tables must ENABLE+FORCE RLS + policy)"
 uv run python ../scripts/check_migration_guardrails.py migrations/sql || fail "Tenant-table RLS guardrail failed (ADR-0002/0014)."
 

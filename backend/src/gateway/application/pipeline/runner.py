@@ -83,6 +83,7 @@ from gateway.application.ports.pipeline import (
     StageContext,
     StageResult,
 )
+from gateway.observability.metrics import record_admission_decision
 
 #: What a caller is told when the runner itself refuses. Stage-authored denials keep their own
 #: reason (the stages already decide what is safe to disclose); this covers only the cases where
@@ -184,6 +185,10 @@ class RequestPipeline:
         for name, stage in self._stages:
             record = await self._run(name, stage, context)
             records.append(record)
+            # Slice 16: this component owns admission facts, so it records them. The stage name
+            # is bounded by the composition root's fixed chain and the action by StageAction;
+            # neither can be influenced by a caller.
+            record_admission_decision(stage=record.stage, action=record.action.value)
             if record.blocked:
                 return AdmissionOutcome(
                     records=tuple(records), blocked_by=record.stage, reason=record.reason

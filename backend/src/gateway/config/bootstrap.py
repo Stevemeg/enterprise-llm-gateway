@@ -27,6 +27,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service_version=resolved.service_version,
         health_registry=container.health,
         key_provider=container.key_provider,
+        # Slice 17: authentication now executes, and the inference path is reachable.
+        authenticator=container.authenticator,
+        audit_sink=container.audit_sink,
+        inference_service=container.inference_service,
         on_shutdown=container.dispose,
     )
     app.state.container = container
