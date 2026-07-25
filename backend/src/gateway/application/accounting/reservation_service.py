@@ -63,7 +63,9 @@ class ReservationService:
         ``BudgetEnforcer.evaluate``. Raises ``UnknownPriceError`` for an unpriced model - a
         configuration defect, never a budget denial (same reasoning as ``CostAccountant``).
         """
-        price = await self._pricing.price_for(provider.name, provider.model)
+        price = await self._pricing.price_for(
+            provider.name, provider.model, organization_id=organization_id
+        )
         if price is None:
             raise UnknownPriceError(
                 f"no price configured for provider={provider.name!r} model={provider.model!r}"

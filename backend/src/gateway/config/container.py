@@ -13,21 +13,32 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from gateway.adapters.audit.composite_sink import CompositeAuthAuditSink
 from gateway.adapters.audit.logging_sink import LoggingAuthAuditSink
+from gateway.adapters.audit.sql_sink import SqlAuthAuditSink
 from gateway.adapters.authorization.null_resolver import NullPermissionResolver
+from gateway.adapters.authorization.sql_resolver import SqlPermissionResolver
 from gateway.adapters.budget.in_memory_budget_store import InMemoryBudgetStore
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
 from gateway.adapters.cache.sql_response_cache import SqlResponseCache
+from gateway.adapters.catalog.sql_provider_catalog import SqlProviderCatalog
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.ledger.sql_budget_ledger import SqlBudgetLedger
 from gateway.adapters.persistence.engine import create_database_engine, create_session_factory
 from gateway.adapters.persistence.health import DatabaseHealthCheck
+from gateway.adapters.persistence.repositories.auth_repositories import (
+    TenantScopedApiKeyRepository,
+)
 from gateway.adapters.persistence.uow import UnitOfWorkFactory
 from gateway.adapters.pipeline.authorization_stage import AuthorizationStage
 from gateway.adapters.pipeline.policy_stage import PolicyStage
 from gateway.adapters.pipeline.routing_stage import AgentRoutingStage
 from gateway.adapters.policy.local_policy_engine import LocalPolicyEngine
+from gateway.adapters.pricing.sql_price_table import SqlPriceTable
 from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.in_memory_client import InMemoryProviderClient
+from gateway.adapters.providers.openai_compatible_client import (
+    OpenAiCompatibleProviderClient,
+    ProviderConnection,
+)
 from gateway.adapters.secrets.env_resolver import EnvSecretsResolver
 from gateway.adapters.security.jwt import JwtService
 from gateway.adapters.security.key_provider import KeyProvider
@@ -44,6 +55,8 @@ from gateway.application.agents.planner import PlannerAgent
 from gateway.application.agents.policy import PolicyAgent
 from gateway.application.agents.provider import ProviderAgent
 from gateway.application.agents.runtime import AgentRuntime
+from gateway.application.auth.authenticate_api_key import AuthenticateApiKey
+from gateway.application.auth.authenticate_request import CompositeAuthenticator
 from gateway.application.evaluation.response_completeness import ResponseCompletenessEvaluator
 from gateway.application.evaluation.runner import EvaluationRunner
 from gateway.application.evaluation.usage_consistency import UsageAccountingConsistencyEvaluator
@@ -64,7 +77,7 @@ from gateway.application.ports.secrets import SecretNotFoundError, SecretsResolv
 from gateway.application.providers.provider_executor import ProviderExecutor
 from gateway.application.reflection.reflective_executor import ReflectiveExecutor
 from gateway.application.reflection.retry_policy import RetryPolicy
-from gateway.application.routing.catalog import InMemoryProviderCatalog
+from gateway.application.routing.catalog import InMemoryProviderCatalog, ProviderCatalog
 from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
 from gateway.application.serving.inference_service import InferenceService
 from gateway.config.settings import AuthSettings, Settings
@@ -113,6 +126,41 @@ def _build_key_provider(auth: AuthSettings, secrets: SecretsResolver) -> KeyProv
         private_pem=private_pem,
         previous=tuple(previous),
     )
+
+
+def _build_provider_connections(
+    settings: Settings, secrets: SecretsResolver
+) -> dict[str, ProviderConnection]:
+    """Resolve each configured provider's credential into a usable connection (ADR-0003/0011).
+
+    A configured provider whose key cannot be resolved **fails startup** rather than being skipped
+    or wired with an empty credential (ADR-0009 row 16: "secrets manager unreachable at startup ->
+    fail fast"). Skipping it would silently shrink the routable set and surface later as a
+    mysterious ``no_eligible_provider``; an empty credential would surface as an unexplained 401
+    from the provider on every request. Both hide a misconfiguration the operator can fix now.
+
+    A provider with no ``base_url`` is likewise a configuration error, not a default to guess at.
+    """
+    connections: dict[str, ProviderConnection] = {}
+    for name, connection in settings.providers.items():
+        if not connection.base_url:
+            raise SecretNotFoundError(
+                f"provider {name!r} has no base_url configured "
+                f"(set GATEWAY_PROVIDERS__{name.upper()}__BASE_URL)."
+            )
+        api_key = secrets.try_resolve(connection.api_key_ref) if connection.api_key_ref else None
+        if api_key is None:
+            raise SecretNotFoundError(
+                f"provider {name!r} credential {connection.api_key_ref!r} could not be resolved; "
+                "a provider configured with an unusable credential would fail every call "
+                "(ADR-0011 / ADR-0009 row 16)."
+            )
+        connections[name] = ProviderConnection(
+            base_url=connection.base_url,
+            api_key=api_key,
+            timeout_seconds=connection.timeout_seconds,
+        )
+    return connections
 
 
 def _resolve_state_signing_key(auth: AuthSettings, secrets: SecretsResolver) -> str:
@@ -203,22 +251,46 @@ class Container:
         # Slice 17: the middleware finally has an Authenticator to be wired with. JWT only -
         # API-key credentials need a request-scoped ApiKeyRepository, which is Slice 18's durable
         # storage work; an unverifiable credential fails closed rather than being waved through.
-        authenticator: Authenticator = BearerTokenAuthenticator(token_service)
-        # Composite so the durable hash-chained audit_event sink drops in later (ADR-0009)
-        # without changing any call site.
-        audit_sink: AuthAuditSink = CompositeAuthAuditSink([LoggingAuthAuditSink()])
+        # Slice 18: API keys are verifiable at last. CompositeAuthenticator routes `elg_`-prefixed
+        # credentials to the key use-case and everything else to the token verifier; the key path
+        # needs durable storage, and reaching it under RLS needs the ADR-0019 bootstrap lookup,
+        # which exists only on PostgreSQL. Without Postgres the deployment keeps the JWT-only
+        # authenticator rather than pretending to verify a credential type it cannot read - an
+        # API key then fails closed with a 401, exactly as it did before this slice.
+        authenticator: Authenticator = (
+            CompositeAuthenticator(
+                AuthenticateApiKey(TenantScopedApiKeyRepository(uow_factory), clock),
+                token_service,
+            )
+            if rls_enabled
+            else BearerTokenAuthenticator(token_service)
+        )
+        # Slice 18: the composite finally has something to fan out to. The durable sink writes the
+        # hash-chained audit_event log; the logging sink stays because it is the ONLY record of an
+        # authentication rejection, which has no proven tenant and therefore no tenant-scoped log
+        # to be appended to (see SqlAuthAuditSink's docstring). Order matters for neither, but the
+        # composite's failure isolation does: a database hiccup must alert, not break login
+        # (ADR-0009 row 7, inference-side "buffer+alert").
+        audit_sinks: list[AuthAuditSink] = [LoggingAuthAuditSink()]
+        if rls_enabled:
+            audit_sinks.append(SqlAuthAuditSink(uow_factory, clock))
+        audit_sink: AuthAuditSink = CompositeAuthAuditSink(audit_sinks)
         # Signs the tenant hint inside the OIDC ``state`` so the callback can resolve the org
         # before any DB access. Resolved from the secrets manager in production (ADR-0011);
         # a per-process ephemeral key is used only when no reference is configured, which
         # confines any such deployment to a single instance by construction.
         state_signer = StateSigner(_resolve_state_signing_key(auth, secrets))
 
-        # --- routing object graph (ADR-0016 Slice 6) ------------------------------------
+        # --- routing object graph (ADR-0016 Slice 6; durable catalog Slice 19) -----------
         # The composition root is the only place any of these may be built (Guards K and L).
-        # The catalog starts empty because no provider configuration exists yet: routing then
-        # yields NO_CANDIDATE, which is an explained refusal rather than a crash, and is the
+        # Slice 19: on PostgreSQL the catalog reads the tenant's provider/model rows, so routing
+        # finally has something to choose between and FR-028's runtime enable/disable takes effect
+        # without a redeploy. Without Postgres the in-memory catalog remains, and it starts empty:
+        # routing then yields NO_CANDIDATE, an explained refusal rather than a crash, and the
         # correct behaviour for a gateway with nothing to route to.
-        provider_catalog = InMemoryProviderCatalog()
+        provider_catalog: ProviderCatalog = (
+            SqlProviderCatalog(uow_factory) if rls_enabled else InMemoryProviderCatalog()
+        )
         agent_runtime = AgentRuntime(
             [PlannerAgent(), PolicyAgent(), CostAgent(), HealthAgent(), ProviderAgent()], clock
         )
@@ -227,19 +299,29 @@ class Container:
         )
         routing_stage = AgentRoutingStage(routing_engine)
 
-        # --- provider execution object graph (ADR-0016 Slice 7) -------------------------
-        # The composition root is the only place either may be built (Guard 1). No real
-        # provider SDK exists yet (that is provider-abstraction work), so the in-memory client
-        # is the current default - it validates the port, not a production integration.
-        provider_client: ProviderClient = InMemoryProviderClient()
+        # --- provider execution object graph (ADR-0016 Slice 7; real adapter Slice 19) ----
+        # The composition root is the only place either may be built (Guard 1). Slice 19 realizes
+        # ADR-0003: when connections are configured, the OpenAI-compatible HTTP adapter makes the
+        # real call. With none configured the in-memory client remains - it validates the port,
+        # and a deployment that has not been told how to reach any provider has nothing to call.
+        # Credentials are resolved here, from the secrets manager, and never leave the adapter.
+        provider_connections = _build_provider_connections(settings, secrets)
+        provider_client: ProviderClient = (
+            OpenAiCompatibleProviderClient(provider_connections)
+            if provider_connections
+            else InMemoryProviderClient()
+        )
         provider_executor = ProviderExecutor(provider_client)
 
-        # --- usage/cost accounting object graph (ADR-0016 Slice 8) -----------------------
-        # The composition root is the only place any of these may be built (Guard 1). Both
-        # adapters start empty: no price list and no budgets are configured yet, so accounting
-        # would raise UnknownPriceError and enforcement would allow (unbounded) - the same
-        # "nothing configured yet" posture as the routing catalog above, not a defect.
-        pricing_port: PricingPort = StaticPriceTable()
+        # --- usage/cost accounting object graph (Slice 8; durable pricing Slice 19) -------
+        # The composition root is the only place any of these may be built (Guard 1). Slice 19:
+        # on PostgreSQL the price list is the tenant's effective-dated price_table rows, so a
+        # settled cost is reproducible against the price that was in force when the call happened
+        # (FR-074/075). The budget store still starts empty - no budgets configured means
+        # unbounded, the same "nothing configured yet" posture as before, not a defect.
+        pricing_port: PricingPort = (
+            SqlPriceTable(uow_factory, clock) if rls_enabled else StaticPriceTable()
+        )
         budget_port: BudgetPort = InMemoryBudgetStore()
         cost_accountant = CostAccountant(pricing_port)
         budget_enforcer = BudgetEnforcer(budget_port)
@@ -302,13 +384,12 @@ class Container:
         # PolicyStage (Slice 13) was constructed but never run: both were enforced by
         # construction and unenforced in traffic.
         #
-        # RBAC has no storage yet, so the resolver grants nothing (Rule 4's validating
-        # implementation, and the safe one - an unwired RBAC subsystem must deny every request,
-        # never allow every one). Combined with AuthorizationStage's refusal of an undeclared
-        # request, the default chain therefore denies everything until an endpoint declares its
-        # requirements and a real resolver is wired. That is the same "nothing configured yet"
-        # posture as the empty provider catalog and empty price table above, and here it is
-        # deliberately the fail-closed direction.
+        # Slice 18: RBAC has storage. On PostgreSQL the resolver reads the seeded ADR-0008 role
+        # matrix and virtual-key scopes, so a principal who has actually been granted something
+        # now resolves to it. Without Postgres there is nowhere to read from, and the fail-closed
+        # NullPermissionResolver remains - an unwired RBAC subsystem must deny every request,
+        # never allow every one. Substituting one for the other is the single line the Slice-5
+        # port was introduced to buy.
         #
         # Order is derived, not assumed:
         #   1. authorization - may this principal act at all? The cheapest question that can
@@ -322,7 +403,9 @@ class Container:
         #      side effect: it invokes the routing engine, which runs the entire agent chain.
         #      "Authorization denial => no routing" is exactly this ordering plus the runner's
         #      first-block-wins rule, and it is what closes the Slice 5-13 bypass.
-        permission_resolver: PermissionResolver = NullPermissionResolver()
+        permission_resolver: PermissionResolver = (
+            SqlPermissionResolver(uow_factory) if rls_enabled else NullPermissionResolver()
+        )
         authorization_stage = AuthorizationStage(permission_resolver)
         request_pipeline = RequestPipeline((authorization_stage, policy_stage, routing_stage))
 

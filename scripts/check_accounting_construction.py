@@ -23,6 +23,7 @@ from pathlib import Path
 TARGETS = frozenset(
     {
         "StaticPriceTable",
+        "SqlPriceTable",
         "InMemoryBudgetStore",
         "CostAccountant",
         "BudgetEnforcer",
@@ -32,15 +33,19 @@ TARGETS = frozenset(
     }
 )
 ALLOWED = ("gateway/config/container.py",)
-IMPLEMENTATIONS = (
-    "static_price_table.py",
-    "in_memory_budget_store.py",
-    "cost_accountant.py",
-    "budget_enforcer.py",
-    "sql_budget_ledger.py",
-    "in_memory_budget_ledger.py",
-    "reservation_service.py",
-)
+#: path suffix -> the ONE class that file is allowed to name. Per-class, never a bare filename
+#: list: Slice 19 added SqlPriceTable, and a per-file exemption would have let static_price_table.py
+#: construct it undetected - the defect Slices 15/18 fixed in the pipeline and resolver guards.
+IMPLEMENTATIONS = {
+    "pricing/static_price_table.py": "StaticPriceTable",
+    "pricing/sql_price_table.py": "SqlPriceTable",
+    "budget/in_memory_budget_store.py": "InMemoryBudgetStore",
+    "accounting/cost_accountant.py": "CostAccountant",
+    "accounting/budget_enforcer.py": "BudgetEnforcer",
+    "ledger/sql_budget_ledger.py": "SqlBudgetLedger",
+    "ledger/in_memory_budget_ledger.py": "InMemoryBudgetLedger",
+    "accounting/reservation_service.py": "ReservationService",
+}
 
 
 def _constructions(path: Path) -> set[str]:
@@ -66,9 +71,11 @@ def audit(src: Path) -> list[str]:
         rel = path.relative_to(src.parent).as_posix()
         if any(rel.endswith(allowed) for allowed in ALLOWED):
             continue
-        if rel.endswith(IMPLEMENTATIONS):
-            continue
         constructed = _constructions(path)
+        # Per-class exemption: a module may name ITS OWN class and no other.
+        for suffix, own_class in IMPLEMENTATIONS.items():
+            if rel.endswith(suffix):
+                constructed.discard(own_class)
         if constructed:
             offenders.append(f"{rel}: constructs {', '.join(sorted(constructed))}")
     return offenders

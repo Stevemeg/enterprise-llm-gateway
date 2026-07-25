@@ -43,6 +43,14 @@ remains **frozen**: nothing here amends it.
 | 15 | Served Inference Path | Capability | `v1.15.0-phase4-slices14-15` |
 | 16 | Production Observability | Capability | `v1.17.0-phase4-slices16-17` |
 | 17 | HTTP Inference Endpoint + Authentication Wiring | Capability | `v1.17.0-phase4-slices16-17` |
+| 18 | RBAC Durable Storage + Hash-Chained Audit Sink (ADR-0019) | Capability | *pending publication* |
+| 19 | Real Provider Adapter + Durable Catalog/Pricing | Capability | *pending publication* |
+
+Slices 18–19 are implemented, fully validated (Gate 1 + Gate 2, 767 passed / 0 skipped / 97%) and
+awaiting the publication step; the tag column is filled in at publish. Slice 18 introduced a single
+new architectural decision, **[ADR-0019](adr/0019-api-key-credential-bootstrap-lookup.md)** (the
+sanctioned `SECURITY DEFINER` credential-bootstrap lookup); Slice 19 changed no ADR (it added
+`organization_id` to the capability-owned `PricingPort` under Rule 5, recorded in the evidence log).
 
 ## Remaining sequence
 
@@ -52,8 +60,6 @@ instrumentation).
 
 | # | Milestone | Type | Depends on | Rationale |
 |---|---|---|---|---|
-| 18 | RBAC Durable Storage + Hash-Chained Audit Sink | Capability | 17 | `role`/`permission`/`role_permission` and `audit_event` tables exist and are unused; ADR-0009 mandates the audit sink. **Blocking:** the endpoint shipped in Slice 17 denies every request until permissions have storage, and API-key credentials cannot be verified without a request-scoped `ApiKeyRepository` |
-| 19 | Real Provider Adapter + Durable Catalog/Pricing | Capability | 17 | Realizes ADR-0003; `provider`/`model`/`price_table` unused, catalog and pricing are empty in-memory stubs |
 | 20 | Provider Health & Circuit Breaking | Capability | 16, 19 | `HealthAgent` is a stub; `provider_health` table unused. Needs metrics and a real provider to have health |
 | 21 *(conditional)* | Adaptive Routing | Capability | 16, 20 | **Only if** 16 + 20 produce evidence justifying it (ADR-0016 names it the legitimate consumer of `PlannerDecision`'s deferred fields) |
 
@@ -71,16 +77,27 @@ unimplemented), rate limiting, OPA. Each is a recorded deferral, not an omission
 - **ADR-0013 is still `Proposed`** although the schema change it covers shipped long ago.
 - **ADR-0005 (eventing) is Accepted but unimplemented**; Redis runs in `docker-compose.dev.yml` and
   nothing connects to it.
-- **ADR-0003 (provider abstraction) has never met a real SDK** — `InMemoryProviderClient` only.
+- **ADR-0003 (provider abstraction) has met a real SDK as of Slice 19** —
+  `OpenAiCompatibleProviderClient` (httpx) is wired when a provider connection is configured;
+  `InMemoryProviderClient` remains the default when none is.
 - **Four of five routing agents are stubs** (`PolicyAgent`, `CostAgent`, `HealthAgent`,
-  `ProviderAgent`); only `PlannerAgent` is real.
-- **31 of 45 schema tables are unused.**
-- **The default deployment denies every request** — correct fail-closed behaviour, but no storage
-  backs the permissions that would allow one until Slice 18.
+  `ProviderAgent`); only `PlannerAgent` is real. (Slice 19 gave the runtime real candidates to
+  choose between, but the *choosing* is still `PlannerAgent`; the other four remain stubs.)
+- **A routable provider configured without a price fails closed as a generic 500** — the served
+  path now reaches `UnknownPriceError` (Slice 8's invariant: a config defect is never a budget
+  outcome), and no spend is booked, but mapping it to a tailored fail-closed 5xx is deferred
+  because it would require either importing accounting into delivery (contract-forbidden) or
+  reversing the Slice-8 invariant. New in Slice 19; recorded rather than hidden.
+- **~26 of 45 schema tables remain unused** (Slice 18 activated `role`/`permission`/
+  `role_permission`/`membership`/`audit_event` + `audit_chain_head`; Slice 19 activated
+  `provider`/`model`/`price_table`).
 - **`PipelineStage.after_response` / `on_error` are still executed by nothing** — `RequestPipeline`
   runs only `before_request`. The oldest open piece of the Tier-1 stage protocol.
-- **Only JWT bearer credentials can be verified** (Slice 17). API keys fail closed until Slice 18
-  supplies the request-scoped repository `CompositeAuthenticator` needs.
+- **Resolved in Slice 18:** the default PostgreSQL deployment can now authorize a request (durable
+  RBAC), API keys are verifiable (`CompositeAuthenticator` + the ADR-0019 bootstrap), and
+  authentication decisions are written to a durable, hash-chained, per-tenant `audit_event` log.
+  A non-PostgreSQL deployment keeps the fail-closed `NullPermissionResolver` and JWT-only
+  authenticator.
 
 ## Working agreements
 

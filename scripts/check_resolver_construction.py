@@ -4,7 +4,18 @@
 
 Fourth occurrence of a construction constraint import-linter cannot express. For RBAC the stakes
 are higher than for the earlier seams: a component that constructs its own resolver chooses its
-own authorization source, which is indistinguishable from choosing its own answer.
+own authorization source, which is indistinguishable from choosing its own answer. Slice 18 raised
+them again - ``SqlPermissionResolver`` holds a database handle, so a component that built its own
+would also choose its own tenant scoping.
+
+## Slice 18: the exemption is per CLASS, not per FILE
+
+``IMPLEMENTATIONS`` used to be a tuple of filenames, which exempted each of those files from
+*every* target rather than from its own class - so ``null_resolver.py`` could have constructed an
+``InMemoryPermissionResolver`` and this guard would have said nothing. That is the identical defect
+Slice 15 found and fixed in ``check_pipeline_construction.py``; adding a third resolver here is
+what made it worth fixing rather than merely noting. A file is now exempt only for the class it
+defines.
 
 Usage: python scripts/check_resolver_construction.py [src_dir]
 Exit 0 = construction confined to the composition root; exit 1 = any other site.
@@ -16,9 +27,16 @@ import ast
 import sys
 from pathlib import Path
 
-TARGETS = frozenset({"InMemoryPermissionResolver", "NullPermissionResolver"})
+TARGETS = frozenset(
+    {"InMemoryPermissionResolver", "NullPermissionResolver", "SqlPermissionResolver"}
+)
 ALLOWED = ("gateway/config/container.py",)
-IMPLEMENTATIONS = ("in_memory_resolver.py", "null_resolver.py")
+#: path suffix -> the ONE class that file is allowed to name. Never a bare filename list.
+IMPLEMENTATIONS = {
+    "authorization/in_memory_resolver.py": "InMemoryPermissionResolver",
+    "authorization/null_resolver.py": "NullPermissionResolver",
+    "authorization/sql_resolver.py": "SqlPermissionResolver",
+}
 
 
 def _constructions(path: Path) -> set[str]:
@@ -44,9 +62,11 @@ def audit(src: Path) -> list[str]:
         rel = path.relative_to(src.parent).as_posix()
         if any(rel.endswith(allowed) for allowed in ALLOWED):
             continue
-        if rel.endswith(IMPLEMENTATIONS):
-            continue
         constructed = _constructions(path)
+        # Per-class exemption: a resolver module may name ITS OWN class and no other.
+        for suffix, own_class in IMPLEMENTATIONS.items():
+            if rel.endswith(suffix):
+                constructed.discard(own_class)
         if constructed:
             offenders.append(f"{rel}: constructs {', '.join(sorted(constructed))}")
     return offenders

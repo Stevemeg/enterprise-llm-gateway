@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from gateway.shared.auth_constants import API_KEY_PREFIX_LENGTH
+from gateway.shared.auth_constants import API_KEY_PREFIX, API_KEY_PREFIX_LENGTH
 from gateway.shared.secrets import generate_token, hash_secret, verify_secret
 
 
@@ -24,7 +24,7 @@ class GeneratedApiKey:
 
 def generate_api_key(environment: str = "live") -> GeneratedApiKey:
     """Generate a new virtual API key with >=256 bits of entropy."""
-    secret = f"elg_{environment}_{generate_token(32)}"
+    secret = f"{API_KEY_PREFIX}{environment}_{generate_token(32)}"
     return GeneratedApiKey(
         secret=secret, prefix=extract_prefix(secret), key_hash=hash_secret(secret)
     )

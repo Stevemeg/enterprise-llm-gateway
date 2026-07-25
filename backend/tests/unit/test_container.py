@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+import pytest
+
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.pipeline.authorization_stage import AuthorizationStage
 from gateway.adapters.pipeline.policy_stage import PolicyStage
+from gateway.adapters.providers.openai_compatible_client import OpenAiCompatibleProviderClient
 from gateway.application.accounting.budget_enforcer import BudgetEnforcer
 from gateway.application.accounting.cost_accountant import CostAccountant
 from gateway.application.accounting.reservation_service import ReservationService
@@ -24,12 +27,18 @@ from gateway.application.ports.pipeline import PipelineStage, StageContext
 from gateway.application.ports.policy import PolicyEnginePort
 from gateway.application.ports.pricing import PricingPort
 from gateway.application.ports.providers import InferenceRequest, ProviderClient
+from gateway.application.ports.secrets import SecretNotFoundError
 from gateway.application.providers.provider_executor import ProviderExecutor
 from gateway.application.reflection.reflective_executor import ReflectiveExecutor
 from gateway.application.reflection.retry_policy import RetryPolicy
 from gateway.application.serving.inference_service import InferenceService
 from gateway.config.container import Container
-from gateway.config.settings import Settings
+from gateway.config.settings import (
+    AuthSettings,
+    DatabaseSettings,
+    ProviderConnectionSettings,
+    Settings,
+)
 from gateway.delivery.http.ops.health import HealthRegistry
 from gateway.shared.clock import Clock, Sleeper
 
@@ -45,6 +54,54 @@ def test_container_wires_provider_execution(test_settings: Settings) -> None:
     container = Container.create(test_settings)
     assert isinstance(container.provider_client, ProviderClient)
     assert isinstance(container.provider_executor, ProviderExecutor)
+
+
+class _StubSecrets:
+    """Resolves exactly the references it was handed; everything else is absent (ADR-0011)."""
+
+    def __init__(self, known: dict[str, str]) -> None:
+        self._known = known
+
+    def resolve(self, reference: str) -> str:
+        value = self._known.get(reference)
+        if value is None:
+            raise SecretNotFoundError(reference)
+        return value
+
+    def try_resolve(self, reference: str) -> str | None:
+        return self._known.get(reference)
+
+
+def _settings_with_provider(**connection: object) -> Settings:
+    return Settings(
+        database=DatabaseSettings(url="sqlite+aiosqlite:///:memory:"),
+        auth=AuthSettings(allow_insecure_generated_keys=True),
+        providers={"openai": ProviderConnectionSettings(**connection)},
+    )
+
+
+def test_a_configured_provider_selects_the_real_http_client() -> None:
+    """With a resolvable connection the composition root wires the OpenAI-compatible adapter, not
+    the in-memory stub - Slice 19 realizing ADR-0003."""
+    settings = _settings_with_provider(base_url="https://api.example.test", api_key_ref="k")
+    container = Container.create(settings, secrets_resolver=_StubSecrets({"k": "sk-secret"}))
+    assert isinstance(container.provider_client, OpenAiCompatibleProviderClient)
+
+
+def test_a_provider_without_a_base_url_fails_fast() -> None:
+    """A half-configured provider must stop start-up, not wire a client that cannot reach anyone
+    (ADR-0009 row 16)."""
+    settings = _settings_with_provider(base_url="", api_key_ref="k")
+    with pytest.raises(SecretNotFoundError):
+        Container.create(settings, secrets_resolver=_StubSecrets({"k": "sk-secret"}))
+
+
+def test_a_provider_whose_credential_cannot_be_resolved_fails_fast() -> None:
+    """An unresolved credential must fail start-up rather than wire a client that 401s on every
+    call (ADR-0011 / ADR-0009 row 16)."""
+    settings = _settings_with_provider(base_url="https://api.example.test", api_key_ref="absent")
+    with pytest.raises(SecretNotFoundError):
+        Container.create(settings, secrets_resolver=_StubSecrets({}))
 
 
 def test_container_wires_accounting(test_settings: Settings) -> None:

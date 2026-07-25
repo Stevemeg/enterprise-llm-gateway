@@ -9,8 +9,7 @@ from __future__ import annotations
 from gateway.application.auth.authenticate_api_key import AuthenticateApiKey
 from gateway.application.ports.auth import AccessTokenVerifier
 from gateway.domain.auth.models import Principal
-
-_API_KEY_PREFIX = "elg_"
+from gateway.shared.auth_constants import API_KEY_PREFIX
 
 
 class CompositeAuthenticator:
@@ -21,6 +20,6 @@ class CompositeAuthenticator:
         self._tokens = token_verifier
 
     async def authenticate(self, credential: str) -> Principal:
-        if credential.startswith(_API_KEY_PREFIX):
+        if credential.startswith(API_KEY_PREFIX):
             return await self._api_key(credential)
         return self._tokens.verify(credential)

@@ -271,6 +271,13 @@ forbidden_modules = ["gateway.adapters.authorization"]
 [[tool.importlinter.contracts]]
 # Guard H - resolvers answer "what may this principal do" and nothing else. A resolver importing
 # the registry, MCP or the pipeline would be making enforcement decisions it cannot explain.
+# Slice 18 extends it: the resolver now holds a database handle, so the ways it could overreach
+# stopped being hypothetical. Each added target is one claim:
+#   - adapters.audit          -> a resolver does not author audit records. The enforcing stage and
+#     the middleware produce the audit trail; a resolver that wrote its own would create a second,
+#     unreconcilable account of the same decision.
+#   - application.accounting / ports.ledger -> resolving a permission cannot move money
+#   - application.execution   -> resolving a permission cannot execute an inference
 name = "PermissionResolvers depend on nothing but their port"
 type = "forbidden"
 source_modules = ["gateway.adapters.authorization"]
@@ -278,7 +285,41 @@ forbidden_modules = [
     "gateway.adapters.tools",
     "gateway.adapters.mcp",
     "gateway.adapters.pipeline",
+    "gateway.adapters.audit",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.execution",
     "gateway.delivery",
+]
+
+[[tool.importlinter.contracts]]
+# Slice 18 Guard 1 - an audit sink RECORDS what happened and decides nothing. It is handed a
+# finished AuthAuditEvent; it must never be able to influence the decision it is recording, or to
+# become a second source of one. One forbidden target per claim:
+#   - application.authorization / adapters.authorization -> the sink cannot resolve permissions or
+#     re-decide authorization. Recording a decision and making one are different jobs, and a sink
+#     that could do both would make the audit trail a participant in what it attests to.
+#   - application.routing / agents -> the sink cannot route or reach AgentRuntime
+#   - application.providers / execution -> the sink cannot invoke a provider or run the
+#     cache/reserve/execute/settle sequence
+#   - application.accounting / ports.ledger -> the sink cannot author cost or move budget
+#   - application.pipeline / serving -> the sink cannot run admission or serve a request
+# Not listed: gateway.delivery, already covered by "adapters must not import delivery or the
+# composition root" - repeating it here would be redundant enforcement.
+name = "audit sinks record and reach no capability"
+type = "forbidden"
+source_modules = ["gateway.adapters.audit"]
+forbidden_modules = [
+    "gateway.application.authorization",
+    "gateway.adapters.authorization",
+    "gateway.application.routing",
+    "gateway.application.agents",
+    "gateway.application.providers",
+    "gateway.application.execution",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.pipeline",
+    "gateway.application.serving",
 ]
 
 [[tool.importlinter.contracts]]
@@ -290,15 +331,71 @@ source_modules = ["gateway.application.routing"]
 forbidden_modules = ["gateway.adapters", "gateway.delivery", "gateway.config"]
 
 [[tool.importlinter.contracts]]
-# Guard 2 - ProviderClient implementations are mutually independent (ADR-0016 Slice 7). One
-# importing the other would make the pair a single implementation wearing two names, and the
-# Rule-4 proof (a second backend validates the port with no protocol change) would be comparing
-# a backend against itself.
+# Guard 2 - ProviderClient implementations are mutually independent (Slice 7, +real adapter S19).
+# One importing another would make them a single implementation wearing several names, and the
+# Rule-4 proof (a second backend validates the port with no protocol change) would be comparing a
+# backend against itself. Slice 19 adds the first real adapter to the set: the OpenAI-compatible
+# HTTP client must not lean on either fake, and neither fake may reach into it.
 name = "provider client implementations are mutually independent"
 type = "independence"
 modules = [
     "gateway.adapters.providers.in_memory_client",
     "gateway.adapters.providers.fake_client",
+    "gateway.adapters.providers.openai_compatible_client",
+]
+
+[[tool.importlinter.contracts]]
+# Slice 19 Guard 1 - a ProviderClient EXECUTES the provider it is given and nothing more. The real
+# adapter holds an SDK, endpoints and credentials, so the ways it could overreach stopped being
+# hypothetical. One forbidden target per claim:
+#   - application.routing.engine / agents -> the adapter cannot route or re-select a provider;
+#     selection is upstream and arrives in the ProviderDescriptor (ADR-0003). routing.catalog is
+#     NOT forbidden: ProviderDescriptor, the type the adapter is handed, lives there - being given
+#     a descriptor is the opposite of choosing one.
+#   - application.accounting / ports.ledger -> the adapter cannot author cost or move budget; usage
+#     leaves it as a ProviderUsage for CostAccountant, never as a parallel accounting path
+#   - application.execution / reflection -> the adapter cannot run the coordinator sequence or
+#     retry; reflection owns retry (Slice 11), and an adapter that also retried would multiply the
+#     two attempt bounds together
+name = "provider client adapters execute and own no other capability"
+type = "forbidden"
+source_modules = ["gateway.adapters.providers"]
+forbidden_modules = [
+    "gateway.application.routing.engine",
+    "gateway.application.agents",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.execution",
+    "gateway.application.reflection",
+]
+
+[[tool.importlinter.contracts]]
+# Slice 19 Guard 2 - PricingPort implementations are mutually independent. Same reasoning as the
+# ProviderClient (Slice 7), BudgetLedgerPort (Slice 9) and ResponseCachePort (Slice 10)
+# independence contracts: the durable SqlPriceTable and the in-memory StaticPriceTable each
+# validate the port on their own, and one importing the other would collapse that into a backend
+# compared against itself.
+name = "pricing implementations are mutually independent"
+type = "independence"
+modules = [
+    "gateway.adapters.pricing.static_price_table",
+    "gateway.adapters.pricing.sql_price_table",
+]
+
+[[tool.importlinter.contracts]]
+# Slice 19 Guard 3 - the provider catalog SUPPLIES candidates and selects nothing. The durable
+# SqlProviderCatalog reads provider/model rows; it must not reach the routing engine, the agents,
+# or a provider client, any of which would turn "which providers exist" into "which provider wins".
+# (It legitimately imports application.routing.catalog for the ProviderCatalog protocol and
+# ProviderDescriptor - that is the port it implements, not the engine.)
+name = "the durable provider catalog supplies candidates and does not route"
+type = "forbidden"
+source_modules = ["gateway.adapters.catalog"]
+forbidden_modules = [
+    "gateway.application.routing.engine",
+    "gateway.application.agents",
+    "gateway.application.providers",
+    "gateway.adapters.providers",
 ]
 
 [[tool.importlinter.contracts]]

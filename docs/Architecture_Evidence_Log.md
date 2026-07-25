@@ -2247,3 +2247,152 @@ broken**; `api/inference.py` at 100% line coverage.
 - **The realistic mutation matters more than the convenient one.** Deleting the auth check produced
   a crash, not a bypass; only the fallback-identity version modelled the bug the guard exists to
   catch, and it was the version that proved the guard.
+
+## Evidence Record - Phase 4 Slice 18: RBAC Durable Storage + Hash-Chained Audit Sink
+
+**Milestone type: Capability.** It puts storage behind two existing seams and creates no extension
+point. One new architectural decision was required - **ADR-0019** - but not for a port.
+
+### Rule 5 determination
+
+| Protocol | Result |
+|---|---|
+| Tier-1 (`RoutingDecision`, `PipelineStage`, MCP/Tool ports, BaseAgent) | **NOT TRIGGERED** - zero diff on `domain/`, `ports/pipeline.py`, `ports/tools.py`, `ports/mcp.py`, `ports/agents.py`, `agents/`, ADR-0016 (sha256 `2735cdfa...f777c3`, byte-identical) |
+| `PermissionResolver` (Slice 5, capability-owned) | **NOT TRIGGERED** - `SqlPermissionResolver` satisfies `resolve(principal_id, organization_id) -> frozenset[str]` unchanged. Pressure to return role names "for audit" declined: nothing consumes roles |
+| `AuthAuditSink` (capability-owned) | **NOT TRIGGERED**, under genuine pressure - `audit_event.organization_id` is NOT NULL but `AuthAuditEvent.organization_id` is None for every rejection; `result`/`actor_type` are narrow enums. The sink maps and declines to persist a tenant-less event rather than widening the schema |
+| `ApiKeyRepository` | **NOT TRIGGERED** - `SqlApiKeyRepository` already implemented it; what was missing was wiring |
+
+### ADR-0019: the one genuinely new decision
+
+Resolving a virtual API key to its tenant must happen *before* a tenant is known, but `api_key` is
+RLS-scoped and `app_rw` is `NOBYPASSRLS` (ADR-0014, non-negotiable). Verified against real
+PostgreSQL that a naively-wired repository returns zero rows for every key. The sanctioned path is a
+single `SECURITY DEFINER` function exposing exactly one fact - which organization owns an exact
+active prefix - paired with an owner-only `FOR SELECT` policy. This is a new architectural boundary
+(the first sanctioned RLS exception), so it is an ADR, not a migration comment.
+
+### Findings that only appeared under real PostgreSQL
+
+- **Partitions did not inherit RLS or the append-only REVOKE.** As `app_rw` with tenant B bound, a
+  tenant-A `audit_event` row was readable *and updatable* via `audit_event_2026_07`, while the same
+  statements against the parent were correctly refused. Migration 0007 extends ENABLE+FORCE+policy
+  and the UPDATE/DELETE revoke to every partition of `audit_event` and `usage_ledger`, over
+  `pg_inherits` so future partitions are covered. `check_migration_guardrails.py` was blind to
+  partitions (its regex requires a column body) - now it audits them.
+- **The RBAC catalog was never seeded.** No migration inserted `permission`/`role`/
+  `role_permission` rows, so a durable resolver would have resolved every principal to nothing.
+  0007 seeds ADR-0008's matrix verbatim; `inference:invoke` is granted to no human role (ADR-0008:
+  "via keys - application principals only"), which is why API-key verification had to ship too.
+- **`audit_event` had partitions only to 2026-09-01.** The first writer would have failed on
+  2026-09-01; 0007 adds a DEFAULT partition.
+- **`CompositeAuthAuditSink` fan-out had never fanned out** - it had only ever held one sink, so its
+  error-isolation path was at 67% coverage. Slice 18's durable sink is the second, and the
+  isolation path is now proven and at 100%.
+
+### Guard evaluation
+
+| Guard | Classification |
+|---|---|
+| `check_resolver_construction.py` | **REUSED-EXTENDED** (adds `SqlPermissionResolver`), and its per-file exemption was corrected to per-class - the Slice-15 defect. Re-proved it still catches both prior targets |
+| `check_migration_guardrails.py` | **REUSED-EXTENDED, and non-vacuous for partitions for the first time** - it never saw a partition before |
+| "PermissionResolvers depend on nothing but their port" (Guard H) | **REUSED-EXTENDED** - added audit/accounting/ledger/execution targets now that the resolver holds a DB handle |
+| "audit sinks record and reach no capability" | **NEW** - one forbidden target per ownership claim |
+| RoutingDecision / Guard L | **REUSED** - proven against the two new adapter files |
+
+**30/30 deliberate-failure proofs PROVEN** (violate -> observe fail -> restore exact bytes ->
+observe pass), including re-proving each extended guard's original subjects and the per-class fix.
+
+### Security behaviour (proven against real PostgreSQL, as `app_rw`)
+
+RBAC resolves the ADR-0008 matrix and key scopes; an unknown principal, wrong tenant, inactive
+membership, another tenant's custom role, and a revoked key all resolve to the empty set (deny). The
+audit chain is recomputable from stored rows; each tenant has an independent chain; the runtime role
+cannot UPDATE/DELETE any audit row or partition; a tenant cannot read or rewrite another's audit
+rows through a partition; the ADR-0019 function discloses only the organization and cannot be used
+to read `api_key` directly. Every storage failure fails closed (resolver -> empty set; repository ->
+None -> 401; catalog/pricing -> raise -> fail closed). A tenant-less rejection is not persisted (no
+tenant-scoped log exists) but is retained by the logging sink.
+
+### Decision
+
+**No action against ADR-0016** (frozen, byte-unchanged). **ADR-0019 created.** Migration
+`0007_rbac_seed_audit_chain`.
+
+## Evidence Record - Phase 4 Slice 19: Real Provider Adapter + Durable Catalog/Pricing
+
+**Milestone type: Capability.** It puts storage and a real SDK behind existing seams. **No ADR.**
+
+### Rule 5 determination
+
+| Protocol | Result |
+|---|---|
+| Tier-1 | **NOT TRIGGERED** - zero diff on `domain/`, the Tier-1 ports, `agents/`, ADR-0016 |
+| `ProviderClient` / `ProviderDescriptor` | **NOT TRIGGERED**, under real pressure - a real HTTP client needs a base URL, credential and timeout, and the descriptor carries "identity only". The adapter owns its own `ProviderConnection` keyed by provider name; no endpoint or credential enters `RoutingExecution` |
+| `ProviderCatalog` | **NOT TRIGGERED** - already tenant-scoped |
+| `PricingPort` | **TRIGGERED** - `organization_id` added to `price_for`. Capability-owned, so a Rule 5 event recorded here, not an ADR |
+
+### The Rule 5 event on `PricingPort`
+
+`price_table` is tenant-scoped (`organization_id NOT NULL`, RLS), so a durable pricing adapter
+cannot read a row without a tenant. Slice 8 recorded the exact condition for adding the parameter:
+"nothing in this slice consumes tenant-scoped pricing, so `price_for` stays global (Rule 5: no
+active consumer needs the tenant dimension yet)." Slice 19 is that consumer. Active consumers:
+`CostAccountant.account` and `ReservationService.reserve`, both of which already hold
+`organization_id` at the call site, so the change propagates no new data through any layer.
+`StaticPriceTable` keeps its deployment-wide behaviour by ignoring the argument (documented).
+
+### What the real adapter does not do, and why it is proven
+
+`OpenAiCompatibleProviderClient` (ADR-0003's named generic adapter, FR-024) does not retry
+(reflection owns retry - `httpx` `retries=0`), does not select a provider (the descriptor arrives
+chosen), does not raise for a provider-level failure (every transport error, timeout and HTTP status
+becomes a classified `ProviderResponse`), and never echoes provider text or credentials. All proven
+by contract tests against a scripted `httpx.MockTransport` - real library, no network, no credits.
+Timeouts are explicit per provider; credentials are resolved from the secrets manager at
+composition time and fail startup if unresolvable (ADR-0011 / ADR-0009 row 16).
+
+### Durable catalog and pricing (proven against real PostgreSQL)
+
+The catalog reads enabled provider/model rows per tenant, honours FR-028 runtime enable/disable by
+reading through on every call, offers one descriptor per provider (the runtime's vocabulary is
+provider names), isolates tenants via RLS, and raises rather than reporting "no providers" on an
+outage. Pricing selects the row *in force by time* (not the newest), so a future price does not
+apply early and a settled cost is reproducible (FR-074/075); it isolates tenants and raises rather
+than looking unpriced on an outage.
+
+### The headline, proven end to end through the real container
+
+The exact request that returned **503 no_eligible_provider** in Slice 18 (empty catalog) now
+returns **200** with spend booked exactly once against the effective-dated `price_table` - routing
+has a provider to choose, pricing can cost the call, and the existing reserve/execute/settle path
+runs unchanged. The in-memory client still executes in this test (wiring a live provider would spend
+credits); the real adapter's behaviour is covered by the contract tests.
+
+### Known debt introduced
+
+A routable provider configured without a price reaches `UnknownPriceError` in the served path and
+fails closed as a generic 500 (no provider detail reaches the client; no spend is booked). Mapping
+it to a tailored fail-closed 5xx is deferred rather than done, because it would require importing
+accounting into delivery (contract-forbidden) or reversing Slice 8's "config defect is never a
+budget outcome" invariant. Recorded, not hidden.
+
+### Guard evaluation
+
+| Guard | Classification |
+|---|---|
+| `check_provider_construction.py` | **REUSED-EXTENDED** (adds the real client + both catalogs), per-file -> per-class exemption fixed; prior targets re-proved |
+| `check_accounting_construction.py` | **REUSED-EXTENDED** (adds `SqlPriceTable`), per-file -> per-class fixed |
+| "provider client adapters execute and own no other capability" | **NEW** |
+| "the durable provider catalog supplies candidates and does not route" | **NEW** |
+| "provider client implementations are mutually independent" (3) / "pricing implementations are mutually independent" (2) | **REUSED-EXTENDED / NEW** |
+| "ports declare contracts only (no transport)" | **REUSED, now load-bearing** - it forbids `httpx` in ports, and a real httpx client now exists to be kept out |
+
+**26/26 deliberate-failure proofs PROVEN**, including re-proving each extended guard's original
+subjects, both per-class fixes, and behavioural proofs (reverting the container to the in-memory
+catalog or static pricing, and removing the effective-dating lower bound, each break a test).
+
+### Decision
+
+**No action against ADR-0016** (frozen, byte-unchanged). **No new ADR.** No schema change
+(`provider`/`model`/`price_table` already existed and are RLS-protected). Alembic head unchanged
+at `0007_rbac_seed_audit_chain`.

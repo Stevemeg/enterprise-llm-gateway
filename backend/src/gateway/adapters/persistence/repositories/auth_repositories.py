@@ -12,10 +12,12 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import CursorResult, delete, insert, select, update
+from sqlalchemy import CursorResult, delete, insert, select, text, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gateway.adapters.persistence import tables as t
+from gateway.adapters.persistence.uow import UnitOfWorkFactory
 from gateway.domain.auth.models import (
     ApiKeyRecord,
     ApiKeyStatus,
@@ -25,7 +27,14 @@ from gateway.domain.auth.models import (
     ServiceAccountCredentialRecord,
     SessionRecord,
 )
+from gateway.observability.logging import get_logger
 from gateway.shared.clock import Clock
+
+_logger = get_logger("auth")
+
+#: ADR-0019 credential bootstrap. Maps an EXACT non-secret prefix to its owning organization and
+#: nothing else; created by migration 0007 and executable only by the runtime role.
+_RESOLVE_TENANT_SQL = text("SELECT gateway_api_key_tenant(:prefix)")
 
 
 def _to_bytes(hex_hash: str) -> bytes:
@@ -65,6 +74,51 @@ class SqlApiKeyRepository:
             is_active=row["status"] == ApiKeyStatus.ACTIVE,
             expires_at=row["expires_at"],
         )
+
+
+class TenantScopedApiKeyRepository:
+    """``ApiKeyRepository`` that resolves the tenant before reading the key (ADR-0019).
+
+    ``SqlApiKeyRepository`` above needs a session that is already bound to a tenant, because
+    ``api_key`` is RLS-scoped. Authentication has no tenant yet - that is the whole point of the
+    lookup - so binding nothing would make RLS return zero rows and every API key would fail while
+    the wiring looked complete. Hence two phases:
+
+    1. **Resolve the tenant** with no tenant context, through the one sanctioned bootstrap
+       function. It returns an organization id for an exact, active prefix and nothing else - no
+       hash, no scopes, no enumeration.
+    2. **Read the record** inside that tenant's RLS context, via the ordinary repository. The
+       secret is verified afterwards, by the caller, in constant time.
+
+    An unknown prefix ends at phase 1 with ``None``, so a caller learns nothing from the timing
+    difference beyond "no active key has this prefix" - which is what presenting the prefix
+    already told them.
+
+    Process-lifetime, not request-scoped: each call is its own complete unit of work, exactly like
+    ``SqlBudgetLedger`` and ``SqlResponseCache``.
+    """
+
+    def __init__(self, uow_factory: UnitOfWorkFactory) -> None:
+        self._uow_factory = uow_factory
+
+    async def get_by_prefix(self, prefix: str) -> ApiKeyRecord | None:
+        try:
+            async with self._uow_factory(tenant_id=None) as uow:
+                organization_id: UUID | None = (
+                    await uow.session.execute(_RESOLVE_TENANT_SQL, {"prefix": prefix})
+                ).scalar_one_or_none()
+            if organization_id is None:
+                return None
+            async with self._uow_factory(tenant_id=organization_id) as uow:
+                return await SqlApiKeyRepository(uow.session).get_by_prefix(prefix)
+        except (SQLAlchemyError, OSError) as exc:
+            # Fail closed: an unreadable credential store must refuse, never admit (ADR-0009
+            # rows 6 and 15). The caller turns ``None`` into a 401 rather than a 500, so an
+            # outage cannot be distinguished from a bad key by an unauthenticated caller -
+            # deliberate, and logged here so it is not invisible to operators. Only the
+            # exception TYPE is logged; SQLAlchemy messages can quote bound parameters.
+            _logger.error("api_key_lookup_failed", error=type(exc).__name__)
+            return None
 
 
 class SqlServiceAccountCredentialRepository:

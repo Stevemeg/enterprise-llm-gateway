@@ -111,6 +111,33 @@ class AuthSettings(BaseModel):
     oidc: OidcSettings = OidcSettings()
 
 
+class ProviderConnectionSettings(BaseModel):
+    """How to reach one provider (ADR-0003/0011, Slice 19).
+
+    Deployment configuration, keyed in ``Settings.providers`` by the provider's catalog name, e.g.
+    ``GATEWAY_PROVIDERS__OPENAI__BASE_URL``. It is deliberately separate from the tenant-scoped
+    ``provider`` table the catalog reads: the catalog decides *which* providers an organization may
+    route to, this decides *how the deployment reaches* one, and only the ``ProviderClient`` adapter
+    ever sees both. Putting an endpoint or a credential on ``ProviderDescriptor`` would push them
+    through ``RoutingExecution`` and into the routing record.
+
+    ``api_key_ref`` is a **reference**, never an inline value (ADR-0011): it names an entry in the
+    secrets manager, resolved once at startup. A missing reference fails startup rather than
+    producing a client that 401s against every provider (ADR-0009 row 16).
+
+    Per-tenant endpoints and BYO credentials are a real future capability with no consumer today
+    and no per-tenant secret storage to resolve them against, so they are deferred, not modelled.
+    """
+
+    model_config = {"frozen": True}
+
+    base_url: str = ""
+    api_key_ref: str = ""
+    # Explicit, never httpx's own default: a hung provider must fail as a retryable TIMEOUT rather
+    # than occupy the request path indefinitely.
+    timeout_seconds: float = Field(default=30.0, gt=0)
+
+
 class Settings(BaseSettings):
     """Immutable, validated process configuration."""
 
@@ -131,6 +158,9 @@ class Settings(BaseSettings):
     log_json: bool = True
     database: DatabaseSettings = DatabaseSettings()
     auth: AuthSettings = AuthSettings()
+    # Empty by default: a deployment with no provider connections keeps the in-memory client, the
+    # same "nothing configured yet" posture as the empty catalog and price list.
+    providers: dict[str, ProviderConnectionSettings] = {}
 
     @model_validator(mode="after")
     def _enforce_production_invariants(self) -> Settings:

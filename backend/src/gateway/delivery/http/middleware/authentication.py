@@ -33,13 +33,10 @@ from gateway.domain.auth.models import (
 )
 from gateway.observability.logging import bind_request_context
 from gateway.observability.metrics import auth_duration_seconds
+from gateway.shared.auth_constants import API_KEY_PREFIX
 
 _HEADER = "Authorization"
 _SCHEME = "Bearer "
-
-# Credential shape -> method label. Keys issued by the gateway carry a stable prefix; anything
-# else presented as a bearer token is a JWT. Both are closed, low-cardinality label values.
-_API_KEY_PREFIX = "gw_"
 
 _DECISION_TO_ERROR_CODE = {
     AuthenticationDecision.INVALID_TOKEN: "invalid_credential",
@@ -49,9 +46,11 @@ _DECISION_TO_ERROR_CODE = {
 
 
 def _method_for(credential: str) -> AuthenticationMethod:
+    """Credential shape -> method label, for the case where authentication FAILS and there is no
+    principal to ask. Both outcomes are closed, low-cardinality label values."""
     return (
         AuthenticationMethod.API_KEY
-        if credential.startswith(_API_KEY_PREFIX)
+        if credential.startswith(API_KEY_PREFIX)
         else AuthenticationMethod.JWT
     )
 
