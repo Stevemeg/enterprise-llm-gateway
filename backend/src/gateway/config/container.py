@@ -20,6 +20,7 @@ from gateway.adapters.budget.in_memory_budget_store import InMemoryBudgetStore
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
 from gateway.adapters.cache.sql_response_cache import SqlResponseCache
 from gateway.adapters.catalog.sql_provider_catalog import SqlProviderCatalog
+from gateway.adapters.health.in_memory_circuit_breaker import InMemoryCircuitBreaker
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.ledger.sql_budget_ledger import SqlBudgetLedger
 from gateway.adapters.persistence.engine import create_database_engine, create_session_factory
@@ -67,18 +68,21 @@ from gateway.application.ports.auth import AuthAuditSink, Authenticator
 from gateway.application.ports.authorization import PermissionResolver
 from gateway.application.ports.budget import BudgetPort
 from gateway.application.ports.cache import ResponseCachePort
+from gateway.application.ports.circuit_breaker import CircuitBreaker
 from gateway.application.ports.evaluation import Evaluator
 from gateway.application.ports.ledger import BudgetLedgerPort
 from gateway.application.ports.policy import PolicyEnginePort
 from gateway.application.ports.pricing import PricingPort
 from gateway.application.ports.providers import ProviderClient
 from gateway.application.ports.routing import RoutingEngine
+from gateway.application.ports.routing_strategy import RoutingStrategy
 from gateway.application.ports.secrets import SecretNotFoundError, SecretsResolver
 from gateway.application.providers.provider_executor import ProviderExecutor
 from gateway.application.reflection.reflective_executor import ReflectiveExecutor
 from gateway.application.reflection.retry_policy import RetryPolicy
 from gateway.application.routing.catalog import InMemoryProviderCatalog, ProviderCatalog
 from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
+from gateway.application.routing.health_tiered_strategy import HealthTieredRoutingStrategy
 from gateway.application.serving.inference_service import InferenceService
 from gateway.config.settings import AuthSettings, Settings
 from gateway.delivery.http.ops.health import HealthRegistry
@@ -196,6 +200,7 @@ class Container:
     authenticator: Authenticator
     audit_sink: AuthAuditSink
     state_signer: StateSigner
+    circuit_breaker: CircuitBreaker
     routing_engine: RoutingEngine
     routing_stage: AgentRoutingStage
     provider_client: ProviderClient
@@ -291,8 +296,27 @@ class Container:
         provider_catalog: ProviderCatalog = (
             SqlProviderCatalog(uow_factory) if rls_enabled else InMemoryProviderCatalog()
         )
+        # Slice 20: one circuit breaker, shared by the HealthAgent that READS it at routing time
+        # and the InferenceCoordinator that WRITES call outcomes to it at settlement time. A single
+        # instance is the whole point - a component that built its own would split the feedback
+        # loop (a construction guard enforces that only this line may build one). In-process and
+        # per-(org, provider); durable cross-replica snapshots await ADR-0005 (see the port).
+        circuit_breaker: CircuitBreaker = InMemoryCircuitBreaker(clock)
+        # Slice 21: adaptive routing. The strategy ranks the usable candidates the HealthAgent
+        # reports (healthy over degraded), so a recovering provider is preferred last rather than
+        # picked first. Stateless and pure, so it needs no construction guard - swapping it for a
+        # future strategy (ADR-0012's lowest_cost / lowest_latency, or the deferred bandit) is one
+        # line here and nothing else, which is the whole point of the RoutingStrategy port.
+        routing_strategy: RoutingStrategy = HealthTieredRoutingStrategy()
         agent_runtime = AgentRuntime(
-            [PlannerAgent(), PolicyAgent(), CostAgent(), HealthAgent(), ProviderAgent()], clock
+            [
+                PlannerAgent(),
+                PolicyAgent(),
+                CostAgent(),
+                HealthAgent(breaker=circuit_breaker),
+                ProviderAgent(strategy=routing_strategy),
+            ],
+            clock,
         )
         routing_engine: RoutingEngine = AgentOrchestratedRoutingEngine(
             provider_catalog, agent_runtime
@@ -347,7 +371,7 @@ class Container:
         )
         deduplicator = RequestDeduplicator()
         inference_coordinator = InferenceCoordinator(
-            cache_port, deduplicator, reservation_service, provider_executor
+            cache_port, deduplicator, reservation_service, provider_executor, circuit_breaker
         )
 
         # --- reflection / bounded retry object graph (ADR-0016 Slice 11) -----------------
@@ -443,6 +467,7 @@ class Container:
             authenticator=authenticator,
             audit_sink=audit_sink,
             state_signer=state_signer,
+            circuit_breaker=circuit_breaker,
             routing_engine=routing_engine,
             routing_stage=routing_stage,
             provider_client=provider_client,

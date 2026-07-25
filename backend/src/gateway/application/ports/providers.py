@@ -116,6 +116,23 @@ class ProviderErrorCategory(StrEnum):
     AUTHENTICATION = "authentication"
 
 
+#: The failure categories that indicate the **provider itself** was transiently unable to serve -
+#: as opposed to the request being malformed (``INVALID_REQUEST``) or misauthenticated
+#: (``AUTHENTICATION``), which would recur against any provider and say nothing about this one's
+#: health. Two consumers must agree on this exact set or they drift silently (Rule 3): reflection
+#: decides whether to *retry* a failed attempt, and circuit breaking (Slice 20) decides whether a
+#: failure counts *against a provider's health*. Both questions have the same answer - "was this
+#: the provider's transient fault" - so the set lives here, beside the enum, and is imported by
+#: both rather than spelled out twice.
+TRANSIENT_PROVIDER_ERROR_CATEGORIES: frozenset[ProviderErrorCategory] = frozenset(
+    {
+        ProviderErrorCategory.TIMEOUT,
+        ProviderErrorCategory.RATE_LIMITED,
+        ProviderErrorCategory.SERVER_ERROR,
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderResponse:
     """Outcome of a provider call. Failure is data, not an exception (mirrors ``McpResult``).

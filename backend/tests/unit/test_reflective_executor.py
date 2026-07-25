@@ -16,6 +16,7 @@ from uuid import uuid4
 import pytest
 
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
+from gateway.adapters.health.in_memory_circuit_breaker import InMemoryCircuitBreaker
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.fake_client import FakeProviderClient
@@ -125,6 +126,7 @@ def _build(
         RequestDeduplicator(),
         ReservationService(ledger, pricing, CostAccountant(pricing)),
         ProviderExecutor(client),
+        InMemoryCircuitBreaker(FixedClock()),
     )
     sleeper = RecordingSleeper()
     executor = ReflectiveExecutor(coordinator, policy or RetryPolicy(), sleeper)

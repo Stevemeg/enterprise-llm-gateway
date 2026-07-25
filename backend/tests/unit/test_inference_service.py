@@ -17,6 +17,7 @@ import pytest
 from gateway.adapters.authorization.in_memory_resolver import InMemoryPermissionResolver
 from gateway.adapters.authorization.null_resolver import NullPermissionResolver
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
+from gateway.adapters.health.in_memory_circuit_breaker import InMemoryCircuitBreaker
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.pipeline.authorization_stage import AuthorizationStage
 from gateway.adapters.pipeline.noop_stage import NoOpPipelineStage
@@ -176,6 +177,7 @@ class Harness:
             RequestDeduplicator(),
             reservation,
             ProviderExecutor(self.client),
+            InMemoryCircuitBreaker(clock),
         )
         self.sleeper = NoSleep()
         self.executor = ReflectiveExecutor(

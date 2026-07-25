@@ -48,6 +48,9 @@ uv run python ../scripts/check_mcp_construction.py src/gateway || fail "MCP cons
 step "Resolver construction guard (only the composition root may build one)"
 uv run python ../scripts/check_resolver_construction.py src/gateway || fail "Resolver construction guard failed (ADR-0016 invariant 2)."
 
+step "Circuit-breaker construction guard (only the composition root may build one)"
+uv run python ../scripts/check_circuit_breaker_construction.py src/gateway || fail "Circuit-breaker construction guard failed (ADR-0016 Slice 20)."
+
 step "Routing engine guard (construction + sole AgentRuntime caller)"
 uv run python ../scripts/check_routing_engine.py src/gateway || fail "Routing engine guard failed (ADR-0016 invariants 2-3)."
 

@@ -28,6 +28,7 @@ from prometheus_client import REGISTRY, Counter, Histogram
 from gateway.adapters.authorization.in_memory_resolver import InMemoryPermissionResolver
 from gateway.adapters.authorization.null_resolver import NullPermissionResolver
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
+from gateway.adapters.health.in_memory_circuit_breaker import InMemoryCircuitBreaker
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.pipeline.authorization_stage import AuthorizationStage
 from gateway.adapters.pipeline.policy_stage import PolicyStage
@@ -156,6 +157,7 @@ class Harness:
             RequestDeduplicator(),
             reservation,
             ProviderExecutor(client),
+            InMemoryCircuitBreaker(clock),
         )
         executor = ReflectiveExecutor(
             self.coordinator, RetryPolicy(max_attempts=max_attempts), NoSleep()
@@ -557,6 +559,7 @@ def test_metrics_module_declares_no_label_outside_the_guarded_allowlist() -> Non
         metrics.routing_decisions,
         metrics.evaluations,
         metrics.budget_reservations,
+        metrics.provider_circuit_transitions,
     ):
         for name in metric._labelnames:
             assert name in {

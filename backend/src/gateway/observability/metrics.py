@@ -134,6 +134,9 @@ _ROUTING_OUTCOMES: Final = frozenset(
 )
 _EVALUATION_OUTCOMES: Final = frozenset({"passed", "failed", "error", "not_applicable"})
 _RESERVATION_OUTCOMES: Final = frozenset({"reserved", "exceeded", "unavailable"})
+#: Circuit-breaker transitions (Slice 20). A closed vocabulary mirroring CircuitState's edges - the
+#: label reuses the existing ``outcome`` name, so no new label name is introduced.
+_CIRCUIT_TRANSITIONS: Final = frozenset({"opened", "closed", "half_opened"})
 
 
 admission_stage_decisions = Counter(
@@ -203,6 +206,12 @@ budget_reservations = Counter(
     "gateway_budget_reservations_total",
     "Budget reservation attempts by outcome (reserved / exceeded / ledger unavailable).",
     labelnames=("outcome",),
+)
+
+provider_circuit_transitions = Counter(
+    "gateway_provider_circuit_transitions_total",
+    "Circuit-breaker state transitions per provider; outcome=opened is a provider being excluded.",
+    labelnames=("provider", "outcome"),
 )
 
 
@@ -300,4 +309,15 @@ def record_budget_reservation(*, outcome: str) -> None:
     _record(
         "budget_reservation",
         lambda: budget_reservations.labels(outcome=_bounded(outcome, _RESERVATION_OUTCOMES)).inc(),
+    )
+
+
+def record_circuit_transition(*, provider: str, transition: str) -> None:
+    """One circuit-breaker state change. ``provider`` is catalog-bounded; ``transition`` is a
+    closed vocabulary. Records a fact and decides nothing (Slice 16 failure-isolation applies)."""
+    _record(
+        "circuit_transition",
+        lambda: provider_circuit_transitions.labels(
+            provider=provider, outcome=_bounded(transition, _CIRCUIT_TRANSITIONS)
+        ).inc(),
     )

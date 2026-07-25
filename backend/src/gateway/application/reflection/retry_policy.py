@@ -47,15 +47,13 @@ from gateway.application.execution.inference_coordinator import (
     InferenceExecutionResult,
 )
 from gateway.application.ports.execution import ExecutionOutcome
-from gateway.application.ports.providers import ProviderErrorCategory
+from gateway.application.ports.providers import TRANSIENT_PROVIDER_ERROR_CATEGORIES
 
-_RETRYABLE_PROVIDER_ERRORS = frozenset(
-    {
-        ProviderErrorCategory.TIMEOUT,
-        ProviderErrorCategory.RATE_LIMITED,
-        ProviderErrorCategory.SERVER_ERROR,
-    }
-)
+#: A failed attempt is worth retrying exactly when the provider was transiently at fault - the same
+#: set the circuit breaker (Slice 20) counts against a provider's health. Shared from
+#: ``ports.providers`` (Rule 3) so retry and circuit-breaking can never disagree about which
+#: failures are the provider's fault; previously this was a private duplicate here.
+_RETRYABLE_PROVIDER_ERRORS = TRANSIENT_PROVIDER_ERROR_CATEGORIES
 
 
 class RetryVerdict(StrEnum):

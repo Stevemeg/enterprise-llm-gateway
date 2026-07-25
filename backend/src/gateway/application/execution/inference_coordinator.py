@@ -60,6 +60,7 @@ from gateway.application.ports.cache import (
     CacheUnavailableError,
     ResponseCachePort,
 )
+from gateway.application.ports.circuit_breaker import CircuitBreaker, ProviderCallResult
 from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.ledger import ReservationOutcome
 from gateway.application.ports.providers import InferenceRequest, ProviderResponse
@@ -87,11 +88,13 @@ class InferenceCoordinator:
         deduplicator: RequestDeduplicator,
         reservation_service: ReservationService,
         provider_executor: ProviderExecutor,
+        circuit_breaker: CircuitBreaker,
     ) -> None:
         self._cache = cache
         self._deduplicator = deduplicator
         self._reservation_service = reservation_service
         self._provider_executor = provider_executor
+        self._circuit_breaker = circuit_breaker
 
     async def execute(
         self, execution: RoutingExecution, request: InferenceRequest
@@ -147,6 +150,16 @@ class InferenceCoordinator:
             return InferenceExecutionResult(outcome=outcome, response=response)
 
         response = await self._provider_executor.execute(execution, request)
+        # Slice 20: a *real* provider call happened, so feed its outcome to the circuit breaker.
+        # This is the only place that observes health: cache hits, budget denials and unrouted
+        # requests never reach here, so a circuit only ever moves on evidence of an actual call.
+        # The breaker itself decides what counts (success closes, transient fault opens, client
+        # errors are ignored) - the coordinator just reports what happened.
+        self._circuit_breaker.observe(
+            organization_id=organization_id,
+            provider=provider.name,
+            result=ProviderCallResult(ok=response.ok, error_category=response.error_category),
+        )
         if not response.ok:
             await self._reservation_service.release(
                 organization_id=organization_id, correlation_id=request.correlation_id

@@ -136,6 +136,7 @@ GUARDED_METRICS = frozenset(
         "routing_decisions",
         "evaluations",
         "budget_reservations",
+        "provider_circuit_transitions",  # Slice 20
     }
 )
 

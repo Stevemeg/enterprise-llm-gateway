@@ -2396,3 +2396,122 @@ catalog or static pricing, and removing the effective-dating lower bound, each b
 **No action against ADR-0016** (frozen, byte-unchanged). **No new ADR.** No schema change
 (`provider`/`model`/`price_table` already existed and are RLS-protected). Alembic head unchanged
 at `0007_rbac_seed_audit_chain`.
+
+## Evidence Record - Phase 4 Slice 20: Provider Health & Circuit Breaking
+
+**Milestone type: Capability.** It puts a circuit breaker behind an existing routing seam and
+creates no Tier-1 extension point. **No ADR.**
+
+### Rule 5 determination
+
+| Protocol | Result |
+|---|---|
+| Tier-1 (`RoutingDecision`, `HealthDecision`, `AgentContext`, BaseAgent) | **NOT TRIGGERED** - `HealthDecision` already carried `healthy`/`degraded`/`excluded` candidate tuples and `RoutingOutcome.ALL_UNHEALTHY` already existed (Slice 6). The stub `HealthAgent` simply never populated them from real data. Zero diff on `domain/`, `ports/pipeline.py`, `ports/agents.py`, ADR-0016 (sha256 `2735cdfa...f777c3`, byte-identical). |
+| New `CircuitBreaker` port (capability-owned) | **NOT TRIGGERED / no ADR** - a capability introducing its own typed port is the established, repeatedly-validated pattern (`PermissionResolver` Slice 5, `ProviderClient` Slice 7, `PricingPort` Slice 8), none of which shipped an ADR. Rule 2 governs the birth of a *Tier-1* seam; this is not one. |
+
+### Architecture decisions, stated rather than implied
+
+- **The breaker is in-process, and that is correct, not a shortcut.** ADR-0012 specifies circuit
+  state "maintained from passive (live errors/latency)"; a breaker must react within one call's
+  latency budget (NFR-P01), which a per-call database round-trip cannot meet. The durable
+  `provider_health` table is deliberately **not** written: it exists for cross-replica snapshots,
+  which need ADR-0005's eventing backbone (unimplemented) to be a shared source of truth, and
+  writing snapshots nothing reads would be the speculative infrastructure Rule 8 forbids. Recorded
+  as a deferral, not done.
+- **Only transient provider faults count.** Timeout / rate-limited / server-error move a circuit
+  toward open; a client error (invalid request, bad auth) or an unclassified failure is ignored,
+  because it would recur against any provider and must not let a caller's bad requests trip a
+  healthy provider's breaker. This is the *same* set reflection uses to decide retryability, so it
+  was lifted to `TRANSIENT_PROVIDER_ERROR_CATEGORIES` in `ports.providers` and imported by both
+  (Rule 3) - previously reflection kept a private duplicate that could have drifted.
+- **Tenant isolation without RLS.** State is keyed `(organization_id, provider)`, so one tenant's
+  failures never open another tenant's circuit for the same shared provider - the isolation RLS
+  gives storage, here by the key, because this state never touches the database.
+- **The feed point is the only place a real call happens.** The coordinator observes an outcome
+  only after `ProviderExecutor.execute`; cache hits, budget denials and unrouted requests never
+  reach it, so a circuit only ever moves on evidence of an actual provider call. Proven by a
+  recording-breaker double asserting exactly which paths feed it and which do not.
+
+### Guard evaluation
+
+| Guard | Classification |
+|---|---|
+| `check_circuit_breaker_construction.py` (only the composition root builds a breaker) | **NEW** - a component that built its own breaker would split the routing-time read from the execution-time write; per-class exemption from the start (the Slice-15 defect). Wired into both validate scripts (parity kept). |
+| "circuit-breaker consumers depend on the CircuitBreaker port only" (import-linter) | **NEW** |
+| "circuit breakers observe and reach no capability" (import-linter) | **NEW** |
+| Metric cardinality (`provider_circuit_transitions`) | **REUSED-EXTENDED** - a new metric added to `GUARDED_METRICS`, reusing the existing `provider`/`outcome` label names (no new label name) |
+| RoutingDecision construction / Guard L | **REUSED** - proven against the new breaker file |
+
+**12/12 deliberate-failure proofs PROVEN** (violate -> observe fail -> restore exact bytes ->
+observe pass), including re-proving the metric guard against the new metric and the behavioural
+proof that removing the coordinator's breaker feed breaks the feed tests.
+
+### Decision
+
+**No action against ADR-0016** (frozen, byte-unchanged). **No new ADR.** No schema change. In-memory
+circuit breaker; `provider_health` durable snapshots recorded as deferred. `HealthAgent` shipped
+mapping half-open circuits into `healthy_candidates` (usable, probe noted in reasoning) because
+nothing yet ranked candidates - the healthy/degraded distinction gains its consumer in Slice 21.
+
+## Evidence Record - Phase 4 Slice 21: Adaptive Routing
+
+**Milestone type: Capability.** It puts a ranking strategy behind an existing selection seam.
+**No ADR.**
+
+### The conditionality, resolved
+
+The plan marked Adaptive Routing conditional on "16 + 20 producing evidence justifying it". Slice 20
+produces that evidence: providers now carry differentiated live circuit health, so "pick the first
+usable candidate" is a decision nobody made once candidates are no longer interchangeable. Adaptive
+Routing was therefore implemented as ADR-0012's **deterministic ranking strategy** (health tier),
+explicitly *not* the ML/bandit router ADR-0012 defers "to preserve explainability and governance".
+
+### Rule 5 determination
+
+| Protocol | Result |
+|---|---|
+| Tier-1, including `PlannerDecision` | **NOT TRIGGERED.** ADR-0016 sanctions growing `PlannerDecision`'s deferred fields (latency sensitivity, streaming, ...) *for* Adaptive Routing - but only if the routing rule consumes them. The health-tiered strategy ranks on the circuit-health signal Slice 20 produces, which is already carried by `HealthDecision`; it consumes none of `PlannerDecision`'s deferred fields. Per Rule 5's own third test ("why the change does not belong in the consumer instead"), no field is added that nothing reads. Zero diff on `domain/`, `ports/agents.py`, ADR-0016. |
+| New `RoutingStrategy` port (capability-owned) | **NOT TRIGGERED / no ADR** - ADR-0012 already named `RoutingStrategyPort`; this realizes it as a capability-owned port, the same footing as the other capability ports. |
+
+### What each slice owns, kept distinct
+
+- **Slice 20** owns *which providers are usable and their health tier* (the `HealthDecision`).
+- **Slice 21** owns *which usable provider is best* (the ranking). It consumes Slice 20's output via
+  the domain `HealthDecision` (healthy vs degraded tiers), **not** the breaker's internals - it
+  never imports the circuit breaker at all.
+
+Slice 21 refined the `HealthAgent` so a half-open circuit maps to `degraded_candidates` (distinct
+from healthy `closed`), because the ranker is the consumer that finally needs the distinction - the
+evidence-driven evolution GP-1 describes, not thrash. The runtime's `ALL_UNHEALTHY` check was
+widened to "no healthy **and** no degraded", so an all-half-open set is routable (its providers get
+the recovery probe they need) rather than refused.
+
+### The strategy is pure and deterministic
+
+`HealthTieredRoutingStrategy` prefers healthy over degraded, breaking ties by provider name so an
+identical candidate set always yields an identical selection (FR-033 explainability). A degraded
+provider is preferred *last*, not excluded: excluding it would leave a recovering circuit never
+probed. `ProviderAgent` builds `RoutingCandidate` values from the health tiers and records the
+strategy's choice; it constructs no `RoutingDecision` (invariant 3) and reaches no provider client.
+
+### Guard evaluation
+
+| Guard | Classification |
+|---|---|
+| "agents depend on the routing-strategy port, not a concrete strategy or the engine" (import-linter) | **NEW** |
+| "the routing strategy ranks candidates and reaches no capability" (import-linter) | **NEW** |
+| RoutingDecision construction / Guard L | **REUSED** - proven against the new strategy file |
+
+No new construction guard: the strategy is stateless and pure, so a duplicate instance is harmless
+(unlike the breaker, whose shared state a duplicate would split). The import-linter port dependency
+is the enforcement.
+
+**12/12 deliberate-failure proofs PROVEN**, including behavioural proofs that inverting the tier
+preference, removing the runtime's degraded-usable check, or dropping degraded candidates from
+selection each break the end-to-end adaptive-routing tests.
+
+### Decision
+
+**No action against ADR-0016** (frozen, byte-unchanged). **No new ADR.** No schema change. In-memory
+strategy with one deterministic implementation; per-org `routing_policy` configuration and the
+ML/bandit strategy recorded as deferred.

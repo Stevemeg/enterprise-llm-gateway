@@ -102,8 +102,12 @@ class AgentRuntime:
         if (
             context.health is not None
             and not context.health.healthy_candidates
+            and not context.health.degraded_candidates
             and context.candidates
         ):
+            # ALL_UNHEALTHY only when nothing is usable. A degraded (half-open) candidate is
+            # usable - it is a sanctioned recovery probe (Slice 20/21) - so a set that is all
+            # degraded is routable, not all-unhealthy.
             return RoutingOutcome.ALL_UNHEALTHY
         return None
 

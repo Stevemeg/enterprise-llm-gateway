@@ -27,6 +27,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
+from gateway.adapters.health.in_memory_circuit_breaker import InMemoryCircuitBreaker
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.pipeline.authorization_stage import AuthorizationStage
 from gateway.adapters.pipeline.policy_stage import PolicyStage
@@ -116,6 +117,7 @@ def _permissive_inference_service() -> InferenceService:
         RequestDeduplicator(),
         ReservationService(InMemoryBudgetLedger(), pricing, CostAccountant(pricing)),
         ProviderExecutor(InMemoryProviderClient()),
+        InMemoryCircuitBreaker(clock),
     )
     runtime = AgentRuntime(
         [PlannerAgent(), PolicyAgent(), CostAgent(), HealthAgent(), ProviderAgent()], clock

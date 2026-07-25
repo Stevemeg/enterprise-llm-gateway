@@ -323,12 +323,89 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+# Slice 20 Guard 1 - circuit-breaker consumers depend on the CircuitBreaker port only, never on a
+# concrete breaker. The HealthAgent reads circuit state and the execution coordinator writes call
+# outcomes to it; if either imported the in-memory implementation directly it could construct its
+# own copy of the state, splitting the read from the write - the exact failure the shared, injected
+# instance exists to prevent. Same shape as Guard G for permission resolvers.
+name = "circuit-breaker consumers depend on the CircuitBreaker port only"
+type = "forbidden"
+source_modules = ["gateway.application.agents", "gateway.application.execution"]
+forbidden_modules = ["gateway.adapters.health"]
+
+[[tool.importlinter.contracts]]
+# Slice 20 Guard 2 - a circuit breaker OBSERVES provider outcomes and reports state; it decides
+# nothing else. It is fed call results and asked for circuit state, and must never be able to
+# route, select a provider, author cost, move budget, run admission, or serve a request. One
+# forbidden target per claim, mirroring the audit-sink contract (Slice 18):
+#   - application.routing / agents -> the breaker cannot route or reach AgentRuntime
+#   - application.providers / execution -> the breaker cannot invoke a provider or run the
+#     cache/reserve/execute/settle sequence (it reacts to those, from outside)
+#   - application.accounting / ports.ledger -> the breaker cannot author cost or move budget
+#   - application.pipeline / serving / authorization -> the breaker cannot admit, serve, or authorize
+# It legitimately imports application.ports.circuit_breaker (the port it implements),
+# application.ports.providers (the error-category vocabulary it classifies) and
+# observability.metrics (it records transitions) - none of which is forbidden here.
+# ``routing.engine`` is forbidden, not the whole ``routing`` package: ``ProviderDescriptor`` lives
+# in ``routing.catalog`` and reaches this adapter transitively through ``ports.providers`` (the
+# same harmless edge the Slice-19 provider-client contract accommodates); being able to name a
+# descriptor type is not being able to route.
+name = "circuit breakers observe and reach no capability"
+type = "forbidden"
+source_modules = ["gateway.adapters.health"]
+forbidden_modules = [
+    "gateway.application.routing.engine",
+    "gateway.application.agents",
+    "gateway.application.providers",
+    "gateway.application.execution",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.pipeline",
+    "gateway.application.serving",
+    "gateway.application.authorization",
+]
+
+[[tool.importlinter.contracts]]
 # Guard J - the routing engine is application-layer orchestration. Importing any adapter would
 # let it reach a provider client directly, bypassing the decision record (ADR-0016 invariant 3).
 name = "the routing engine depends on application and domain only"
 type = "forbidden"
 source_modules = ["gateway.application.routing"]
 forbidden_modules = ["gateway.adapters", "gateway.delivery", "gateway.config"]
+
+[[tool.importlinter.contracts]]
+# Slice 21 Guard 1 - agents depend on the RoutingStrategy PORT, never on a concrete strategy or the
+# routing engine. An agent that imported a concrete strategy would bind provider selection to one
+# ranking rule and defeat the port; an agent that reached the engine could route itself, which is
+# AgentRuntime's job. The ProviderAgent gets its strategy by injection
+# (application.ports.routing_strategy). ``routing.catalog`` is NOT forbidden: ProviderDescriptor
+# reaches health.py transitively through ports.providers (the same benign edge the Slice-19 and
+# Slice-20 contracts accommodate), and naming a descriptor type is not routing.
+name = "agents depend on the routing-strategy port, not a concrete strategy or the engine"
+type = "forbidden"
+source_modules = ["gateway.application.agents"]
+forbidden_modules = [
+    "gateway.application.routing.engine",
+    "gateway.application.routing.health_tiered_strategy",
+]
+
+[[tool.importlinter.contracts]]
+# Slice 21 Guard 2 - a routing strategy RANKS the candidates it is given and decides nothing else.
+# It must not fetch candidates, call a provider, price a call, consult a budget, reach the runtime,
+# or run admission. Module-scoped (not the whole routing package) because the engine legitimately
+# imports AgentRuntime, but the strategy is a pure function of RoutingCandidate values.
+name = "the routing strategy ranks candidates and reaches no capability"
+type = "forbidden"
+source_modules = ["gateway.application.routing.health_tiered_strategy"]
+forbidden_modules = [
+    "gateway.application.agents",
+    "gateway.application.routing.engine",
+    "gateway.application.routing.catalog",
+    "gateway.application.providers",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.execution",
+]
 
 [[tool.importlinter.contracts]]
 # Guard 2 - ProviderClient implementations are mutually independent (Slice 7, +real adapter S19).

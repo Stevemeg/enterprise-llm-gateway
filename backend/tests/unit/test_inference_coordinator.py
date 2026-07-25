@@ -9,13 +9,15 @@ coordinator's own orchestration and fail-safe semantics.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
+from gateway.adapters.health.in_memory_circuit_breaker import InMemoryCircuitBreaker
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.fake_client import FakeProviderClient
@@ -24,6 +26,11 @@ from gateway.application.accounting.reservation_service import ReservationServic
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import (
     InferenceCoordinator,
+)
+from gateway.application.ports.circuit_breaker import (
+    CircuitState,
+    ProviderCallResult,
+    ProviderCircuit,
 )
 from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.ledger import ReservationOutcome, UnknownReservationError
@@ -98,9 +105,110 @@ def _coordinator(
     pricing = StaticPriceTable((PRICE,))
     reservation_service = ReservationService(ledger, pricing, CostAccountant(pricing))
     coordinator = InferenceCoordinator(
-        cache, RequestDeduplicator(), reservation_service, ProviderExecutor(client)
+        cache,
+        RequestDeduplicator(),
+        reservation_service,
+        ProviderExecutor(client),
+        InMemoryCircuitBreaker(MovableClock()),
     )
     return coordinator, ledger
+
+
+# ------------------------------------------------------------------ circuit-breaker feed (Slice 20)
+
+
+class _RecordingBreaker:
+    """Records every ``observe`` so a test can assert exactly which calls fed the circuit.
+
+    ``assess`` always reports CLOSED: this double is about the *write* side (does a real provider
+    call feed the breaker, and do the non-call paths correctly not?), not the state machine, which
+    is covered exhaustively in ``test_circuit_breaker.py``. It satisfies the ``CircuitBreaker``
+    protocol structurally.
+    """
+
+    def __init__(self) -> None:
+        self.observed: list[tuple[str, bool]] = []
+
+    def observe(self, *, organization_id: UUID, provider: str, result: ProviderCallResult) -> None:
+        self.observed.append((provider, result.ok))
+
+    def assess(
+        self, *, organization_id: UUID, providers: Sequence[str]
+    ) -> tuple[ProviderCircuit, ...]:
+        return tuple(ProviderCircuit(provider=p, state=CircuitState.CLOSED) for p in providers)
+
+
+def _coordinator_with(
+    breaker: _RecordingBreaker,
+    client: FakeProviderClient,
+    *,
+    ledger: InMemoryBudgetLedger | None = None,
+) -> InferenceCoordinator:
+    if ledger is None:
+        ledger = InMemoryBudgetLedger({ORG: Money(Decimal("1000"), "USD")})
+    pricing = StaticPriceTable((PRICE,))
+    return InferenceCoordinator(
+        InMemoryResponseCache(MovableClock()),
+        RequestDeduplicator(),
+        ReservationService(ledger, pricing, CostAccountant(pricing)),
+        ProviderExecutor(client),
+        breaker,
+    )
+
+
+async def test_a_real_provider_call_feeds_its_outcome_to_the_breaker() -> None:
+    breaker = _RecordingBreaker()
+    client = FakeProviderClient(responses={"openai": _ok_response()})
+    coordinator = _coordinator_with(breaker, client)
+
+    await coordinator.execute(_execution(), _request())
+
+    assert breaker.observed == [("openai", True)], "the provider's success must reach the breaker"
+
+
+async def test_a_provider_failure_is_reported_to_the_breaker() -> None:
+    breaker = _RecordingBreaker()
+    failing = ProviderResponse(ok=False, error="boom", provider="openai")
+    coordinator = _coordinator_with(breaker, FakeProviderClient(responses={"openai": failing}))
+
+    await coordinator.execute(_execution(), _request())
+
+    assert breaker.observed == [("openai", False)]
+
+
+async def test_a_cache_hit_does_not_feed_the_breaker() -> None:
+    breaker = _RecordingBreaker()
+    client = FakeProviderClient(responses={"openai": _ok_response()})
+    coordinator = _coordinator_with(breaker, client)
+    await coordinator.execute(_execution(), _request("warm"))
+    breaker.observed.clear()
+
+    result = await coordinator.execute(_execution(correlation_id="hit"), _request("warm"))
+
+    assert result.outcome is ExecutionOutcome.CACHE_HIT
+    assert breaker.observed == [], "a cache hit calls no provider, so it must not touch the breaker"
+
+
+async def test_a_budget_denial_does_not_feed_the_breaker() -> None:
+    breaker = _RecordingBreaker()
+    broke = InMemoryBudgetLedger({ORG: Money(Decimal("0.000001"), "USD")})
+    coordinator = _coordinator_with(
+        breaker, FakeProviderClient(responses={"openai": _ok_response()}), ledger=broke
+    )
+
+    result = await coordinator.execute(_execution(), _request())
+
+    assert result.outcome is ExecutionOutcome.BUDGET_DENIED
+    assert breaker.observed == [], "no provider was called, so the breaker must see nothing"
+
+
+async def test_an_unrouted_request_does_not_feed_the_breaker() -> None:
+    breaker = _RecordingBreaker()
+    coordinator = _coordinator_with(breaker, FakeProviderClient())
+
+    await coordinator.execute(_execution(RoutingOutcome.NO_CANDIDATE), _request())
+
+    assert breaker.observed == []
 
 
 # ------------------------------------------------------------------ not routed

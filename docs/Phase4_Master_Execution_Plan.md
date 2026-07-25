@@ -43,29 +43,39 @@ remains **frozen**: nothing here amends it.
 | 15 | Served Inference Path | Capability | `v1.15.0-phase4-slices14-15` |
 | 16 | Production Observability | Capability | `v1.17.0-phase4-slices16-17` |
 | 17 | HTTP Inference Endpoint + Authentication Wiring | Capability | `v1.17.0-phase4-slices16-17` |
-| 18 | RBAC Durable Storage + Hash-Chained Audit Sink (ADR-0019) | Capability | *pending publication* |
-| 19 | Real Provider Adapter + Durable Catalog/Pricing | Capability | *pending publication* |
+| 18 | RBAC Durable Storage + Hash-Chained Audit Sink (ADR-0019) | Capability | `v1.19.0-phase4-slices18-19` |
+| 19 | Real Provider Adapter + Durable Catalog/Pricing | Capability | `v1.19.0-phase4-slices18-19` |
+| 20 | Provider Health & Circuit Breaking | Capability | *pending publication* |
+| 21 | Adaptive Routing | Capability | *pending publication* |
 
-Slices 18–19 are implemented, fully validated (Gate 1 + Gate 2, 767 passed / 0 skipped / 97%) and
-awaiting the publication step; the tag column is filled in at publish. Slice 18 introduced a single
-new architectural decision, **[ADR-0019](adr/0019-api-key-credential-bootstrap-lookup.md)** (the
-sanctioned `SECURITY DEFINER` credential-bootstrap lookup); Slice 19 changed no ADR (it added
-`organization_id` to the capability-owned `PricingPort` under Rule 5, recorded in the evidence log).
+Slice 18 introduced one new architectural decision,
+**[ADR-0019](adr/0019-api-key-credential-bootstrap-lookup.md)** (the sanctioned `SECURITY DEFINER`
+credential-bootstrap lookup); Slice 19 changed no ADR (it added `organization_id` to the
+capability-owned `PricingPort` under Rule 5). Slices 20–21 are implemented, fully validated (Gate 1
++ Gate 2, 806 passed / 0 skipped / 97%) and awaiting the publication step; neither changed an ADR.
+Slice 20 introduced the capability-owned `CircuitBreaker` port (no ADR, the same footing as
+`PermissionResolver`/`PricingPort`); Slice 21 introduced the capability-owned `RoutingStrategy`
+port and, per Rule 5's own third test, did **not** grow `PlannerDecision` — the health-tiered
+strategy consumes none of its deferred fields, so no field nothing reads was added.
+
+**Slice 21's conditionality (from the plan) was resolved to "justified".** ADR-0016 marked Adaptive
+Routing conditional on "16 + 20 producing evidence justifying it". Slice 20 produces exactly that
+evidence: providers now carry differentiated live circuit health (closed / half-open / open), so
+selecting the first usable candidate is demonstrably suboptimal when a healthier alternative exists.
+Adaptive Routing was therefore implemented as ADR-0012's deterministic ranking strategy (health
+tier), **not** the ML/bandit router ADR-0012 explicitly defers.
 
 ## Remaining sequence
 
-Ordering principle: **cross-cutting operational foundations before capabilities that depend on
-trustworthy runtime evidence** (GP-1 — architecture evolves through evidence, and evidence requires
-instrumentation).
-
-| # | Milestone | Type | Depends on | Rationale |
-|---|---|---|---|---|
-| 20 | Provider Health & Circuit Breaking | Capability | 16, 19 | `HealthAgent` is a stub; `provider_health` table unused. Needs metrics and a real provider to have health |
-| 21 *(conditional)* | Adaptive Routing | Capability | 16, 20 | **Only if** 16 + 20 produce evidence justifying it (ADR-0016 names it the legitimate consumer of `PlannerDecision`'s deferred fields) |
+Phase 4's planned slices are complete. Nothing in the plan's original sequence remains.
 
 **Explicitly deferred beyond Phase 4 under GP-1 (no consumer today):** Enterprise Memory, Benchmark
 Service, semantic/vector cache tier (ADR-0018 scoped it out), eventing backbone (ADR-0005 accepted,
-unimplemented), rate limiting, OPA. Each is a recorded deferral, not an omission.
+unimplemented), rate limiting, OPA, durable `provider_health` cross-replica snapshots (the
+in-process circuit breaker is authoritative; sharing state across replicas needs ADR-0005's
+eventing backbone), per-org `routing_policy` strategy configuration (no management API yet), and the
+ML/bandit routing strategy (ADR-0012 defers it to preserve explainability). Each is a recorded
+deferral, not an omission.
 
 ## Known contradictions and debt (carried forward)
 
@@ -80,9 +90,11 @@ unimplemented), rate limiting, OPA. Each is a recorded deferral, not an omission
 - **ADR-0003 (provider abstraction) has met a real SDK as of Slice 19** —
   `OpenAiCompatibleProviderClient` (httpx) is wired when a provider connection is configured;
   `InMemoryProviderClient` remains the default when none is.
-- **Four of five routing agents are stubs** (`PolicyAgent`, `CostAgent`, `HealthAgent`,
-  `ProviderAgent`); only `PlannerAgent` is real. (Slice 19 gave the runtime real candidates to
-  choose between, but the *choosing* is still `PlannerAgent`; the other four remain stubs.)
+- **Three of five routing agents are stubs** (`PolicyAgent`, `CostAgent`, `PlannerAgent` is real
+  heuristic). Slice 20 made `HealthAgent` real (it reads live circuit-breaker state), and Slice 21
+  made `ProviderAgent` real (it selects via a `RoutingStrategy` that ranks by circuit health).
+  `PolicyAgent` and `CostAgent` remain stubs — real policy admission lives in the `PolicyStage`
+  (Slice 13), and per-candidate cost ranking awaits a real cost signal (GP-1).
 - **A routable provider configured without a price fails closed as a generic 500** — the served
   path now reaches `UnknownPriceError` (Slice 8's invariant: a config defect is never a budget
   outcome), and no spend is booked, but mapping it to a tailored fail-closed 5xx is deferred
