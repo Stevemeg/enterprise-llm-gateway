@@ -21,11 +21,11 @@ from gateway.adapters.health.in_memory_circuit_breaker import InMemoryCircuitBre
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.fake_client import FakeProviderClient
-from gateway.application.accounting.cost_accountant import CostAccountant
-from gateway.application.accounting.reservation_service import ReservationService
+from gateway.application.execution.cache_key import compute_cache_key
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import (
     InferenceCoordinator,
+    InferenceExecutionResult,
 )
 from gateway.application.ports.circuit_breaker import (
     CircuitState,
@@ -41,6 +41,7 @@ from gateway.application.ports.routing import RoutingExecution
 from gateway.application.providers.provider_executor import ProviderExecutor
 from gateway.application.routing.catalog import ProviderDescriptor
 from gateway.domain.routing.models import ReasoningStep, RoutingDecision, RoutingOutcome
+from tests.support.accounting import reservation_service
 
 ORG = uuid4()
 OPENAI = ProviderDescriptor(name="openai", model="gpt-4o")
@@ -69,7 +70,6 @@ def _decision(outcome: RoutingOutcome, correlation_id: str = "c1") -> RoutingDec
         decided_at=datetime(2026, 7, 23, 12, 0, 0, tzinfo=UTC),
         reasoning_steps=(ReasoningStep(agent="provider", summary="stub"),),
         selected_provider="openai" if outcome is RoutingOutcome.SELECTED else None,
-        selected_model="gpt-4o" if outcome is RoutingOutcome.SELECTED else None,
     )
 
 
@@ -103,11 +103,11 @@ def _coordinator(
     if cache is None:
         cache = InMemoryResponseCache(MovableClock())
     pricing = StaticPriceTable((PRICE,))
-    reservation_service = ReservationService(ledger, pricing, CostAccountant(pricing))
+    reservation = reservation_service(ledger, pricing)
     coordinator = InferenceCoordinator(
         cache,
         RequestDeduplicator(),
-        reservation_service,
+        reservation,
         ProviderExecutor(client),
         InMemoryCircuitBreaker(MovableClock()),
     )
@@ -150,7 +150,7 @@ def _coordinator_with(
     return InferenceCoordinator(
         InMemoryResponseCache(MovableClock()),
         RequestDeduplicator(),
-        ReservationService(ledger, pricing, CostAccountant(pricing)),
+        reservation_service(ledger, pricing),
         ProviderExecutor(client),
         breaker,
     )
@@ -389,3 +389,72 @@ async def test_a_cache_write_outage_does_not_fail_an_otherwise_successful_reques
     assert result.outcome is ExecutionOutcome.EXECUTED
     assert result.response.ok is True
     assert result.cost is not None
+
+
+# ------------------------------------------------------ unaccountable calls (Phase 5 M2)
+
+
+async def test_a_provider_response_with_no_usage_is_a_typed_refusal_not_an_exception() -> None:
+    """Before M2 ``MissingUsageError`` escaped the coordinator, travelled untouched through
+    reflection and serving, and reached HTTP as an unhandled exception - a generic 500 with the
+    budget hold still reserved behind it. It is now a refusal the delivery layer can map, and the
+    hold is given back."""
+    client = FakeProviderClient(
+        responses={"openai": ProviderResponse(ok=True, content="hi", provider="openai")}
+    )
+    coordinator, ledger = _coordinator(client)
+
+    result = await coordinator.execute(_execution(), _request())
+
+    assert result.outcome is ExecutionOutcome.NOT_ACCOUNTABLE
+    assert result.response.ok is False
+    assert result.cost is None
+    # The hold came back: the whole original limit is reservable again.
+    probe = await ledger.reserve(ORG, "probe", Money(Decimal("1000"), "USD"))
+    assert probe.outcome is ReservationOutcome.RESERVED
+
+
+async def test_an_unaccountable_call_is_never_cached() -> None:
+    """A response nobody could price must not be served again for free."""
+    client = FakeProviderClient(
+        responses={"openai": ProviderResponse(ok=True, content="hi", provider="openai")}
+    )
+    cache = InMemoryResponseCache(MovableClock())
+    coordinator, _ = _coordinator(client, cache=cache)
+
+    await coordinator.execute(_execution(), _request())
+
+    key = compute_cache_key(ORG, provider="openai", model="gpt-4o", payload={"prompt": "hello"})
+    assert await cache.get(ORG, key) is None
+
+
+async def test_an_unpriced_model_refuses_before_the_provider_is_called() -> None:
+    """Reservation prices the call first, so the defect is caught before any spend or any call."""
+    client = FakeProviderClient(responses={"openai": _ok_response()})
+    ledger = InMemoryBudgetLedger({ORG: Money(Decimal("1000"), "USD")})
+    unpriced = StaticPriceTable(())
+    coordinator = InferenceCoordinator(
+        InMemoryResponseCache(MovableClock()),
+        RequestDeduplicator(),
+        reservation_service(ledger, unpriced),
+        ProviderExecutor(client),
+        InMemoryCircuitBreaker(MovableClock()),
+    )
+
+    result = await coordinator.execute(_execution(), _request())
+
+    assert result.outcome is ExecutionOutcome.NOT_ACCOUNTABLE
+    assert client.calls == []
+
+
+def test_an_unaccountable_outcome_is_terminal_for_reflection() -> None:
+    """Retrying a configuration or provider defect is precisely wrong - it would charge the tenant
+    again for a call that cannot succeed until a human changes something."""
+    from gateway.application.reflection.retry_policy import RetryVerdict, classify
+
+    result = InferenceExecutionResult(
+        outcome=ExecutionOutcome.NOT_ACCOUNTABLE,
+        response=ProviderResponse(ok=False, error="not_accountable"),
+    )
+
+    assert classify(result) is RetryVerdict.TERMINAL_FAILURE

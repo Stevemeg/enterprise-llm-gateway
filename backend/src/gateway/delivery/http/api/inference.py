@@ -47,14 +47,38 @@ it. That guard existed before this slice and had no protected route to protect.
 A refusal keeps the reason the admission chain produced: those are already caller-safe (the stages
 deliberately never name the missing permission, the rule or the threshold). This route adds no
 detail of its own to a denial, so it cannot leak what the controls were careful not to.
+
+## Phase 5 M1: ``"stream": true`` on the same endpoint
+
+The streamed response is Server-Sent Events, per ``docs/API_Streaming.md`` §1 - a decision this
+route *implements* rather than makes. SSE was chosen there over WebSocket and gRPC because
+inference is unidirectional, proxy-friendly and OpenAI-shaped; nothing here revisits that.
+
+It is a flag on the existing endpoint rather than a second path, so authentication, the declared
+permission, the admission chain and the error envelope are literally the same code. A second route
+would have been a second place for "this endpoint is protected" to be true or forgotten.
+
+**Where the status code is decided is the whole design.** ``InferenceService.serve_stream`` returns
+a session that has already run admission, the cache lookup, the budget reservation and the first
+provider event - everything that can fail *before a byte is owed to the client*. So this route
+still answers those with an ordinary JSON error and a real status code, exactly as the unary path
+does and exactly as ``API_Streaming.md`` §2 requires. Only once the session is open does it commit
+to ``200 text/event-stream``; from that instant a failure can only be a terminal ``event: error``,
+because the status line is already sent and part of an answer is already in the client's hands.
+
+This route still decides nothing else: it does not route, price, reserve, settle, retry, touch the
+circuit breaker or know what a provider is. It frames owned events (``StreamChunk`` /
+``StreamFailed`` from ``ports/streaming.py``) as SSE lines, and that is all.
 """
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from gateway.application.authorization.requirements import declare
@@ -62,7 +86,12 @@ from gateway.application.ports.execution import ExecutionOutcome
 from gateway.application.ports.pipeline import StageContext
 from gateway.application.ports.policy import REQUEST_PAYLOAD_KEY
 from gateway.application.ports.providers import InferenceRequest
-from gateway.application.serving.inference_service import InferenceService, ServedInference
+from gateway.application.ports.streaming import InferenceStreamEvent, StreamChunk
+from gateway.application.serving.inference_service import (
+    InferenceService,
+    ServedInference,
+    ServedStream,
+)
 
 #: The permission this endpoint declares. ``AuthorizationStage`` refuses any request that declares
 #: nothing, so an endpoint without this line is denied rather than silently public (Slice 5).
@@ -82,6 +111,42 @@ class InferenceBody(BaseModel):
 
     prompt: str = Field(min_length=1)
     model: str | None = None
+    #: Phase 5 M1. Deliberately excluded from the payload the policy engine and the cache key see
+    #: (``_inference_payload``): how a response is *delivered* is not part of what was asked for,
+    #: and letting it into the cache key would give every streamed request a permanent miss
+    #: against the unary entry for the identical prompt.
+    stream: bool = False
+
+
+#: Framing headers for a streamed response (``docs/API_Streaming.md`` §1). ``X-Accel-Buffering``
+#: is not decoration: an nginx-shaped intermediary buffers a response body by default, which turns
+#: token streaming back into one delayed blob and silently undoes the entire milestone.
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+_DONE_SENTINEL = "[DONE]"
+#: The one message a streamed provider failure may carry. Identical to the unary 502's text, and
+#: for the identical reason: the provider's own error string is unbounded, provider-authored, and
+#: may quote the request back.
+_PROVIDER_FAILED = "The upstream provider failed to complete this request."
+
+
+def _error_body(
+    *, error_type: str, code: str, message: str, request_id: str, retryable: bool
+) -> dict[str, Any]:
+    """API_Error_Model.md's envelope as data, so a JSON response and a terminal SSE event cannot
+    describe the same failure two different ways."""
+    return {
+        "error": {
+            "type": error_type,
+            "code": code,
+            "message": message,
+            "request_id": request_id,
+            "retryable": retryable,
+        }
+    }
 
 
 def _error(
@@ -95,21 +160,23 @@ def _error(
 ) -> JSONResponse:
     """Render API_Error_Model.md's envelope. Never includes stage names, rules or thresholds."""
     return JSONResponse(
-        {
-            "error": {
-                "type": error_type,
-                "code": code,
-                "message": message,
-                "request_id": request_id,
-                "retryable": retryable,
-            }
-        },
+        _error_body(
+            error_type=error_type,
+            code=code,
+            message=message,
+            request_id=request_id,
+            retryable=retryable,
+        ),
         status_code=status,
     )
 
 
-def _translate_refusal(served: ServedInference, request_id: str) -> JSONResponse:
-    """An admission refusal. 403 for every case: the caller may not learn which control refused."""
+def _translate_refusal(served: ServedInference | ServedStream, request_id: str) -> JSONResponse:
+    """An admission refusal. 403 for every case: the caller may not learn which control refused.
+
+    Shared by both delivery shapes deliberately: a refusal must look identical whether or not the
+    caller asked to stream, or the flag would become a way to probe which control said no.
+    """
     return _error(
         status=403,
         error_type="permission_error",
@@ -117,6 +184,59 @@ def _translate_refusal(served: ServedInference, request_id: str) -> JSONResponse
         message=served.refusal_reason or "request was not admitted",
         request_id=request_id,
     )
+
+
+def _sse(data: str, *, event: str | None = None) -> str:
+    """One SSE frame. Chunk text is JSON-encoded, so a newline in a token cannot forge a frame."""
+    prefix = f"event: {event}\n" if event is not None else ""
+    return f"{prefix}data: {data}\n\n"
+
+
+async def _aclose(events: AsyncIterator[InferenceStreamEvent]) -> None:
+    """Close the application's event stream when framing stops, so the reservation is finalized
+    and the upstream call aborted *now* rather than whenever the loop gets around to it."""
+    closer = getattr(events, "aclose", None)
+    if closer is not None:
+        await closer()
+
+
+async def _frame(
+    events: AsyncIterator[InferenceStreamEvent], request_id: str
+) -> AsyncIterator[str]:
+    """Translate owned events into SSE frames. Adds no decision - only framing."""
+    try:
+        async for event in events:
+            if isinstance(event, StreamChunk):
+                yield _sse(json.dumps({"delta": event.content}))
+                continue
+            # A terminal failure after the status line was already sent: the only honest ending
+            # is an error event, and it carries this module's constant, never the provider's text.
+            yield _sse(
+                json.dumps(
+                    _error_body(
+                        error_type="provider_error",
+                        code="provider_failed",
+                        message=_PROVIDER_FAILED,
+                        request_id=request_id,
+                        retryable=True,
+                    )
+                ),
+                event="error",
+            )
+            return
+        yield _sse(_DONE_SENTINEL)
+    finally:
+        await _aclose(events)
+
+
+def _inference_payload(body: InferenceBody) -> dict[str, Any]:
+    """What was asked for, without how it should be delivered.
+
+    ``stream`` is a transport preference. It is excluded so the policy engine measures the same
+    request either way and - more importantly - so the cache key is identical, letting a streamed
+    request be served from an entry a unary request populated, and the reverse.
+    """
+    return body.model_dump(exclude_none=True, exclude={"stream"})
 
 
 _EXECUTION_ERRORS: dict[ExecutionOutcome, tuple[int, str, str, str, bool]] = {
@@ -141,7 +261,79 @@ _EXECUTION_ERRORS: dict[ExecutionOutcome, tuple[int, str, str, str, bool]] = {
         "No eligible provider is available for this request.",
         True,
     ),
+    # Phase 5 M2. Previously this condition escaped as an uncaught accounting exception and
+    # surfaced as a generic 500. It is not an unexpected fault: it is a deliberate fail-closed
+    # refusal, so it belongs in the taxonomy rather than in the 500 bucket.
+    #
+    # 503 ``availability_error``, per API_Error_Model.md 2 - the deployment is "not ready" to
+    # serve this model, which is exactly what a missing price-table row means, and the row's fail
+    # mode is already "closed (ADR-0009)". ``retryable`` is **false**, deliberately and unlike the
+    # other two 503s here: those clear on their own, and this one clears only when an operator
+    # changes configuration, so telling a client to back off and retry would be a lie.
+    #
+    # The message names no model, no provider and no price table: a caller must not be able to
+    # enumerate which models a deployment cannot price. Operators get the specifics from
+    # ``inference_not_accountable`` in the log and from the metric label.
+    ExecutionOutcome.NOT_ACCOUNTABLE: (
+        503,
+        "availability_error",
+        "accounting_unavailable",
+        "This request could not be accounted for and was not served.",
+        False,
+    ),
 }
+
+
+async def _stream_response(
+    service: InferenceService,
+    context: StageContext,
+    inference_request: InferenceRequest,
+    request_id: str,
+) -> Response:
+    """Serve the streamed shape. Everything answerable with a status code is answered here."""
+    served = await service.serve_stream(context, inference_request)
+
+    if not served.admitted:
+        return _translate_refusal(served, request_id)
+
+    # An admitted request always has a session (ServedStream enforces it).
+    assert served.session is not None
+    session = served.session
+
+    mapped = _EXECUTION_ERRORS.get(session.outcome)
+    if mapped is not None:
+        status, error_type, code, message, retryable = mapped
+        return _error(
+            status=status,
+            error_type=error_type,
+            code=code,
+            message=message,
+            request_id=request_id,
+            retryable=retryable,
+        )
+
+    if not session.opened:
+        # The provider failed before producing anything: no byte is owed to the client yet, so
+        # this is still an ordinary error response (API_Streaming.md §2).
+        return _error(
+            status=502,
+            error_type="provider_error",
+            code="provider_failed",
+            message=_PROVIDER_FAILED,
+            request_id=request_id,
+            retryable=True,
+        )
+
+    assert session.events is not None
+    return StreamingResponse(
+        _frame(session.events, request_id),
+        media_type="text/event-stream",
+        headers={
+            **_SSE_HEADERS,
+            "X-Request-Id": request_id,
+            "X-Cache": "hit" if session.outcome is ExecutionOutcome.CACHE_HIT else "miss",
+        },
+    )
 
 
 def build_inference_router(service: InferenceService) -> APIRouter:
@@ -149,7 +341,7 @@ def build_inference_router(service: InferenceService) -> APIRouter:
     router = APIRouter(tags=["Inference"])
 
     @router.post(INFERENCE_PATH, summary="Execute one inference request")
-    async def infer(request: Request, body: InferenceBody) -> JSONResponse:
+    async def infer(request: Request, body: InferenceBody) -> Response:
         request_id: str = getattr(request.state, "request_id", "unknown")
 
         auth = getattr(request.state, "auth", None)
@@ -164,7 +356,7 @@ def build_inference_router(service: InferenceService) -> APIRouter:
                 request_id=request_id,
             )
 
-        payload: dict[str, Any] = body.model_dump(exclude_none=True)
+        payload: dict[str, Any] = _inference_payload(body)
         context = StageContext(
             correlation_id=request_id,
             organization_id=auth.organization_id,
@@ -174,10 +366,13 @@ def build_inference_router(service: InferenceService) -> APIRouter:
                 REQUEST_PAYLOAD_KEY: payload,
             },
         )
+        inference_request = InferenceRequest(correlation_id=request_id, payload=payload)
 
-        served = await service.serve(
-            context, InferenceRequest(correlation_id=request_id, payload=payload)
-        )
+        if body.stream:
+            # Same context, same request, same admission chain - only the delivery shape differs.
+            return await _stream_response(service, context, inference_request, request_id)
+
+        served = await service.serve(context, inference_request)
 
         if not served.admitted:
             return _translate_refusal(served, request_id)

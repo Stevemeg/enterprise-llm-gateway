@@ -27,6 +27,12 @@ two evaluator classes themselves are deliberately NOT confined: they are statele
 no configuration authority, so constructing one elsewhere decides nothing (recorded as NOT
 APPLICABLE in the evidence log rather than guarded for symmetry).
 
+Phase 5 M1 extends it again, for the same reason and not by analogy: ``StreamingCoordinator``
+decides when a streamed call is settled, released or cached. A component that built its own would
+pair the deployment's budget ledger with *its* choice of cache and *its* circuit breaker - and a
+breaker that is not the shared instance is a feedback loop the HealthAgent cannot see, the exact
+defect the Slice-20 construction guard exists to prevent one layer down.
+
 A second, narrower reason ``RequestDeduplicator`` specifically needs this: it holds process-local
 in-flight state that only provides its coalescing guarantee if every caller shares the *same*
 instance. A component that constructed its own would silently defeat the guarantee for whatever
@@ -51,6 +57,7 @@ TARGETS = frozenset(
         "SqlResponseCache",
         "RequestDeduplicator",
         "InferenceCoordinator",
+        "StreamingCoordinator",
         "ReflectiveExecutor",
         "RetryPolicy",
         "EvaluationRunner",
@@ -62,6 +69,7 @@ IMPLEMENTATIONS = (
     "sql_response_cache.py",
     "deduplicator.py",
     "inference_coordinator.py",
+    "streaming_coordinator.py",
     "reflective_executor.py",
     "retry_policy.py",
     "runner.py",

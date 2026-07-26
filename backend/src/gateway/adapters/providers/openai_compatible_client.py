@@ -41,10 +41,30 @@ this module never reads an environment variable and holds no default. The key is
 ``Authorization`` header and is never logged, never placed in an error string, and never returned
 in a ``ProviderResponse`` - the only text this adapter ever attaches to a failure is its own, or a
 provider error body that the delivery layer is already forbidden to echo (Slice 17).
+
+## Phase 5 M1: the same adapter also implements ``StreamingProviderClient``
+
+One class, two ports. They are separate protocols (see ``ports/streaming.py``) because a provider
+that can do one and not the other must be expressible; they live in one adapter because the
+endpoint, the credential, the timeout, the status taxonomy and the wire format are identical - and
+duplicating them into a second class would be two spellings of one integration, drifting the first
+time a status code moved.
+
+``stream`` sends ``"stream": true`` **and** ``"stream_options": {"include_usage": true}``. The
+second is not optional politeness: without it an OpenAI-compatible server omits usage from a
+streamed response entirely, and this adapter refuses to invent it (identical discipline to
+``_usage_from``). Asking for it explicitly is what keeps "the stream ended with no usage" a genuine
+provider defect the consumer can act on rather than the normal case.
+
+A ``data:`` line that is not JSON, or whose shape is unrecognisable, ends the stream as a
+``SERVER_ERROR`` rather than being skipped. Skipping would silently drop tokens out of the middle
+of an answer that the client would then receive, concatenate and believe.
 """
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,6 +76,12 @@ from gateway.application.ports.providers import (
     ProviderResponse,
     ProviderUsage,
 )
+from gateway.application.ports.streaming import (
+    ProviderStreamEvent,
+    StreamChunk,
+    StreamCompleted,
+    StreamFailed,
+)
 from gateway.application.routing.catalog import ProviderDescriptor
 from gateway.observability.logging import get_logger
 
@@ -64,6 +90,9 @@ _logger = get_logger("providers")
 _CHAT_COMPLETIONS_PATH = "/chat/completions"
 _DEFAULT_PROMPT_KEY = "prompt"
 _MODEL_KEY = "model"
+_DATA_PREFIX = "data:"
+_DONE_SENTINEL = "[DONE]"
+_MALFORMED_EVENT = "provider returned a malformed stream event"
 
 #: HTTP status -> canonical category (ADR-0003's "normalized error taxonomy"). Anything not named
 #: here falls back by class: 5xx is a server error, any other 4xx is an invalid request.
@@ -132,6 +161,45 @@ def _content_from(payload: dict[str, Any]) -> Any:
             if isinstance(message, dict) and "content" in message:
                 return message["content"]
     return payload
+
+
+def _payload_of(line: str) -> str | None:
+    """The payload of one ``data:`` frame, or ``None`` for a line that carries no event."""
+    stripped = line.strip()
+    if not stripped.startswith(_DATA_PREFIX):
+        return None
+    return stripped[len(_DATA_PREFIX) :].strip()
+
+
+def _decode(data: str) -> dict[str, Any] | None:
+    """Parse one frame's JSON object. ``None`` means malformed - never "skip it and carry on":
+    dropping a frame out of the middle of an answer the client will concatenate and believe is
+    worse than ending the stream and saying so."""
+    try:
+        event = json.loads(data)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def _delta_from(event: dict[str, Any]) -> str:
+    """The incremental text in one streamed chunk, or ``""`` when it carries none.
+
+    An empty answer is not an error: the final ``include_usage`` chunk has an empty ``choices``
+    list, and role-only opening deltas carry no content either. Both are ordinary frames to skip,
+    which is why this returns a string rather than ``None`` for "nothing here".
+    """
+    choices = event.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    delta = first.get("delta")
+    if not isinstance(delta, dict):
+        return ""
+    content = delta.get("content")
+    return content if isinstance(content, str) else ""
 
 
 class OpenAiCompatibleProviderClient:
@@ -230,6 +298,83 @@ class OpenAiCompatibleProviderClient:
             usage=_usage_from(payload),
         )
 
+    async def stream(
+        self, provider: ProviderDescriptor, request: InferenceRequest
+    ) -> AsyncIterator[ProviderStreamEvent]:
+        """Stream an OpenAI-compatible ``/chat/completions`` response as owned events."""
+        connection = self._connections.get(provider.name)
+        if connection is None:
+            # Same reasoning as ``invoke``: configuration, not a provider fault, and not retryable.
+            _logger.error("provider_not_configured", provider=provider.name)
+            yield StreamFailed(
+                error="provider has no connection configured",
+                error_category=ProviderErrorCategory.AUTHENTICATION,
+            )
+            return
+
+        body = self._body(provider, request)
+        body["stream"] = True
+        # Without this an OpenAI-compatible server reports no usage for a streamed call at all,
+        # and this adapter will not invent any (see the module docstring).
+        body["stream_options"] = {"include_usage": True}
+
+        try:
+            async with (
+                httpx.AsyncClient(
+                    base_url=connection.base_url,
+                    timeout=connection.timeout_seconds,
+                    transport=self._transport or httpx.AsyncHTTPTransport(retries=0),
+                ) as client,
+                client.stream(
+                    "POST",
+                    _CHAT_COMPLETIONS_PATH,
+                    json=body,
+                    headers={"Authorization": f"Bearer {connection.api_key}"},
+                ) as response,
+            ):
+                if response.status_code >= 400:
+                    # Drain so the connection can be released; the body is never surfaced.
+                    await response.aread()
+                    yield self._stream_failure(
+                        provider,
+                        _category_for_status(response.status_code),
+                        f"provider returned HTTP {response.status_code}",
+                    )
+                    return
+                usage: ProviderUsage | None = None
+                async for line in response.aiter_lines():
+                    data = _payload_of(line)
+                    if data is None:
+                        # Blank separators and ``: keep-alive`` comments carry no content.
+                        continue
+                    if data == _DONE_SENTINEL:
+                        yield StreamCompleted(usage=usage)
+                        return
+                    event = _decode(data)
+                    if event is None:
+                        yield self._stream_failure(
+                            provider, ProviderErrorCategory.SERVER_ERROR, _MALFORMED_EVENT
+                        )
+                        return
+                    reported = _usage_from(event)
+                    if reported is not None:
+                        usage = reported
+                    delta = _delta_from(event)
+                    if delta:
+                        yield StreamChunk(content=delta)
+        except httpx.TimeoutException:
+            yield self._stream_failure(
+                provider, ProviderErrorCategory.TIMEOUT, "provider call timed out"
+            )
+            return
+        except httpx.HTTPError:
+            yield self._stream_failure(
+                provider, ProviderErrorCategory.SERVER_ERROR, "provider transport error"
+            )
+            return
+        # Fell off the end of the body without ``[DONE]``. No terminal event is emitted: the
+        # consumer must not be able to mistake a truncated stream for a completed one.
+
     @staticmethod
     def _failure(
         provider: ProviderDescriptor, category: ProviderErrorCategory, message: str
@@ -243,3 +388,11 @@ class OpenAiCompatibleProviderClient:
         return ProviderResponse(
             ok=False, error=message, provider=provider.name, error_category=category
         )
+
+    @staticmethod
+    def _stream_failure(
+        provider: ProviderDescriptor, category: ProviderErrorCategory, message: str
+    ) -> StreamFailed:
+        """The streaming twin of ``_failure``: one exit, so no provider text can leak."""
+        _logger.warning("provider_stream_failed", provider=provider.name, category=category.value)
+        return StreamFailed(error=message, error_category=category)

@@ -27,6 +27,7 @@ from gateway.application.ports.ledger import (
     ReservationOutcome,
     SettlementDetail,
     UnknownReservationError,
+    UnsupportedCurrencyError,
 )
 from gateway.application.ports.money import Money
 from tests.support.postgres import PG_URL, requires_postgres
@@ -459,3 +460,55 @@ async def test_a_re_held_reservation_can_be_settled_normally(
     row = await _org_budget_row(engine, org)
     assert row["spent"] == Decimal("55")
     assert row["reserved"] == Decimal("0")
+
+
+# ------------------------------------------------------------------ currency is a config defect
+
+
+async def test_reserving_in_the_wrong_currency_is_a_defect_not_a_denial(
+    engine: AsyncEngine, ledger: SqlBudgetLedger
+) -> None:
+    """This project performs no currency conversion, so a mismatch is a misconfiguration a human
+    must fix - never a budget outcome. Folding it into ``EXCEEDED`` would tell a tenant they were
+    out of money when they were not, and would hide the defect behind a plausible answer.
+
+    Phase 5 M2 moved ``UnsupportedCurrencyError`` here from the deleted Slice-8 budget layer, whose
+    tests were the only thing covering it. The guarantee outlived that layer, so its proof must
+    too - this is that proof, now against the implementation that actually raises it.
+    """
+    org = uuid4()
+    await _seed_org(engine, org)
+    await _seed_budget(engine, org, "100.00", currency="USD")
+
+    with pytest.raises(UnsupportedCurrencyError):
+        await ledger.reserve(org, "wrong-currency", _money("1.00", "EUR"))
+
+    # Nothing was held: a defect must not leave a phantom reservation behind it.
+    assert (await _org_budget_row(engine, org))["reserved"] == Decimal("0")
+
+
+async def test_settling_in_the_wrong_currency_is_a_defect_not_a_silent_conversion(
+    engine: AsyncEngine, ledger: SqlBudgetLedger
+) -> None:
+    """The actual cost arriving in a different currency from the reservation would otherwise be
+    added to ``spent`` as if the two were comparable."""
+    org = uuid4()
+    await _seed_org(engine, org)
+    await _seed_budget(engine, org, "100.00", currency="USD")
+    await ledger.reserve(org, "mismatch", _money("10.00"))
+
+    detail = SettlementDetail(
+        provider="openai",
+        model="gpt-4o",
+        prompt_tokens=1,
+        completion_tokens=1,
+        input_cost=_money("1.00", "EUR"),
+        output_cost=_money("0", "EUR"),
+        total_cost=_money("1.00", "EUR"),
+    )
+    with pytest.raises(UnsupportedCurrencyError):
+        await ledger.settle(org, "mismatch", detail)
+
+    budget = await _org_budget_row(engine, org)
+    assert budget["spent"] == Decimal("0"), "no cross-currency amount may reach spend"
+    assert budget["reserved"] == Decimal("10.00000000"), "the hold stands; nothing was settled"

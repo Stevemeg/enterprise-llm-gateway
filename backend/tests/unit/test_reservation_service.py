@@ -17,7 +17,6 @@ from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.in_memory_client import InMemoryProviderClient
 from gateway.application.accounting.cost_accountant import (
-    CostAccountant,
     MissingUsageError,
     UnknownPriceError,
 )
@@ -27,6 +26,7 @@ from gateway.application.ports.money import Money
 from gateway.application.ports.pricing import ModelPrice
 from gateway.application.ports.providers import InferenceRequest, ProviderResponse
 from gateway.application.routing.catalog import ProviderDescriptor
+from tests.support.accounting import reservation_service
 
 ORG = uuid4()
 OPENAI = ProviderDescriptor(name="openai", model="gpt-4o")
@@ -43,7 +43,7 @@ def _service(
     ledger: InMemoryBudgetLedger, prices: tuple[ModelPrice, ...] = (PRICE,)
 ) -> ReservationService:
     pricing = StaticPriceTable(prices)
-    return ReservationService(ledger, pricing, CostAccountant(pricing))
+    return reservation_service(ledger, pricing)
 
 
 def _request(correlation_id: str, prompt: str = "hello") -> InferenceRequest:

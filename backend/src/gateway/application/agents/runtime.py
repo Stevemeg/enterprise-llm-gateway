@@ -122,7 +122,6 @@ class AgentRuntime:
             decided_at=self._clock.now(),
             reasoning_steps=steps,
             selected_provider=selected,
-            selected_model=context.selected_model if selected else None,
             planner_result=context.planner,
             policy_result=context.policy,
             cost_result=context.cost,

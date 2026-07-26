@@ -105,7 +105,14 @@ _SERVED_BUCKETS: Final = (0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
 # asserted by tests so a new enum member cannot silently start reporting as "unknown".
 _STAGE_ACTIONS: Final = frozenset({"continue", "annotate", "block"})
 _EXECUTION_OUTCOMES: Final = frozenset(
-    {"cache_hit", "executed", "not_routed", "budget_denied", "budget_unavailable"}
+    {
+        "cache_hit",
+        "executed",
+        "not_routed",
+        "budget_denied",
+        "budget_unavailable",
+        "not_accountable",
+    }
 )
 #: Served outcomes are the execution outcomes plus the one terminal state that never reaches
 #: execution at all. "not_admitted" is deliberately distinct: a refusal is not an execution

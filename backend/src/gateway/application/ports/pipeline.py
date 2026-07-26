@@ -8,6 +8,28 @@ stable seam. This is it.
 
 Defines the protocol only. No stages, no pipeline runner, no execution (Rule 2: protocol before
 implementation).
+
+## Phase 5 M2: narrowed to ``before_request`` (ADR-0020, a deliberate Tier-1 contraction)
+
+This protocol originally also declared ``after_response(context)`` and ``on_error(context, error)``.
+Neither was ever invoked: ``RequestPipeline.admit`` calls ``before_request`` and nothing else, and
+all four implementations returned an inert ``CONTINUE``. They survived Slices 1-21 and Phase 5 M1 -
+the milestone most likely to need them - with zero call sites.
+
+Streaming was the honest test and it *strengthened* the case rather than rescuing the hooks.
+Streamed inferences are not evaluated because ``serve_stream`` returns while the stream is still
+open, and a post-response stage hook looks like the fix but is not: ``after_response`` receives no
+outcome, no response and no usage (``ports/evaluation.py`` records exactly this). Making it useful
+would mean widening *this* Tier-1 protocol to carry a response - the Rule 5 event against Tier 1
+that ADR-0016's freeze most directly forbids.
+
+**Invariant 5 is unchanged in substance.** One stable interception point that lets policy,
+evaluation, safety, cost checks, reflection and human approval be added without touching any
+provider, router or agent interface - that is carried entirely by ``before_request`` +
+``StageResult``. What was removed described behaviour the system never had, and a reader could
+reasonably have concluded responses pass back through the chain. They do not.
+
+Re-adding either method is a Rule 5 event that must name its active consumer first.
 """
 
 from __future__ import annotations
@@ -71,7 +93,3 @@ class PipelineStage(Protocol):
         ...
 
     async def before_request(self, context: StageContext) -> StageResult: ...
-
-    async def after_response(self, context: StageContext) -> StageResult: ...
-
-    async def on_error(self, context: StageContext, error: Exception) -> StageResult: ...

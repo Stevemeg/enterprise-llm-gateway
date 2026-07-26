@@ -8,6 +8,7 @@ constructor injection; business code never reaches back into the container.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -16,7 +17,6 @@ from gateway.adapters.audit.logging_sink import LoggingAuthAuditSink
 from gateway.adapters.audit.sql_sink import SqlAuthAuditSink
 from gateway.adapters.authorization.null_resolver import NullPermissionResolver
 from gateway.adapters.authorization.sql_resolver import SqlPermissionResolver
-from gateway.adapters.budget.in_memory_budget_store import InMemoryBudgetStore
 from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCache
 from gateway.adapters.cache.sql_response_cache import SqlResponseCache
 from gateway.adapters.catalog.sql_provider_catalog import SqlProviderCatalog
@@ -40,6 +40,7 @@ from gateway.adapters.providers.openai_compatible_client import (
     OpenAiCompatibleProviderClient,
     ProviderConnection,
 )
+from gateway.adapters.providers.unconfigured_client import UnconfiguredProviderClient
 from gateway.adapters.secrets.env_resolver import EnvSecretsResolver
 from gateway.adapters.security.jwt import JwtService
 from gateway.adapters.security.key_provider import KeyProvider
@@ -47,8 +48,8 @@ from gateway.adapters.security.keys import derive_public_pem
 from gateway.adapters.security.oidc_state import StateSigner
 from gateway.adapters.security.token_authenticator import BearerTokenAuthenticator
 from gateway.adapters.security.token_service import JwtTokenService
-from gateway.application.accounting.budget_enforcer import BudgetEnforcer
 from gateway.application.accounting.cost_accountant import CostAccountant
+from gateway.application.accounting.reservation_reconciler import ReservationReconciler
 from gateway.application.accounting.reservation_service import ReservationService
 from gateway.application.agents.cost import CostAgent
 from gateway.application.agents.health import HealthAgent
@@ -66,7 +67,6 @@ from gateway.application.execution.inference_coordinator import InferenceCoordin
 from gateway.application.pipeline.runner import RequestPipeline
 from gateway.application.ports.auth import AuthAuditSink, Authenticator
 from gateway.application.ports.authorization import PermissionResolver
-from gateway.application.ports.budget import BudgetPort
 from gateway.application.ports.cache import ResponseCachePort
 from gateway.application.ports.circuit_breaker import CircuitBreaker
 from gateway.application.ports.evaluation import Evaluator
@@ -77,13 +77,16 @@ from gateway.application.ports.providers import ProviderClient
 from gateway.application.ports.routing import RoutingEngine
 from gateway.application.ports.routing_strategy import RoutingStrategy
 from gateway.application.ports.secrets import SecretNotFoundError, SecretsResolver
+from gateway.application.ports.streaming import StreamingProviderClient
 from gateway.application.providers.provider_executor import ProviderExecutor
+from gateway.application.providers.streaming_executor import StreamingProviderExecutor
 from gateway.application.reflection.reflective_executor import ReflectiveExecutor
 from gateway.application.reflection.retry_policy import RetryPolicy
 from gateway.application.routing.catalog import InMemoryProviderCatalog, ProviderCatalog
 from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
 from gateway.application.routing.health_tiered_strategy import HealthTieredRoutingStrategy
 from gateway.application.serving.inference_service import InferenceService
+from gateway.application.streaming.streaming_coordinator import StreamingCoordinator
 from gateway.config.settings import AuthSettings, Settings
 from gateway.delivery.http.ops.health import HealthRegistry
 from gateway.observability.logging import configure_logging, get_logger
@@ -204,16 +207,18 @@ class Container:
     routing_engine: RoutingEngine
     routing_stage: AgentRoutingStage
     provider_client: ProviderClient
+    streaming_provider_client: StreamingProviderClient
     provider_executor: ProviderExecutor
+    streaming_executor: StreamingProviderExecutor
     pricing_port: PricingPort
-    budget_port: BudgetPort
     cost_accountant: CostAccountant
-    budget_enforcer: BudgetEnforcer
     ledger_port: BudgetLedgerPort
+    reservation_reconciler: ReservationReconciler
     reservation_service: ReservationService
     cache_port: ResponseCachePort
     deduplicator: RequestDeduplicator
     inference_coordinator: InferenceCoordinator
+    streaming_coordinator: StreamingCoordinator
     sleeper: Sleeper
     retry_policy: RetryPolicy
     reflective_executor: ReflectiveExecutor
@@ -326,29 +331,56 @@ class Container:
         # --- provider execution object graph (ADR-0016 Slice 7; real adapter Slice 19) ----
         # The composition root is the only place either may be built (Guard 1). Slice 19 realizes
         # ADR-0003: when connections are configured, the OpenAI-compatible HTTP adapter makes the
-        # real call. With none configured the in-memory client remains - it validates the port,
-        # and a deployment that has not been told how to reach any provider has nothing to call.
-        # Credentials are resolved here, from the secrets manager, and never leave the adapter.
+        # real call. Credentials are resolved here, from the secrets manager, and never leave the
+        # adapter.
+        #
+        # Phase 5 M1: ONE client object, bound to TWO ports. ProviderClient and
+        # StreamingProviderClient are separate protocols on purpose (a provider able to do only one
+        # must be expressible), but the adapter that can do both is one integration, and building
+        # two instances of it would open two connection pools against the same provider.
+        #
+        # Phase 5 M2: with no connections configured the fallback FAILS CLOSED. It used to be
+        # InMemoryProviderClient, which "always succeeds" and synthesizes usage - so a production
+        # deployment with a seeded catalog and no connections answered every request 200 with
+        # invented content and booked real spend for it. The synthesizing client is still
+        # available, but only to a deployment that asked for it in as many words (and never in
+        # production - the settings validator refuses).
         provider_connections = _build_provider_connections(settings, secrets)
-        provider_client: ProviderClient = (
-            OpenAiCompatibleProviderClient(provider_connections)
-            if provider_connections
-            else InMemoryProviderClient()
-        )
+        provider_client: ProviderClient
+        streaming_provider_client: StreamingProviderClient
+        if provider_connections:
+            http_client = OpenAiCompatibleProviderClient(provider_connections)
+            provider_client = http_client
+            streaming_provider_client = http_client
+        elif settings.allow_fake_provider_client:
+            get_logger("bootstrap").warning(
+                "fake_provider_client_enabled",
+                reason="no provider connections configured; inference responses are FABRICATED "
+                "and spend booked against them is not real (DEV/TEST ONLY)",
+            )
+            in_memory_client = InMemoryProviderClient()
+            provider_client = in_memory_client
+            streaming_provider_client = in_memory_client
+        else:
+            unconfigured = UnconfiguredProviderClient()
+            provider_client = unconfigured
+            streaming_provider_client = unconfigured
         provider_executor = ProviderExecutor(provider_client)
+        streaming_executor = StreamingProviderExecutor(streaming_provider_client)
 
         # --- usage/cost accounting object graph (Slice 8; durable pricing Slice 19) -------
         # The composition root is the only place any of these may be built (Guard 1). Slice 19:
         # on PostgreSQL the price list is the tenant's effective-dated price_table rows, so a
         # settled cost is reproducible against the price that was in force when the call happened
-        # (FR-074/075). The budget store still starts empty - no budgets configured means
-        # unbounded, the same "nothing configured yet" posture as before, not a defect.
+        # (FR-074/075).
+        #
+        # Phase 5 M2: BudgetPort/BudgetEnforcer/InMemoryBudgetStore were built here and called by
+        # nothing - ReservationService/BudgetLedgerPort superseded them in Slice 9. They are gone;
+        # the ledger below is the sole budget authority.
         pricing_port: PricingPort = (
             SqlPriceTable(uow_factory, clock) if rls_enabled else StaticPriceTable()
         )
-        budget_port: BudgetPort = InMemoryBudgetStore()
         cost_accountant = CostAccountant(pricing_port)
-        budget_enforcer = BudgetEnforcer(budget_port)
 
         # --- durable budget ledger / reservation object graph (ADR-0017, Slice 9) -------
         # Real reserve/commit atomicity is a PostgreSQL guarantee (row-level locking inside one
@@ -359,7 +391,16 @@ class Container:
         ledger_port: BudgetLedgerPort = (
             SqlBudgetLedger(uow_factory) if rls_enabled else InMemoryBudgetLedger()
         )
-        reservation_service = ReservationService(ledger_port, pricing_port, cost_accountant)
+        # Phase 5 M2: the crash-safety debt from Slice 9. A hold whose owner died is returned by
+        # the reconciler, which ReservationService.reserve calls for the tenant it is about to
+        # reserve for - tenant-scoped, so RLS covers it, and self-scheduling, so no background
+        # worker had to be invented to own it (see the reconciler's docstring).
+        reservation_reconciler = ReservationReconciler(
+            ledger_port, clock, timedelta(seconds=settings.reservation_ttl_seconds)
+        )
+        reservation_service = ReservationService(
+            ledger_port, pricing_port, cost_accountant, reservation_reconciler
+        )
 
         # --- response cache / request deduplication object graph (ADR-0016 Slice 10) -----
         # Same rationale as ledger_port above: the cache's tenant-isolation claim (RLS) only
@@ -372,6 +413,15 @@ class Container:
         deduplicator = RequestDeduplicator()
         inference_coordinator = InferenceCoordinator(
             cache_port, deduplicator, reservation_service, provider_executor, circuit_breaker
+        )
+
+        # --- streamed inference object graph (Phase 5 M1) --------------------------------
+        # The same cache, the same ReservationService and the same circuit breaker instance the
+        # unary path uses - streaming adds a delivery shape, not a second set of capabilities.
+        # No deduplicator: a stream is an iterator, and two callers cannot share one without one
+        # of them stealing the other's chunks (see StreamingCoordinator's docstring).
+        streaming_coordinator = StreamingCoordinator(
+            cache_port, reservation_service, streaming_executor, circuit_breaker
         )
 
         # --- reflection / bounded retry object graph (ADR-0016 Slice 11) -----------------
@@ -440,7 +490,7 @@ class Container:
         # "denied => no reservation, no provider call, no settlement" is a structural property of
         # the composition rather than a rule someone has to remember.
         inference_service = InferenceService(
-            request_pipeline, reflective_executor, evaluation_runner
+            request_pipeline, reflective_executor, evaluation_runner, streaming_coordinator
         )
 
         health = HealthRegistry(version=settings.service_version, clock=clock)
@@ -471,16 +521,18 @@ class Container:
             routing_engine=routing_engine,
             routing_stage=routing_stage,
             provider_client=provider_client,
+            streaming_provider_client=streaming_provider_client,
             provider_executor=provider_executor,
+            streaming_executor=streaming_executor,
             pricing_port=pricing_port,
-            budget_port=budget_port,
             cost_accountant=cost_accountant,
-            budget_enforcer=budget_enforcer,
             ledger_port=ledger_port,
+            reservation_reconciler=reservation_reconciler,
             reservation_service=reservation_service,
             cache_port=cache_port,
             deduplicator=deduplicator,
             inference_coordinator=inference_coordinator,
+            streaming_coordinator=streaming_coordinator,
             sleeper=sleeper,
             retry_policy=retry_policy,
             reflective_executor=reflective_executor,

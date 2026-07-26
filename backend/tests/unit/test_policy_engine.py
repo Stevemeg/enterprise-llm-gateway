@@ -283,24 +283,6 @@ async def test_tenant_context_reaches_the_engine_unchanged() -> None:
     assert seen[0].correlation_id == "c1"
 
 
-async def test_responses_are_not_re_evaluated() -> None:
-    stage = PolicyStage(LocalPolicyEngine(max_request_bytes=1))
-
-    result = await stage.after_response(_context(payload={"prompt": "x" * 500}))
-
-    assert result.action is StageAction.CONTINUE, "policy decides before the request runs"
-
-
-async def test_a_downstream_error_is_not_turned_into_a_policy_block() -> None:
-    """Converting an unrelated failure into a policy decision would put a decision nobody made
-    into the audit trail."""
-    stage = PolicyStage(LocalPolicyEngine())
-
-    result = await stage.on_error(_context(payload={"prompt": "hi"}), RuntimeError("downstream"))
-
-    assert result.action is StageAction.CONTINUE
-
-
 async def test_policy_does_not_resolve_permissions_or_consult_rbac() -> None:
     """RBAC and policy answer different questions; the stage carries no resolver and reads no
     RBAC keys, so a request with no permission declaration is still policy-evaluated normally."""

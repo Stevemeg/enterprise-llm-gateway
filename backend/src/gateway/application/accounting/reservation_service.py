@@ -2,8 +2,9 @@
 
 The piece Slice 8 explicitly could not provide: a check that runs *before* ``ProviderExecutor``
 is invoked, so a rejected reservation means the provider is never called - not merely that
-already-incurred spend gets classified afterwards (``BudgetEnforcer``'s job, unchanged, still
-valid for its own purpose).
+already-incurred spend gets classified afterwards. (Slice 8's ``BudgetEnforcer``, which did the
+latter, acquired no consumer in Phase 4 and was removed in Phase 5 M2; this is now the only budget
+gate in the system.)
 
 Not itself a port: like ``ProviderExecutor`` and ``CostAccountant``, this is a concrete
 orchestrator built in the composition root, composing real ports (``BudgetLedgerPort``,
@@ -14,10 +15,10 @@ orchestrator built in the composition root, composing real ports (``BudgetLedger
 This class does not call a provider (``ProviderExecutor``'s job) and does not compute cost from
 provider-reported usage itself (``CostAccountant``'s job, reused unchanged for the *actual* side of
 settlement). It only decides "may this proceed" before the call and "release the hold" after -
-the sequencing a caller (a future delivery-layer handler; today, tests and the container wiring
-that prove the seam per Rule 4) must perform is: ``reserve`` -> only if permitted, call
-``ProviderExecutor.execute`` -> ``settle`` on a response with usage, or ``release`` if the provider
-call failed before usage existed.
+the sequencing a caller must perform is: ``reserve`` -> only if permitted, call
+``ProviderExecutor.execute`` (or ``StreamingProviderExecutor.stream``) -> ``settle`` on a response
+with usage, or ``release`` if the provider call failed before usage existed. Both
+``InferenceCoordinator`` and ``StreamingCoordinator`` perform exactly that sequence.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from gateway.application.accounting.cost_accountant import (
     compute_cost,
 )
 from gateway.application.accounting.estimator import estimate_usage
+from gateway.application.accounting.reservation_reconciler import ReservationReconciler
 from gateway.application.ports.ledger import (
     BudgetLedgerPort,
     LedgerUnavailableError,
@@ -48,21 +50,40 @@ class ReservationService:
     """Gates a provider call against a budget, then settles or releases the hold."""
 
     def __init__(
-        self, ledger: BudgetLedgerPort, pricing: PricingPort, cost_accountant: CostAccountant
+        self,
+        ledger: BudgetLedgerPort,
+        pricing: PricingPort,
+        cost_accountant: CostAccountant,
+        reconciler: ReservationReconciler,
     ) -> None:
         self._ledger = ledger
         self._pricing = pricing
         self._cost_accountant = cost_accountant
+        self._reconciler = reconciler
 
     async def reserve(
         self, *, organization_id: UUID, provider: ProviderDescriptor, request: InferenceRequest
     ) -> ReservationResult:
         """Estimate the call's cost and atomically hold it against the org's budget.
 
-        Never raises for a ledger outage - fails closed (ADR-0009 row 1), mirroring
-        ``BudgetEnforcer.evaluate``. Raises ``UnknownPriceError`` for an unpriced model - a
-        configuration defect, never a budget denial (same reasoning as ``CostAccountant``).
+        Never raises for a ledger outage - fails closed (ADR-0009 row 1). Raises
+        ``UnknownPriceError`` for an unpriced model - a configuration defect, never a budget
+        denial (same reasoning as ``CostAccountant``).
+
+        ## Phase 5 M2: this tenant's abandoned holds are reclaimed first
+
+        Before deciding whether the tenant can afford this call, holds left behind by requests
+        that died mid-flight are returned (``ReservationReconciler`` - see its docstring for why
+        the sweep is here rather than in a scheduler this system does not have). It runs first,
+        and in its own transaction, so the headroom it recovers is visible to the reservation
+        immediately below: a tenant blocked by leaked holds is unblocked by the very request that
+        would otherwise have been refused.
+
+        The reclaim cannot make this call *more* permissive than the tenant's real state - it only
+        ever returns money that no live request is holding - and it cannot fail the call, because
+        a repair that could not run is not a reason to refuse an inference.
         """
+        await self._reconciler.reclaim(organization_id)
         price = await self._pricing.price_for(
             provider.name, provider.model, organization_id=organization_id
         )

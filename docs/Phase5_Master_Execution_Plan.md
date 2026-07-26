@@ -1,7 +1,8 @@
 # Phase 5 — Master Execution Plan (Proposed)
 
-**Status:** Proposed · not started · **Created:** 2026-07-25
-**Baseline:** `main` @ `d5d3bc2` · tag `v1.21.0-phase4-slices20-21`
+**Status:** In progress — **M1 and M2 delivered** (2026-07-26); M3-M5 not started
+**Created:** 2026-07-25 · **Baseline:** `main` @ `d5d3bc2` · tag `v1.21.0-phase4-slices20-21`
+**Implementation baseline for M1/M2:** `main` @ `863ad64` · tag `v1.21.1-phase4-closeout`
 **Subordinate to** accepted ADRs and source. ADR-0016 remains **frozen**; nothing here amends it.
 This plan is *sequencing intent*, derived from [`Phase4_Final_Architecture_Review.md`](Phase4_Final_Architecture_Review.md).
 
@@ -29,17 +30,24 @@ proven in the Phase-4 review, not a hypothetical.
 
 ### Milestone sequence (ordered by architectural dependency)
 
-| # | Milestone | Resolves | Depends on |
-|---|---|---|---|
-| P5-M1 | Streaming inference | Review §4.1 (BLOCKER) | — |
-| P5-M2 | Serving correctness & debt closure | §4.2, §4.3, §4.6 + D1/D2/D3 | M1 |
-| P5-M3 | Ingress protection | §4.5 (rate limit, size limits) | M2 |
-| P5-M4 | Distributed runtime state | §4.8 (cross-replica) + eventing | M1–M3 |
-| P5-M5 *(conditional)* | Operational readiness | §4.7 (OTel), deploy, DR | M1–M4 |
+| # | Milestone | Resolves | Depends on | Status |
+|---|---|---|---|---|
+| P5-M1 | Streaming inference | Review §4.1 (BLOCKER) | — | **Delivered** |
+| P5-M2 | Serving correctness & debt closure | §4.2, §4.3, §4.6 + D1/D2/D3 | M1 | **Delivered — all 6 items resolved.** 4 in-milestone; 2 via [ADR-0020](adr/0020-narrowing-proven-vacuous-tier-1-surface.md), written as the GP-2 stop, then **accepted and applied** before publication |
+| P5-M3 | Ingress protection | §4.5 (rate limit, size limits) | M2 | Not started |
+| P5-M4 | Distributed runtime state | §4.8 (cross-replica) + eventing | M1–M3 | Not started |
+| P5-M5 *(conditional)* | Operational readiness | §4.7 (OTel), deploy, DR | M1–M4 | Not started |
 
 ---
 
-## P5-M1 — Streaming inference
+## P5-M1 — Streaming inference · **DELIVERED**
+
+> **Outcome.** Tier-1 byte-stable. The pre-registered prediction was **half falsified**: streaming
+> is *not* an additive method on `ProviderClient` but a new capability-owned seam
+> (`StreamingProviderClient`). The commit boundary is enforced by an import contract rather than a
+> runtime flag. Pre-first-chunk *failover* is deferred with a reason (reflection retries the same
+> provider, so it is not failover). Evaluation of streams is deferred. See the evidence log.
+
 
 - **Objective.** Serve token-streamed responses end to end (provider → coordinator → HTTP), while
   preserving budget reservation, settlement, caching semantics and the circuit-breaker feed.
@@ -78,7 +86,16 @@ proven in the Phase-4 review, not a hypothetical.
   - *What would force an ADR:* a required change to any Tier-1 protocol, or a new persistent store
     for partial streams.
 
-## P5-M2 — Serving correctness & debt closure
+## P5-M2 — Serving correctness & debt closure · **DELIVERED (4 of 6; 2 deferred by governance)**
+
+> **Outcome.** Fake-client default replaced with a fail-closed client; reservation reconciliation
+> shipped **with no migration** (the schema already had `created_at` and an `expired` enum member);
+> unpriced/unaccountable calls became a typed 503 instead of a generic 500; the dead Slice-8 budget
+> layer was removed. Narrowing `PipelineStage` and removing `selected_model` are **Tier-1** changes,
+> so the milestone stopped and wrote [ADR-0020](adr/0020-narrowing-proven-vacuous-tier-1-surface.md)
+> per GP-2 rather than applying them unilaterally. That ADR was then **accepted** and the
+> contraction applied, so the published state carries an explicit Tier-1 diff. See the evidence log.
+
 
 - **Objective.** Close the correctness gaps that exist even on one node, and remove the vacuous
   architecture the review identified.

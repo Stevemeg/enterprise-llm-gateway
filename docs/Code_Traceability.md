@@ -859,3 +859,33 @@ Tests: `test_inference_endpoint.py` (23), plus `test_route_auth_coverage.py` (ex
 **Gate 1 + Gate 2 (combined, both slices present): PASS — 659 passed, 0 skipped, 97% coverage, mypy
 strict clean (236 files), import-linter 34 kept / 0 broken.** Alembic head unchanged at
 `0006_budget_ledger`; runtime role verified `app_rw`, `rolsuper=False`, `rolbypassrls=False`.
+
+
+---
+
+## Phase 5 M1 - Streaming inference
+
+| Concern | Where | Notes |
+|---|---|---|
+| Streaming seam (new port) | `application/ports/streaming.py` | `StreamingProviderClient`; owned events `StreamChunk` / `StreamCompleted` / `StreamFailed` |
+| Provider-call boundary | `application/providers/streaming_executor.py` | `StreamingProviderExecutor`; total-stream latency metric, aborts upstream on close |
+| Streamed orchestration | `application/streaming/streaming_coordinator.py` | cache -> reserve -> stream -> settle/release; owns the commit boundary |
+| Served streamed path | `application/serving/inference_service.py` | `serve_stream` + `ServedStream`; **same** `RequestPipeline` instance as `serve` |
+| Real streaming adapter | `adapters/providers/openai_compatible_client.py` | SSE reader; sends `stream_options.include_usage`; a malformed frame ends the stream |
+| Non-HTTP implementations | `adapters/providers/in_memory_client.py`, `fake_client.py` | Rule 4 second/third implementations of the new seam |
+| HTTP delivery | `delivery/http/api/inference.py` | `stream: true` on the same endpoint; SSE framing; status chosen before the body is committed |
+| Enforcement (new) | `pyproject.toml` | "streamed inference cannot retry, route, admit or authorize"; "HTTP delivery holds no infrastructure adapter" |
+| Enforcement (extended) | `scripts/check_execution_construction.py`, `scripts/check_provider_construction.py` | `StreamingCoordinator`, `StreamingProviderExecutor` |
+
+## Phase 5 M2 - Serving correctness & debt closure
+
+| Concern | Where | Notes |
+|---|---|---|
+| Fail-closed provider fallback | `adapters/providers/unconfigured_client.py` | Refuses every call; satisfies both provider ports |
+| Fake-client opt-in | `config/settings.py` | `allow_fake_provider_client`; **rejected in production** by the validator |
+| Reservation reconciliation | `application/accounting/reservation_reconciler.py` | Owns the TTL rule; called by `ReservationService.reserve` |
+| Atomic reclaim | `adapters/ledger/sql_budget_ledger.py` | `reconcile_expired`; `FOR UPDATE SKIP LOCKED`; late-settlement branch |
+| Second implementation | `adapters/ledger/in_memory_budget_ledger.py` | `reconcile_expired` + injectable `Clock` |
+| Typed accounting refusal | `application/ports/execution.py`, `application/execution/inference_coordinator.py` | `NOT_ACCOUNTABLE`; 503 `accounting_unavailable` at the route |
+| **Removed** | `application/accounting/budget_enforcer.py`, `application/ports/budget.py`, `adapters/budget/` | Superseded by `ReservationService`/`BudgetLedgerPort`; no consumer in all of Phase 4 |
+| **Tier-1 contraction (applied)** | [ADR-0020](adr/0020-narrowing-proven-vacuous-tier-1-surface.md) | `PipelineStage.after_response`/`on_error` and `RoutingDecision.selected_model` **removed** - **Accepted and applied**. Zero call sites, zero writers; pinned by `tests/unit/test_tier1_contraction_adr_0020.py` |

@@ -92,16 +92,3 @@ class AuthorizationStage:
             action=StageAction.CONTINUE,
             annotations={"stage": self.name, "authorized": True, "resource": resource},
         )
-
-    async def after_response(self, context: StageContext) -> StageResult:
-        """Authorization is decided before the request runs; responses are not re-authorized."""
-        return StageResult(action=StageAction.CONTINUE)
-
-    async def on_error(self, context: StageContext, error: Exception) -> StageResult:
-        """A downstream failure is not an authorization event.
-
-        Blocking here would be theatre - the request already ran - and converting an unrelated
-        error into an authorization denial would corrupt the audit trail with a decision that was
-        never made.
-        """
-        return StageResult(action=StageAction.CONTINUE)

@@ -120,15 +120,3 @@ class PolicyStage:
             action=StageAction.CONTINUE,
             annotations={"stage": self._name, "policy_allowed": True, "rule": verdict.rule},
         )
-
-    async def after_response(self, context: StageContext) -> StageResult:
-        """Policy is decided before the request runs; responses are not re-evaluated."""
-        return StageResult(action=StageAction.CONTINUE)
-
-    async def on_error(self, context: StageContext, error: Exception) -> StageResult:
-        """A downstream failure is not a policy event.
-
-        Converting an unrelated error into a policy block would put a decision nobody made into
-        the audit trail - the same reasoning ``AuthorizationStage.on_error`` records.
-        """
-        return StageResult(action=StageAction.CONTINUE)

@@ -36,8 +36,6 @@ from gateway.adapters.policy.local_policy_engine import LocalPolicyEngine
 from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.in_memory_client import InMemoryProviderClient
 from gateway.adapters.security.key_provider import KeyProvider
-from gateway.application.accounting.cost_accountant import CostAccountant
-from gateway.application.accounting.reservation_service import ReservationService
 from gateway.application.agents.cost import CostAgent
 from gateway.application.agents.health import HealthAgent
 from gateway.application.agents.planner import PlannerAgent
@@ -51,15 +49,18 @@ from gateway.application.execution.inference_coordinator import InferenceCoordin
 from gateway.application.pipeline.runner import RequestPipeline
 from gateway.application.ports.pricing import ModelPrice
 from gateway.application.providers.provider_executor import ProviderExecutor
+from gateway.application.providers.streaming_executor import StreamingProviderExecutor
 from gateway.application.reflection.reflective_executor import ReflectiveExecutor
 from gateway.application.reflection.retry_policy import RetryPolicy
 from gateway.application.routing.catalog import ProviderDescriptor
 from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
 from gateway.application.serving.inference_service import InferenceService
+from gateway.application.streaming.streaming_coordinator import StreamingCoordinator
 from gateway.delivery.http.api.inference import INFERENCE_PERMISSION
 from gateway.delivery.http.app import build_http_app
 from gateway.delivery.http.ops.health import HealthRegistry
 from tests.conftest import FixedClock
+from tests.support.accounting import reservation_service
 
 _PROVIDER = ProviderDescriptor(name="openai", model="gpt-4o")
 _PRICE = ModelPrice(
@@ -112,13 +113,14 @@ def _permissive_inference_service() -> InferenceService:
     """
     clock = FixedClock()
     pricing = StaticPriceTable([_PRICE])
+    cache = InMemoryResponseCache(clock)
+    breaker = InMemoryCircuitBreaker(clock)
+    reservation = reservation_service(InMemoryBudgetLedger(), pricing)
+    client = InMemoryProviderClient()
     coordinator = InferenceCoordinator(
-        InMemoryResponseCache(clock),
-        RequestDeduplicator(),
-        ReservationService(InMemoryBudgetLedger(), pricing, CostAccountant(pricing)),
-        ProviderExecutor(InMemoryProviderClient()),
-        InMemoryCircuitBreaker(clock),
+        cache, RequestDeduplicator(), reservation, ProviderExecutor(client), breaker
     )
+    streaming = StreamingCoordinator(cache, reservation, StreamingProviderExecutor(client), breaker)
     runtime = AgentRuntime(
         [PlannerAgent(), PolicyAgent(), CostAgent(), HealthAgent(), ProviderAgent()], clock
     )
@@ -132,6 +134,7 @@ def _permissive_inference_service() -> InferenceService:
         ),
         ReflectiveExecutor(coordinator, RetryPolicy(max_attempts=1), _NoSleep()),
         EvaluationRunner([ResponseCompletenessEvaluator()]),
+        streaming,
     )
 
 

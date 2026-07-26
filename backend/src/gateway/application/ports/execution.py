@@ -22,6 +22,27 @@ alternative would have been to weaken a contract to accommodate a misplaced type
 **This is a relocation, not a protocol change.** No member was added, removed or renamed and no
 semantics changed, so Rule 5 is not triggered; it is a defect in prior-slice code that this
 slice's first real integration exposed.
+
+## Rule 5 event (Phase 5 M2): ``NOT_ACCOUNTABLE`` added
+
+**Active consumer:** ``delivery/http/api/inference.py`` - it must choose an HTTP status, and it
+had no way to express "the gateway refused because it could not account for this call". The
+condition therefore escaped as an uncaught ``UnknownPriceError`` and surfaced as a **generic 500**:
+an operator saw an unexplained server fault, and a caller saw an unexplained server fault, for what
+is in fact a deliberate fail-closed refusal caused by a missing price-table row.
+
+**Why the existing vocabulary was insufficient:** every other member is either "it ran" or a
+*named* reason it did not. Reusing ``BUDGET_DENIED`` would tell a tenant they were out of money
+when they were not; reusing ``NOT_ROUTED`` would blame routing for a decision routing made
+correctly. Both would be the delivery layer reading a fabricated cause.
+
+**Why the change does not belong in the consumer instead:** the delivery layer cannot import
+``application.accounting`` (import-linter, Slice 17), so it structurally cannot catch the
+accounting exception and classify it itself - and it should not, because "was this call
+accountable" is decided where the call is coordinated, not where its result is rendered.
+
+Capability-owned vocabulary, so this is a Rule 5 event recorded in the evidence log, not a new
+ADR. Additive: every existing member and every existing consumer branch is unchanged.
 """
 
 from __future__ import annotations
@@ -38,3 +59,9 @@ class ExecutionOutcome(StrEnum):
     NOT_ROUTED = "not_routed"
     BUDGET_DENIED = "budget_denied"
     BUDGET_UNAVAILABLE = "budget_unavailable"
+    #: The gateway could not price or account for this call, so it refused to serve it - an
+    #: unpriced provider/model before the call, or usage the provider never reported after it.
+    #: A **configuration or provider defect**, never a statement about the tenant's budget, and
+    #: deliberately one member rather than two: the caller must not learn which, and the operator
+    #: learns which from the log line and the metric, not from the response.
+    NOT_ACCOUNTABLE = "not_accountable"

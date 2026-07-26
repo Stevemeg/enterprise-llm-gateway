@@ -44,6 +44,25 @@ Reflection may make several attempts, each reserving and settling under its own 
 identity (Slice 11). Evaluation is handed ``reflection.final`` once, after the loop has finished.
 Evaluating per attempt would count one logical request several times and would report a transient
 failure that a retry already recovered from as a quality problem.
+
+## Phase 5 M1: one admission path, two delivery shapes
+
+``serve_stream`` is the streamed counterpart of ``serve``. It is a second **method**, not a second
+service, and that is the point: it runs the *same* ``RequestPipeline`` instance, in the same order,
+and reads the routing result back with the same ``_routing_execution``. "Denied at admission means
+no reservation, no provider call, no settlement and no cache write" is therefore one property of
+one composition rather than the same claim asserted twice about two chains that could drift apart.
+
+Two things the streamed path deliberately does **not** do:
+
+* **It does not reflect.** Retry is the unary path's; a stream cannot be replayed once output has
+  escaped, and this service could not tell the difference from outside. ``StreamingCoordinator``'s
+  docstring records why the boundary is structural rather than a runtime flag.
+* **It does not evaluate.** Evaluation observes a *completed* inference: it needs the outcome, the
+  response and the usage together (``ports/evaluation.py``). This method returns while the stream
+  is still open, so there is nothing completed to hand an evaluator. Attaching one would require a
+  completion callback that nothing owns and nothing asks for - so it is recorded as a limitation
+  rather than approximated with a verdict about a response nobody has seen yet.
 """
 
 from __future__ import annotations
@@ -58,6 +77,7 @@ from gateway.application.ports.pipeline import StageContext
 from gateway.application.ports.providers import InferenceRequest
 from gateway.application.ports.routing import ROUTING_EXECUTION_KEY, RoutingExecution
 from gateway.application.reflection.reflective_executor import ReflectionResult, ReflectiveExecutor
+from gateway.application.streaming.streaming_coordinator import StreamingCoordinator, StreamSession
 from gateway.observability.metrics import NOT_ADMITTED, record_served_request
 
 
@@ -101,6 +121,34 @@ class ServedInference:
         return self.admission.reason
 
 
+@dataclass(frozen=True, slots=True)
+class ServedStream:
+    """The streamed counterpart of ``ServedInference``: an admission verdict plus, if admitted,
+    the opened ``StreamSession``.
+
+    ``session`` is ``None`` exactly when the request was refused - the same "absent rather than
+    synthesized" discipline ``ServedInference`` applies, and for the same reason: a refusal must
+    not be readable as a provider failure or an empty stream.
+    """
+
+    admission: AdmissionOutcome
+    session: StreamSession | None = None
+
+    def __post_init__(self) -> None:
+        if self.admission.admitted and self.session is None:
+            raise ValueError("an admitted request must record a stream session")
+        if not self.admission.admitted and self.session is not None:
+            raise ValueError("a refused request cannot have opened a stream")
+
+    @property
+    def admitted(self) -> bool:
+        return self.admission.admitted
+
+    @property
+    def refusal_reason(self) -> str | None:
+        return self.admission.reason
+
+
 class InferenceService:
     """Serves one inference request: admit, execute if admitted, then evaluate what happened."""
 
@@ -109,10 +157,12 @@ class InferenceService:
         pipeline: RequestPipeline,
         executor: ReflectiveExecutor,
         evaluation_runner: EvaluationRunner,
+        streaming_coordinator: StreamingCoordinator,
     ) -> None:
         self._pipeline = pipeline
         self._executor = executor
         self._evaluation_runner = evaluation_runner
+        self._streaming_coordinator = streaming_coordinator
 
     async def serve(self, context: StageContext, request: InferenceRequest) -> ServedInference:
         """Run the admission chain, and only on admission the execution and evaluation path."""
@@ -143,6 +193,29 @@ class InferenceService:
             outcome=reflection.final.outcome.value, duration_seconds=time.monotonic() - started
         )
         return ServedInference(admission=admission, reflection=reflection, evaluation=evaluation)
+
+    async def serve_stream(self, context: StageContext, request: InferenceRequest) -> ServedStream:
+        """Run the same admission chain, and only on admission open a provider stream.
+
+        The recorded duration is admission through the **first event**, not the whole stream: this
+        method returns while the stream is still open, so a whole-stream duration would need a
+        completion callback nothing owns. Time-to-first-byte is the honest thing to measure from
+        here, and it is the number this path exists to improve.
+        """
+        started = time.monotonic()
+
+        admission = await self._pipeline.admit(context)
+        if not admission.admitted:
+            # Same line, same guarantee as ``serve``: nothing below runs for a refused request.
+            record_served_request(outcome=NOT_ADMITTED, duration_seconds=time.monotonic() - started)
+            return ServedStream(admission=admission)
+
+        execution = self._routing_execution(admission)
+        session = await self._streaming_coordinator.open(execution, request)
+        record_served_request(
+            outcome=session.outcome.value, duration_seconds=time.monotonic() - started
+        )
+        return ServedStream(admission=admission, session=session)
 
     @staticmethod
     def _routing_execution(admission: AdmissionOutcome) -> RoutingExecution:

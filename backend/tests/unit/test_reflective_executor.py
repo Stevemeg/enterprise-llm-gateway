@@ -20,8 +20,6 @@ from gateway.adapters.health.in_memory_circuit_breaker import InMemoryCircuitBre
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.fake_client import FakeProviderClient
-from gateway.application.accounting.cost_accountant import CostAccountant
-from gateway.application.accounting.reservation_service import ReservationService
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import (
     InferenceCoordinator,
@@ -46,6 +44,7 @@ from gateway.application.reflection.reflective_executor import (
 from gateway.application.reflection.retry_policy import RetryPolicy, RetryVerdict
 from gateway.application.routing.catalog import ProviderDescriptor
 from gateway.domain.routing.models import ReasoningStep, RoutingDecision, RoutingOutcome
+from tests.support.accounting import reservation_service
 
 ORG = uuid4()
 OPENAI = ProviderDescriptor(name="openai", model="gpt-4o")
@@ -81,7 +80,6 @@ def _decision(outcome: RoutingOutcome) -> RoutingDecision:
         decided_at=datetime(2026, 7, 23, 12, 0, 0, tzinfo=UTC),
         reasoning_steps=(ReasoningStep(agent="provider", summary="stub"),),
         selected_provider="openai" if outcome is RoutingOutcome.SELECTED else None,
-        selected_model="gpt-4o" if outcome is RoutingOutcome.SELECTED else None,
     )
 
 
@@ -124,7 +122,7 @@ def _build(
     coordinator = InferenceCoordinator(
         cache,
         RequestDeduplicator(),
-        ReservationService(ledger, pricing, CostAccountant(pricing)),
+        reservation_service(ledger, pricing),
         ProviderExecutor(client),
         InMemoryCircuitBreaker(FixedClock()),
     )

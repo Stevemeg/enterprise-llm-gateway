@@ -181,12 +181,6 @@ async def test_resolvers_satisfy_the_port(impl: PermissionResolver) -> None:
     assert await impl.resolve(uuid4(), uuid4()) == frozenset()
 
 
-async def test_lifecycle_methods_never_reauthorize() -> None:
-    stage = AuthorizationStage(resolver())
-    assert (await stage.after_response(ctx())).action is StageAction.CONTINUE
-    assert (await stage.on_error(ctx(), RuntimeError("downstream"))).action is StageAction.CONTINUE
-
-
 # --------------------------------------------------------------------- declaration ownership
 
 

@@ -12,6 +12,7 @@ negative case checks the downstream side effects that must not have occurred.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -32,8 +33,6 @@ from gateway.adapters.pipeline.routing_stage import AgentRoutingStage
 from gateway.adapters.policy.local_policy_engine import LocalPolicyEngine
 from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.fake_client import FakeProviderClient
-from gateway.application.accounting.cost_accountant import CostAccountant
-from gateway.application.accounting.reservation_service import ReservationService
 from gateway.application.agents.cost import CostAgent
 from gateway.application.agents.health import HealthAgent
 from gateway.application.agents.planner import PlannerAgent
@@ -54,17 +53,26 @@ from gateway.application.ports.providers import (
     ProviderResponse,
     ProviderUsage,
 )
+from gateway.application.ports.streaming import (
+    ProviderStreamEvent,
+    StreamChunk,
+    StreamCompleted,
+    StreamFailed,
+)
 from gateway.application.providers.provider_executor import ProviderExecutor
+from gateway.application.providers.streaming_executor import StreamingProviderExecutor
 from gateway.application.reflection.reflective_executor import ReflectiveExecutor
 from gateway.application.reflection.retry_policy import RetryPolicy
 from gateway.application.routing.catalog import InMemoryProviderCatalog, ProviderDescriptor
 from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
 from gateway.application.serving.inference_service import InferenceService
+from gateway.application.streaming.streaming_coordinator import StreamingCoordinator
 from gateway.delivery.http.api.inference import INFERENCE_PATH, INFERENCE_PERMISSION
 from gateway.delivery.http.app import build_http_app
 from gateway.delivery.http.ops.health import HealthRegistry
 from gateway.domain.auth.errors import CredentialInvalidError
 from gateway.domain.auth.models import Principal, PrincipalType
+from tests.support.accounting import reservation_service
 
 ORG = uuid4()
 PRINCIPAL = uuid4()
@@ -128,6 +136,7 @@ class SpyLedger:
         self.reserved: list[str] = []
         self.settled: list[str] = []
         self.released: list[str] = []
+        self.reconciled: list[UUID] = []
 
     @property
     def touched(self) -> bool:
@@ -144,6 +153,10 @@ class SpyLedger:
     async def release(self, organization_id: UUID, correlation_id: str) -> None:
         self.released.append(correlation_id)
         await self._inner.release(organization_id, correlation_id)
+
+    async def reconcile_expired(self, organization_id: UUID, *, older_than: datetime) -> int:
+        self.reconciled.append(organization_id)
+        return await self._inner.reconcile_expired(organization_id, older_than=older_than)
 
 
 class SpyRoutingEngine:
@@ -184,24 +197,36 @@ class Harness:
         limit: Money | None = None,
         candidates: list[ProviderDescriptor] | None = None,
         with_auth: bool = True,
+        stream_events: list[ProviderStreamEvent] | None = None,
+        unpriced: bool = False,
     ) -> None:
         clock = FixedClock()
-        self.client_spy = SpyProviderClient(
-            FakeProviderClient(
-                sequence=responses
-                or [ProviderResponse(ok=True, content="hi", provider="openai", usage=_usage())]
-            )
+        self.client = FakeProviderClient(
+            sequence=responses
+            or [ProviderResponse(ok=True, content="hi", provider="openai", usage=_usage())],
+            stream_events=stream_events
+            if stream_events is not None
+            else [StreamChunk(content="he"), StreamChunk(content="llo"), StreamCompleted(_usage())],
         )
+        self.client_spy = SpyProviderClient(self.client)
         self.ledger = SpyLedger(
             InMemoryBudgetLedger({ORG: limit or Money(Decimal("100.00"), "USD")})
         )
-        pricing = StaticPriceTable([PRICE])
+        pricing = StaticPriceTable([] if unpriced else [PRICE])
+        cache = InMemoryResponseCache(clock)
+        breaker = InMemoryCircuitBreaker(clock)
+        reservation = reservation_service(self.ledger, pricing)
         coordinator = InferenceCoordinator(
-            InMemoryResponseCache(clock),
+            cache,
             RequestDeduplicator(),
-            ReservationService(self.ledger, pricing, CostAccountant(pricing)),
+            reservation,
             ProviderExecutor(self.client_spy),
-            InMemoryCircuitBreaker(clock),
+            breaker,
+        )
+        # Phase 5 M1: the same cache, ledger and breaker back the streamed shape, so a test can
+        # assert that a streamed request spends and caches exactly like the unary one.
+        streaming = StreamingCoordinator(
+            cache, reservation, StreamingProviderExecutor(self.client), breaker
         )
         runtime = AgentRuntime(
             [PlannerAgent(), PolicyAgent(), CostAgent(), HealthAgent(), ProviderAgent()], clock
@@ -230,6 +255,7 @@ class Harness:
             EvaluationRunner(
                 [ResponseCompletenessEvaluator(), UsageAccountingConsistencyEvaluator()]
             ),
+            streaming,
         )
         self.app = build_http_app(
             service_name="test",
@@ -485,3 +511,196 @@ def test_only_post_is_accepted(method: str) -> None:
         INFERENCE_PATH, headers={"Authorization": f"Bearer {GOOD_TOKEN}"}
     )
     assert response.status_code == 405
+
+
+# --- streamed delivery (Phase 5 M1) --------------------------------------------------------
+
+
+def _frames(raw: str) -> list[str]:
+    """The ``data:`` payloads of an SSE body, in order."""
+    return [line[len("data:") :].strip() for line in raw.splitlines() if line.startswith("data:")]
+
+
+def test_a_streamed_request_returns_sse_and_settles_like_a_unary_one() -> None:
+    """The happy path end to end: real app, real middleware, real admission chain, real ledger.
+    The stream ends with [DONE] and the budget shows one settlement, not a lingering hold."""
+    harness = Harness()
+
+    response = harness.post({"prompt": "hello", "stream": True})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-cache"] == "miss"
+    frames = _frames(response.text)
+    assert [json.loads(f)["delta"] for f in frames[:-1]] == ["he", "llo"]
+    assert frames[-1] == "[DONE]"
+    assert harness.ledger.settled
+    assert harness.ledger.released == []
+
+
+def test_the_stream_flag_never_reaches_the_provider_payload_or_the_cache_key() -> None:
+    """A streamed and a unary request for the same prompt are the same question. The second one
+    is therefore served from the entry the first populated - proof the flag stayed out of the key
+    (and out of what the policy engine measures)."""
+    harness = Harness()
+
+    streamed = harness.post({"prompt": "hello", "stream": True})
+    assert streamed.status_code == 200
+
+    unary = harness.post({"prompt": "hello"})
+
+    assert unary.status_code == 200
+    assert unary.json()["cached"] is True
+    # One provider call in total. The unary spy - which wraps ``invoke`` - was never touched,
+    # because the second request was answered from the entry the stream wrote.
+    assert harness.client_spy.called is False
+    assert len(harness.client.stream_calls) == 1
+
+
+def test_a_cache_hit_is_streamed_as_one_chunk_without_calling_the_provider() -> None:
+    harness = Harness()
+    assert harness.post({"prompt": "hello", "stream": True}).status_code == 200
+
+    response = harness.post({"prompt": "hello", "stream": True})
+
+    assert response.status_code == 200
+    assert response.headers["x-cache"] == "hit"
+    frames = _frames(response.text)
+    assert [json.loads(f)["delta"] for f in frames[:-1]] == ["hello"]
+    assert len(harness.client.stream_calls) == 1  # still just the first request's call
+
+
+def test_a_failure_before_the_first_chunk_is_a_502_not_a_stream() -> None:
+    """Nothing was owed to the client yet, so the caller gets a status code and a JSON body -
+    exactly what API_Streaming.md 2 requires for an error before the first byte."""
+    harness = Harness(
+        stream_events=[StreamFailed(error="upstream exploded: key sk-secret", error_category=None)]
+    )
+
+    response = harness.post({"prompt": "hello", "stream": True})
+
+    assert response.status_code == 502
+    body = response.json()["error"]
+    assert body["type"] == "provider_error"
+    assert "sk-secret" not in response.text
+    assert harness.ledger.released != []
+
+
+def test_a_failure_after_the_first_chunk_is_a_terminal_event_not_a_status_code() -> None:
+    """Committed. The status line is already 200, so the only honest ending is an error event -
+    and the provider's own text must not travel in it."""
+    harness = Harness(
+        stream_events=[
+            StreamChunk(content="partial "),
+            StreamFailed(error="provider said sk-secret", error_category=None),
+        ]
+    )
+
+    response = harness.post({"prompt": "hello", "stream": True})
+
+    assert response.status_code == 200
+    assert "event: error" in response.text
+    assert "sk-secret" not in response.text
+    assert json.loads(_frames(response.text)[-1])["error"]["type"] == "provider_error"
+    assert harness.ledger.released != []
+    assert harness.ledger.settled == []
+
+
+def test_a_streamed_request_that_is_not_admitted_is_refused_before_anything_runs() -> None:
+    """The same 403 a unary refusal produces, and no routing, no provider, no ledger."""
+    harness = Harness(grant=False)
+
+    response = harness.post({"prompt": "hello", "stream": True})
+
+    assert response.status_code == 403
+    assert response.json()["error"]["type"] == "permission_error"
+    assert harness.routing.called is False
+    assert harness.client.stream_calls == []
+    assert harness.ledger.touched is False
+
+
+def test_a_streamed_request_over_budget_is_402_and_never_streams() -> None:
+    harness = Harness(limit=Money(Decimal("0.000001"), "USD"))
+
+    response = harness.post({"prompt": "hello", "stream": True})
+
+    assert response.status_code == 402
+    assert response.json()["error"]["type"] == "budget_error"
+    assert harness.client.stream_calls == []
+
+
+def test_a_streamed_request_with_nothing_routable_is_503_and_never_streams() -> None:
+    harness = Harness(candidates=[])
+
+    response = harness.post({"prompt": "hello", "stream": True})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["type"] == "availability_error"
+    assert harness.client.stream_calls == []
+
+
+def test_an_unauthenticated_streamed_request_is_refused_like_any_other() -> None:
+    """The flag must not be a way around the one control the route itself owns."""
+    harness = Harness()
+
+    response = harness.post({"prompt": "hello", "stream": True}, token=None)
+
+    assert response.status_code == 401
+    assert harness.routing.called is False
+    assert harness.client.stream_calls == []
+
+
+# --- accounting defects are typed refusals, not 500s (Phase 5 M2) --------------------------
+
+
+def test_an_unpriced_model_is_a_typed_503_not_a_generic_500() -> None:
+    """Before M2 this escaped as an uncaught accounting exception and surfaced as a generic 500 -
+    telling the caller nothing and the operator nothing. It is a deliberate fail-closed refusal,
+    so it belongs in the taxonomy."""
+    harness = Harness(unpriced=True)
+
+    response = harness.post()
+
+    assert response.status_code == 503
+    body = response.json()["error"]
+    assert body["type"] == "availability_error"
+    assert body["code"] == "accounting_unavailable"
+    # Retrying cannot help until an operator adds a price, so the client is not told to retry.
+    assert body["retryable"] is False
+
+
+def test_an_unpriced_model_books_no_spend_and_never_calls_a_provider() -> None:
+    """The refusal happens at the budget gate, which prices the call - so the provider is never
+    reached and nothing is held."""
+    harness = Harness(unpriced=True)
+
+    harness.post()
+
+    assert harness.client_spy.called is False
+    assert harness.ledger.reserved == []
+    assert harness.ledger.settled == []
+
+
+def test_an_unpriced_model_discloses_no_pricing_configuration() -> None:
+    """A caller must not be able to enumerate which models this deployment cannot price."""
+    harness = Harness(unpriced=True)
+
+    response = harness.post()
+
+    lowered = response.text.lower()
+    assert "price" not in lowered
+    assert "gpt-4o" not in lowered
+    assert "openai" not in lowered
+
+
+def test_a_streamed_unpriced_model_is_the_same_typed_503() -> None:
+    """Both delivery shapes must refuse identically, or the stream flag would be a way to get a
+    different answer out of the same misconfiguration."""
+    harness = Harness(unpriced=True)
+
+    response = harness.post({"prompt": "hello", "stream": True})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "accounting_unavailable"
+    assert harness.client.stream_calls == []

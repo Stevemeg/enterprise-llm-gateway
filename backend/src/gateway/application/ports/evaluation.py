@@ -21,13 +21,16 @@ time it runs there is nothing left to change.
 reasons, both concrete rather than stylistic:
 
 1. **Evaluation is post-hoc, not interception.** It needs the *finished* execution result -
-   outcome, response, usage. A stage's ``after_response`` would have to smuggle that through
-   ``StageContext.attributes``, which is typed ``dict[str, Any]`` and documented as opaque by
-   contract. Passing a rich typed result through an untyped bag would convert a checked contract
-   into a convention, which is exactly what Rule 3 exists to prevent.
-2. **No pipeline runner exists yet.** Nothing in this codebase executes a chain of stages around an
-   inference. Implementing ``PipelineStage`` today would produce an abstraction with no executor -
-   a seam consumed by nothing (Rule 4).
+   outcome, response, usage - and the stage seam carries none of them. A response-phase hook was
+   considered and **removed** in Phase 5 M2 (ADR-0020) precisely because it could not: it received
+   only a ``StageContext``, so a rich typed result would have had to travel through
+   ``StageContext.attributes``, typed ``dict[str, Any]`` and documented as opaque by contract.
+   Passing a checked contract through an untyped bag is exactly what Rule 3 exists to prevent, and
+   Phase 5 M1's streaming work re-confirmed the conclusion rather than overturning it.
+2. **The stage seam intercepts a request in flight; evaluation observes one that has finished.**
+   ``RequestPipeline`` runs ``before_request`` and nothing else, by design. Implementing
+   ``PipelineStage`` for evaluation would mean asking the admission chain to do a job that happens
+   strictly after it.
 
 The stage seam remains available and untouched for capabilities that genuinely intercept a request
 in flight - which is precisely what Slice 13's policy stage does.

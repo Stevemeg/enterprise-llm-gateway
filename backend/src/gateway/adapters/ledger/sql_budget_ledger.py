@@ -42,12 +42,14 @@ else in this codebase.
 Any unexpected database error (lost connection, deadlock, etc.) is translated to
 ``LedgerUnavailableError`` - fail closed (ADR-0009 row 1). A currency mismatch between the
 estimated/actual cost and the org's configured budget currency is a **configuration defect**,
-reusing ``UnsupportedCurrencyError`` from ``application/ports/budget.py`` (the same fact
-``BudgetEnforcer`` already guards - Rule 3: one shared concept, one shared exception type).
+reusing ``UnsupportedCurrencyError`` from this port's own module (Phase 5 M2 moved it there when the
+superseded Slice-8 budget layer that used to own it was removed - see ``ports/ledger.py``).
 """
 
 from __future__ import annotations
 
+from datetime import datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import RowMapping, func, insert, select, text, update
@@ -57,7 +59,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gateway.adapters.persistence.ledger_tables import budget_reservation, cost_ledger, org_budget
 from gateway.adapters.persistence.uow import UnitOfWorkFactory
-from gateway.application.ports.budget import UnsupportedCurrencyError
 from gateway.application.ports.ledger import (
     BudgetLedgerPort,
     LedgerUnavailableError,
@@ -65,12 +66,18 @@ from gateway.application.ports.ledger import (
     ReservationResult,
     SettlementDetail,
     UnknownReservationError,
+    UnsupportedCurrencyError,
 )
 from gateway.application.ports.money import Money
 
 _RELEASED = "released"
 _COMMITTED = "committed"
-_TERMINAL_STATUSES = (_COMMITTED, _RELEASED)
+_EXPIRED = "expired"
+_RESERVED = "reserved"
+#: Statuses whose hold has already left ``org_budget.reserved``. Releasing one again would hand
+#: back money that was handed back once already, so every branch that could subtract checks this
+#: set - and ``expired`` joined it in Phase 5 M2, the moment anything could actually write it.
+_HOLD_ALREADY_RETURNED = (_COMMITTED, _RELEASED, _EXPIRED)
 
 
 class SqlBudgetLedger(BudgetLedgerPort):
@@ -158,12 +165,16 @@ class SqlBudgetLedger(BudgetLedgerPort):
                     .mappings()
                     .first()
                 )
-                if existing is not None and existing["status"] != _RELEASED:
+                if existing is not None and existing["status"] not in (_RELEASED, _EXPIRED):
                     await uow.commit()
                     # Idempotent replay: the original decision stands, never re-evaluated. Only
                     # a *live* ("reserved") or already-settled ("committed") row replays - a
-                    # RELEASED row is deliberately excluded and falls through to be re-held
-                    # below, because its hold was already given back to the budget.
+                    # RELEASED or EXPIRED row is deliberately excluded and falls through to be
+                    # re-held below, because its hold was already given back to the budget.
+                    # ``expired`` was added to that exclusion in Phase 5 M2: reconciliation is the
+                    # first thing that can produce the status, and replaying one would report
+                    # RESERVED while holding nothing - the identical phantom-hold defect the
+                    # Slice-11 analysis found for ``released``.
                     return ReservationResult(
                         outcome=ReservationOutcome.RESERVED,
                         organization_id=organization_id,
@@ -286,10 +297,10 @@ class SqlBudgetLedger(BudgetLedgerPort):
                         f"correlation_id={correlation_id!r} was never reserved for org "
                         f"{organization_id}"
                     )
-                if row["status"] == "committed":
+                if row["status"] == _COMMITTED:
                     await uow.commit()
                     return  # idempotent replay - already settled, never double-book
-                if row["status"] in _TERMINAL_STATUSES:
+                if row["status"] == _RELEASED:
                     raise UnknownReservationError(
                         f"correlation_id={correlation_id!r} cannot be settled - reservation is "
                         f"already {row['status']!r}"
@@ -301,13 +312,21 @@ class SqlBudgetLedger(BudgetLedgerPort):
                         f"{correlation_id!r}"
                     )
 
+                # Phase 5 M2 - a LATE settlement against an expired reservation. The tokens were
+                # really consumed, so the spend is booked; but reconciliation already returned the
+                # hold, so ``reserved`` must not be decremented a second time. Doing so would
+                # drive it below what is actually held and, at the boundary, past the
+                # ``org_budget_reserved_ck`` floor of zero - turning an ordinary late settlement
+                # into a constraint violation.
+                budget_values: dict[str, object] = {
+                    "spent": org_budget.c.spent + detail.total_cost.amount
+                }
+                if row["status"] == _RESERVED:
+                    budget_values["reserved"] = org_budget.c.reserved - row["estimated_cost"]
                 await session.execute(
                     update(org_budget)
                     .where(org_budget.c.organization_id == organization_id)
-                    .values(
-                        reserved=org_budget.c.reserved - row["estimated_cost"],
-                        spent=org_budget.c.spent + detail.total_cost.amount,
-                    )
+                    .values(**budget_values)
                 )
                 await session.execute(
                     update(budget_reservation)
@@ -373,9 +392,9 @@ class SqlBudgetLedger(BudgetLedgerPort):
                         f"correlation_id={correlation_id!r} was never reserved for org "
                         f"{organization_id}"
                     )
-                if row["status"] in _TERMINAL_STATUSES:
+                if row["status"] in _HOLD_ALREADY_RETURNED:
                     await uow.commit()
-                    return  # idempotent no-op
+                    return  # idempotent no-op - including for a hold reconciliation reclaimed
 
                 await session.execute(
                     update(org_budget)
@@ -385,7 +404,7 @@ class SqlBudgetLedger(BudgetLedgerPort):
                 await session.execute(
                     update(budget_reservation)
                     .where(budget_reservation.c.id == row["id"])
-                    .values(status="released", settled_at=func.now())
+                    .values(status=_RELEASED, settled_at=func.now())
                 )
                 await uow.commit()
         except (LedgerUnavailableError, UnknownReservationError):
@@ -396,4 +415,78 @@ class SqlBudgetLedger(BudgetLedgerPort):
             # database that refuses the TCP connection outright is exactly as unavailable as
             # one that accepts the connection and then errors (ADR-0009 row 1: either way,
             # fail closed, never propagate a raw infrastructure exception to the caller).
+            raise LedgerUnavailableError(str(exc)) from exc
+
+    async def reconcile_expired(self, organization_id: UUID, *, older_than: datetime) -> int:
+        """Reclaim this tenant's stale holds in one transaction (Phase 5 M2).
+
+        ## Why ``FOR UPDATE SKIP LOCKED``, and what it buys
+
+        ``SKIP LOCKED`` is what makes two reconcilers running at once *correct* rather than merely
+        unlikely to collide: each takes a disjoint set of rows and neither waits on the other, so
+        the same hold cannot be reclaimed twice and no reconciler blocks behind a long settlement.
+        It is also what makes a reconciler racing ``settle`` safe in both directions. ``settle``
+        locks its own row with ``SELECT ... FOR UPDATE``, so either
+
+        * the reconciler gets there first - the row becomes ``expired``, the hold is returned once,
+          and the settlement that arrives afterwards takes the late-settlement branch and books
+          spend *without* returning the hold again; or
+        * ``settle`` gets there first - its row is locked, this sweep skips it entirely, and the
+          reservation settles normally.
+
+        There is no interleaving in which ``org_budget.reserved`` is decremented twice for one
+        hold, which is the only way this operation could lose a tenant money.
+
+        ## Why the whole sweep is one statement plus one decrement
+
+        The reclaimed rows and the amount to give back must commit together. Marking the rows in
+        one transaction and adjusting the budget in another would leave, on a crash between them,
+        reservations marked ``expired`` whose money was never returned - a leak this operation
+        exists to fix, recreated by the fix.
+
+        Tenant-scoped by the RLS binding on the unit of work: this can only ever see and touch one
+        organization's rows, so it needs no cross-tenant privilege (ADR-0014/0019).
+        """
+        try:
+            async with self._uow_factory(tenant_id=organization_id) as uow:
+                session = uow.session
+                stale = (
+                    select(budget_reservation.c.id, budget_reservation.c.estimated_cost)
+                    .where(
+                        budget_reservation.c.organization_id == organization_id,
+                        budget_reservation.c.status == _RESERVED,
+                        budget_reservation.c.created_at < older_than,
+                    )
+                    .with_for_update(skip_locked=True)
+                    .cte("stale")
+                )
+                reclaimed = (
+                    (
+                        await session.execute(
+                            update(budget_reservation)
+                            .where(budget_reservation.c.id.in_(select(stale.c.id)))
+                            .values(status=_EXPIRED, settled_at=func.now())
+                            .returning(budget_reservation.c.estimated_cost)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if not reclaimed:
+                    await uow.commit()
+                    return 0
+
+                total = sum(reclaimed, Decimal(0))
+                # Matches no row when the org has no configured budget - correct, because
+                # ``reserve`` never incremented ``reserved`` for such an org either.
+                await session.execute(
+                    update(org_budget)
+                    .where(org_budget.c.organization_id == organization_id)
+                    .values(reserved=org_budget.c.reserved - total)
+                )
+                await uow.commit()
+                return len(reclaimed)
+        except LedgerUnavailableError:
+            raise
+        except (SQLAlchemyError, OSError) as exc:
             raise LedgerUnavailableError(str(exc)) from exc

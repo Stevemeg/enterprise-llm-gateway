@@ -7,6 +7,7 @@ the components that would really have done them.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -26,8 +27,6 @@ from gateway.adapters.pipeline.routing_stage import AgentRoutingStage
 from gateway.adapters.policy.local_policy_engine import LocalPolicyEngine
 from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.fake_client import FakeProviderClient
-from gateway.application.accounting.cost_accountant import CostAccountant
-from gateway.application.accounting.reservation_service import ReservationService
 from gateway.application.agents.cost import CostAgent
 from gateway.application.agents.health import HealthAgent
 from gateway.application.agents.planner import PlannerAgent
@@ -55,7 +54,9 @@ from gateway.application.ports.providers import (
     ProviderResponse,
     ProviderUsage,
 )
+from gateway.application.ports.streaming import ProviderStreamEvent
 from gateway.application.providers.provider_executor import ProviderExecutor
+from gateway.application.providers.streaming_executor import StreamingProviderExecutor
 from gateway.application.reflection.reflective_executor import ReflectiveExecutor
 from gateway.application.reflection.retry_policy import RetryPolicy
 from gateway.application.routing.catalog import InMemoryProviderCatalog, ProviderDescriptor
@@ -64,7 +65,10 @@ from gateway.application.serving.inference_service import (
     InferenceService,
     RoutingTransportError,
     ServedInference,
+    ServedStream,
 )
+from gateway.application.streaming.streaming_coordinator import StreamingCoordinator
+from tests.support.accounting import reservation_service
 
 ORG = uuid4()
 PRINCIPAL = uuid4()
@@ -112,6 +116,12 @@ class SpyProviderClient:
         self.invocations.append(request.correlation_id)
         return await self._inner.invoke(provider, request)
 
+    def stream(
+        self, provider: ProviderDescriptor, request: InferenceRequest
+    ) -> AsyncIterator[ProviderStreamEvent]:
+        self.invocations.append(request.correlation_id)
+        return self._inner.stream(provider, request)
+
 
 class SpyLedger:
     """Counts every budget movement without changing any of them."""
@@ -121,6 +131,7 @@ class SpyLedger:
         self.reserved: list[str] = []
         self.settled: list[str] = []
         self.released: list[str] = []
+        self.reconciled: list[UUID] = []
 
     @property
     def touched(self) -> bool:
@@ -137,6 +148,10 @@ class SpyLedger:
     async def release(self, organization_id: UUID, correlation_id: str) -> None:
         self.released.append(correlation_id)
         await self._inner.release(organization_id, correlation_id)
+
+    async def reconcile_expired(self, organization_id: UUID, *, older_than: datetime) -> int:
+        self.reconciled.append(organization_id)
+        return await self._inner.reconcile_expired(organization_id, older_than=older_than)
 
 
 class SpyEvaluationRunner(EvaluationRunner):
@@ -171,12 +186,18 @@ class Harness:
         )
         self.ledger = SpyLedger(InMemoryBudgetLedger({ORG: limit or _budget()}))
         pricing = StaticPriceTable([PRICE])
-        reservation = ReservationService(self.ledger, pricing, CostAccountant(pricing))
+        reservation = reservation_service(self.ledger, pricing)
         self.coordinator = InferenceCoordinator(
             InMemoryResponseCache(clock),
             RequestDeduplicator(),
             reservation,
             ProviderExecutor(self.client),
+            InMemoryCircuitBreaker(clock),
+        )
+        self.streaming = StreamingCoordinator(
+            InMemoryResponseCache(clock),
+            reservation,
+            StreamingProviderExecutor(self.client),
             InMemoryCircuitBreaker(clock),
         )
         self.sleeper = NoSleep()
@@ -205,9 +226,12 @@ class Harness:
                 AgentRoutingStage(AgentOrchestratedRoutingEngine(catalog, runtime)),
             ]
         )
-        self.service = InferenceService(self.pipeline, self.executor, self.evaluation)
+        self.service = InferenceService(
+            self.pipeline, self.executor, self.evaluation, self.streaming
+        )
 
-    async def serve(self, payload: dict[str, Any] | None = None) -> ServedInference:
+    @staticmethod
+    def _inputs(payload: dict[str, Any] | None) -> tuple[StageContext, InferenceRequest]:
         body = payload if payload is not None else {"prompt": "hello"}
         context = StageContext(
             correlation_id="corr-1",
@@ -215,9 +239,16 @@ class Harness:
             principal_id=PRINCIPAL,
             attributes={**declare(PERMISSION, resource="POST /v1/inference"), "request": body},
         )
-        return await self.service.serve(
-            context, InferenceRequest(correlation_id="corr-1", payload=body)
-        )
+        return context, InferenceRequest(correlation_id="corr-1", payload=body)
+
+    async def serve(self, payload: dict[str, Any] | None = None) -> ServedInference:
+        context, request = self._inputs(payload)
+        return await self.service.serve(context, request)
+
+    async def serve_stream(self, payload: dict[str, Any] | None = None) -> ServedStream:
+        """The streamed shape, through the same service object and the same admission chain."""
+        context, request = self._inputs(payload)
+        return await self.service.serve_stream(context, request)
 
 
 def _usage() -> ProviderUsage:
@@ -465,6 +496,7 @@ async def test_an_admitted_request_with_no_transported_routing_is_a_defect_not_a
         RequestPipeline([NoOpPipelineStage("authorization")]),
         harness.executor,
         harness.evaluation,
+        harness.streaming,
     )
 
     with pytest.raises(RoutingTransportError, match="no routing execution was transported"):
@@ -494,6 +526,43 @@ async def test_a_refused_request_cannot_carry_an_execution() -> None:
     )
     with pytest.raises(ValueError, match="cannot have been executed"):
         ServedInference(admission=refused, reflection=executed.reflection)
+
+
+def test_an_admitted_streamed_request_must_record_a_session() -> None:
+    """The streamed twin of the invariant above: "admitted" and "nothing happened" is a defect,
+    not a response - a caller that read it would see an empty stream and believe it."""
+    admitted = AdmissionOutcome(records=(StageRecord(stage="a", action=StageAction.CONTINUE),))
+    with pytest.raises(ValueError, match="must record a stream session"):
+        ServedStream(admission=admitted)
+
+
+async def test_a_refused_streamed_request_cannot_carry_a_session() -> None:
+    """Built from a genuinely opened session, so the rejected combination is one the type system
+    permits and only the invariant forbids."""
+    harness = Harness(limit=_budget())
+    opened = await harness.serve_stream()
+    assert opened.session is not None
+
+    refused = AdmissionOutcome(
+        records=(StageRecord(stage="a", action=StageAction.BLOCK, reason="no"),),
+        blocked_by="a",
+        reason="no",
+    )
+    with pytest.raises(ValueError, match="cannot have opened a stream"):
+        ServedStream(admission=refused, session=opened.session)
+
+
+async def test_a_streamed_refusal_runs_no_downstream_work() -> None:
+    """The property ``serve`` establishes, asserted again for the streamed shape rather than
+    assumed to carry over: the two methods share one admission chain, and this is the evidence."""
+    harness = Harness(grant=False, limit=_budget())
+
+    served = await harness.serve_stream()
+
+    assert served.admitted is False
+    assert served.session is None
+    assert harness.client.called is False
+    assert harness.ledger.touched is False
 
 
 async def test_a_refused_request_exposes_the_caller_visible_reason_only() -> None:

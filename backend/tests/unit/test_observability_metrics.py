@@ -36,8 +36,6 @@ from gateway.adapters.pipeline.routing_stage import AgentRoutingStage
 from gateway.adapters.policy.local_policy_engine import LocalPolicyEngine
 from gateway.adapters.pricing.static_price_table import StaticPriceTable
 from gateway.adapters.providers.fake_client import FakeProviderClient
-from gateway.application.accounting.cost_accountant import CostAccountant
-from gateway.application.accounting.reservation_service import ReservationService
 from gateway.application.agents.cost import CostAgent
 from gateway.application.agents.health import HealthAgent
 from gateway.application.agents.planner import PlannerAgent
@@ -63,14 +61,17 @@ from gateway.application.ports.providers import (
     ProviderUsage,
 )
 from gateway.application.providers.provider_executor import ProviderExecutor
+from gateway.application.providers.streaming_executor import StreamingProviderExecutor
 from gateway.application.reflection.reflective_executor import ReflectiveExecutor
 from gateway.application.reflection.retry_policy import RetryPolicy, RetryVerdict
 from gateway.application.routing.catalog import InMemoryProviderCatalog, ProviderDescriptor
 from gateway.application.routing.engine import AgentOrchestratedRoutingEngine
 from gateway.application.serving.inference_service import InferenceService
+from gateway.application.streaming.streaming_coordinator import StreamingCoordinator
 from gateway.domain.routing.models import RoutingOutcome
 from gateway.observability import metrics
 from gateway.observability.metrics import NOT_ADMITTED, UNCLASSIFIED, UNKNOWN
+from tests.support.accounting import reservation_service
 
 ORG = uuid4()
 PRINCIPAL = uuid4()
@@ -151,12 +152,18 @@ class Harness:
         )
         ledger = InMemoryBudgetLedger({ORG: limit or _budget()})
         pricing = StaticPriceTable([PRICE])
-        reservation = ReservationService(ledger, pricing, CostAccountant(pricing))
+        reservation = reservation_service(ledger, pricing)
         self.coordinator = InferenceCoordinator(
             InMemoryResponseCache(clock),
             RequestDeduplicator(),
             reservation,
             ProviderExecutor(client),
+            InMemoryCircuitBreaker(clock),
+        )
+        streaming = StreamingCoordinator(
+            InMemoryResponseCache(clock),
+            reservation,
+            StreamingProviderExecutor(client),
             InMemoryCircuitBreaker(clock),
         )
         executor = ReflectiveExecutor(
@@ -184,7 +191,7 @@ class Harness:
         self.evaluation = EvaluationRunner(
             [ResponseCompletenessEvaluator(), UsageAccountingConsistencyEvaluator()]
         )
-        self.service = InferenceService(pipeline, executor, self.evaluation)
+        self.service = InferenceService(pipeline, executor, self.evaluation, streaming)
 
     async def serve(self, payload: dict[str, Any] | None = None) -> Any:
         body = payload if payload is not None else {"prompt": "hello"}

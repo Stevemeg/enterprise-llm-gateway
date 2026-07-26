@@ -69,9 +69,3 @@ class AgentRoutingStage:
         return StageResult(
             action=StageAction.ANNOTATE, annotations={ROUTING_EXECUTION_KEY: execution}
         )
-
-    async def after_response(self, context: StageContext) -> StageResult:
-        return StageResult()
-
-    async def on_error(self, context: StageContext, error: Exception) -> StageResult:
-        return StageResult()

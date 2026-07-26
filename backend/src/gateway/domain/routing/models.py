@@ -97,7 +97,6 @@ class RoutingDecision:
     decided_at: datetime
     reasoning_steps: tuple[ReasoningStep, ...]
     selected_provider: str | None = None
-    selected_model: str | None = None
     planner_result: PlannerDecision | None = None
     policy_result: PolicyDecision | None = None
     cost_result: CostDecision | None = None

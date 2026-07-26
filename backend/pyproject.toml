@@ -419,6 +419,7 @@ modules = [
     "gateway.adapters.providers.in_memory_client",
     "gateway.adapters.providers.fake_client",
     "gateway.adapters.providers.openai_compatible_client",
+    "gateway.adapters.providers.unconfigured_client",
 ]
 
 [[tool.importlinter.contracts]]
@@ -444,6 +445,9 @@ forbidden_modules = [
     "gateway.application.ports.ledger",
     "gateway.application.execution",
     "gateway.application.reflection",
+    # Phase 5 M1: nor the streamed sequence. An adapter that could reach the coordinator could
+    # settle its own call - the same claim ``application.execution`` already makes for unary.
+    "gateway.application.streaming",
 ]
 
 [[tool.importlinter.contracts]]
@@ -746,5 +750,65 @@ forbidden_modules = [
     "gateway.application.reflection",
     "gateway.application.evaluation",
     "gateway.application.pipeline",
+    # Phase 5 M1: the streamed shape reaches the coordinator only through InferenceService too.
+    # The route legitimately imports ``application.ports.streaming`` (the owned event types it
+    # frames) - naming the events is translation; orchestrating them is not.
+    "gateway.application.streaming",
 ]
 allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+# Phase 5 M1 Guard 1 - HTTP delivery may not hold an infrastructure adapter. Before streaming this
+# was hypothetical: the route dealt only in completed values, so importing a provider client would
+# have bought it nothing. A streamed response is a live connection held open for the duration of
+# the request, which makes "the route opens the provider stream itself" a genuinely tempting
+# shortcut - and one that would bypass admission, the budget reservation, settlement, the cache and
+# the circuit breaker in a single import. One forbidden target per claim:
+#   - adapters.providers -> the route cannot call or stream from a provider
+#   - adapters.ledger / adapters.budget -> the route cannot move or read money
+#   - adapters.cache     -> the route cannot read or write a cached answer
+#   - adapters.health    -> the route cannot mark a provider healthy or unhealthy
+#   - adapters.pricing / adapters.catalog -> the route cannot price a call or choose what is routable
+# NOT forbidden: adapters.security and adapters.audit, which the authentication middleware is
+# constructed from upstream and which are already fenced by their own contracts.
+name = "HTTP delivery holds no infrastructure adapter"
+type = "forbidden"
+source_modules = ["gateway.delivery"]
+forbidden_modules = [
+    "gateway.adapters.providers",
+    "gateway.adapters.ledger",
+    "gateway.adapters.budget",
+    "gateway.adapters.cache",
+    "gateway.adapters.health",
+    "gateway.adapters.pricing",
+    "gateway.adapters.catalog",
+]
+
+[[tool.importlinter.contracts]]
+# Phase 5 M1 Guard 2 - THE COMMIT BOUNDARY, made structural. Streamed output escapes the process
+# chunk by chunk, so replaying a stream onto a second provider attempt would splice two providers'
+# partial answers into one response the client cannot tell apart. Forbidding the import outright is
+# stronger than a runtime "have we emitted yet" flag, which a later edit could read wrongly: there
+# is no retry loop to get the condition wrong because there is no way to reach one.
+# The other targets keep the coordinator's ownership honest, one claim each:
+#   - application.routing.engine / agents -> streaming cannot route or reach AgentRuntime; the
+#     RoutingExecution arrives already decided (routing.catalog is NOT forbidden - ProviderDescriptor
+#     lives there, and being handed a descriptor is the opposite of choosing one)
+#   - application.pipeline / serving -> streaming cannot run admission or serve; it is composed
+#     BY the served path, never the other way round
+#   - application.authorization / ports.authorization -> streaming cannot decide a permission; the
+#     same claim ``inference coordination does not depend on authorization`` makes for the unary path
+#   - application.evaluation -> a stream is not a completed inference, so it cannot be judged as one
+name = "streamed inference cannot retry, route, admit or authorize"
+type = "forbidden"
+source_modules = ["gateway.application.streaming"]
+forbidden_modules = [
+    "gateway.application.reflection",
+    "gateway.application.routing.engine",
+    "gateway.application.agents",
+    "gateway.application.pipeline",
+    "gateway.application.serving",
+    "gateway.application.authorization",
+    "gateway.application.ports.authorization",
+    "gateway.application.evaluation",
+]

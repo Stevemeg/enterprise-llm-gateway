@@ -17,7 +17,13 @@ from gateway.adapters.providers.fake_client import FakeProviderClient
 from gateway.adapters.providers.in_memory_client import InMemoryProviderClient
 from gateway.application.ports.providers import InferenceRequest, ProviderClient, ProviderResponse
 from gateway.application.ports.routing import RoutingExecution
+from gateway.application.ports.streaming import (
+    StreamChunk,
+    StreamCompleted,
+    StreamingProviderClient,
+)
 from gateway.application.providers.provider_executor import ProviderExecutor
+from gateway.application.providers.streaming_executor import StreamingProviderExecutor
 from gateway.application.routing.catalog import ProviderDescriptor
 from gateway.domain.routing.models import ReasoningStep, RoutingDecision, RoutingOutcome
 
@@ -149,3 +155,60 @@ async def test_a_missing_script_fails_closed_rather_than_guessing() -> None:
     response = await client.invoke(OPENAI, _request())
     assert response.ok is False
     assert "no scripted response" in (response.error or "")
+
+
+# ------------------------------------------------------------------ streaming seam (Phase 5 M1)
+
+
+def test_both_provider_clients_satisfy_the_streaming_protocol_too() -> None:
+    """Rule 4 for the new seam: two independent implementations, no protocol change to either."""
+    assert isinstance(InMemoryProviderClient(), StreamingProviderClient)
+    assert isinstance(FakeProviderClient(), StreamingProviderClient)
+
+
+async def test_the_in_memory_client_streams_in_pieces_and_reports_usage() -> None:
+    """More than one chunk deliberately: a consumer that only works for single-chunk streams must
+    fail here rather than in production."""
+    events = [event async for event in InMemoryProviderClient().stream(OPENAI, _request(a="b"))]
+
+    chunks = [e for e in events if isinstance(e, StreamChunk)]
+    assert len(chunks) > 1
+    terminal = events[-1]
+    assert isinstance(terminal, StreamCompleted)
+    assert terminal.usage is not None
+
+
+async def test_the_in_memory_clients_streamed_and_unary_usage_agree() -> None:
+    """A streamed and a unary call for the same payload must settle to the same cost, or the two
+    delivery shapes would quietly charge differently for the same question."""
+    client = InMemoryProviderClient()
+    request = _request(prompt="the same question")
+
+    unary = await client.invoke(OPENAI, request)
+    events = [event async for event in client.stream(OPENAI, request)]
+
+    terminal = events[-1]
+    assert isinstance(terminal, StreamCompleted)
+    assert terminal.usage == unary.usage
+
+
+async def test_an_unscripted_fake_stream_ends_without_a_terminal_event() -> None:
+    """The malformed shape a consumer must survive: a provider that opened a stream and stopped.
+    It must not be expressible as a successful completion."""
+    events = [event async for event in FakeProviderClient().stream(OPENAI, _request())]
+
+    assert events == []
+
+
+async def test_the_streaming_executor_relays_events_and_closes_the_upstream() -> None:
+    """The executor measures and relays; it adds no events of its own and leaks no connection."""
+    client = FakeProviderClient(
+        stream_events=[StreamChunk(content="a"), StreamChunk(content="b"), StreamCompleted()]
+    )
+    executor = StreamingProviderExecutor(client)
+
+    events = [event async for event in executor.stream(OPENAI, _request())]
+
+    assert [e.content for e in events if isinstance(e, StreamChunk)] == ["a", "b"]
+    assert isinstance(events[-1], StreamCompleted)
+    assert client.stream_calls == [(OPENAI, _request())]

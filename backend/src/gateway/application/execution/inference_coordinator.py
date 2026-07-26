@@ -43,6 +43,29 @@ effects (a budget reservation, a provider call, a settlement, a cache write), so
 is wrapped in ``RequestDeduplicator.coalesce``, keyed on ``(organization_id,
 request.correlation_id)`` - never on the cache key, which is a different identity for a different
 purpose (see ``deduplicator.py``).
+
+## Phase 5 M2: an unaccountable call is a refusal, not a crash
+
+``CostAccountant``'s ``UnknownPriceError``/``MissingUsageError``/``MalformedUsageError`` are still
+raised where they are raised, and they still mean "a human must fix something" - none of that
+changes. What changed is that they used to *escape this class entirely*, propagate through
+reflection and serving untouched, and arrive at the HTTP layer as an unhandled exception: a
+**generic 500** for what is actually a deliberate fail-closed refusal, with the budget hold left
+reserved behind it because nobody released it.
+
+They are now caught here, at the only place that both knows the reservation exists and owns the
+outcome vocabulary, and turned into ``ExecutionOutcome.NOT_ACCOUNTABLE``:
+
+* **before the call** (unpriced model at ``reserve``) - nothing was held and no provider was
+  called, so there is nothing to undo;
+* **after the call** (``settle`` cannot compute a cost) - the hold is **released**, because the
+  alternative is charging an amount nobody could compute, and leaving it reserved is the leak M2's
+  reconciliation exists to clean up rather than a thing to keep creating.
+
+The exception type never reaches the caller; it goes to the log for the operator, and the metric
+records the outcome. Reflection treats the new outcome as terminal without any change of its own
+(``classify`` already terminates every non-``EXECUTED`` outcome) - retrying a configuration defect
+is precisely wrong.
 """
 
 from __future__ import annotations
@@ -50,7 +73,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
-from gateway.application.accounting.cost_accountant import CostRecord
+from gateway.application.accounting.cost_accountant import (
+    CostRecord,
+    MalformedUsageError,
+    MissingUsageError,
+    UnknownPriceError,
+)
 from gateway.application.accounting.reservation_service import ReservationService
 from gateway.application.execution.cache_key import compute_cache_key
 from gateway.application.execution.deduplicator import RequestDeduplicator
@@ -66,7 +94,19 @@ from gateway.application.ports.ledger import ReservationOutcome
 from gateway.application.ports.providers import InferenceRequest, ProviderResponse
 from gateway.application.ports.routing import RoutingExecution
 from gateway.application.providers.provider_executor import ProviderExecutor
+from gateway.application.routing.catalog import ProviderDescriptor
+from gateway.observability.logging import get_logger
 from gateway.observability.metrics import record_cache_lookup, record_inference_attempt
+
+_logger = get_logger("execution")
+
+#: Everything ``CostAccountant`` raises when a call cannot be turned into money. Named once, so
+#: the pre-call and post-call handlers cannot drift apart about what "unaccountable" means.
+ACCOUNTING_DEFECTS = (UnknownPriceError, MissingUsageError, MalformedUsageError)
+
+#: The only text a caller may see for this outcome. Says nothing about prices, models or usage:
+#: the operator gets the detail from the log line, the caller gets a stable token.
+NOT_ACCOUNTABLE_ERROR = "not_accountable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +176,14 @@ class InferenceCoordinator:
         if provider is None:  # pragma: no cover - guarded by the caller before scheduling
             raise AssertionError("_execute_and_settle requires a routed execution")
 
-        reservation = await self._reservation_service.reserve(
-            organization_id=organization_id, provider=provider, request=request
-        )
+        try:
+            reservation = await self._reservation_service.reserve(
+                organization_id=organization_id, provider=provider, request=request
+            )
+        except ACCOUNTING_DEFECTS as exc:
+            # Nothing was held and no provider was called, so there is nothing to undo - the
+            # request simply is not servable until an operator adds the missing price.
+            return self._not_accountable(phase="reserve", provider=provider, exc=exc)
         if not reservation.permitted:
             outcome = (
                 ExecutionOutcome.BUDGET_UNAVAILABLE
@@ -167,12 +212,21 @@ class InferenceCoordinator:
             record_inference_attempt(outcome=ExecutionOutcome.EXECUTED.value)
             return InferenceExecutionResult(outcome=ExecutionOutcome.EXECUTED, response=response)
 
-        record = await self._reservation_service.settle(
-            organization_id=organization_id,
-            correlation_id=request.correlation_id,
-            response=response,
-            provider=provider,
-        )
+        try:
+            record = await self._reservation_service.settle(
+                organization_id=organization_id,
+                correlation_id=request.correlation_id,
+                response=response,
+                provider=provider,
+            )
+        except ACCOUNTING_DEFECTS as exc:
+            # The provider ran but its call cannot be costed. Release rather than leave the hold
+            # reserved: an amount nobody can compute must not be charged, and a hold nobody
+            # releases is the leak reconciliation exists to clean up, not one to keep creating.
+            await self._reservation_service.release(
+                organization_id=organization_id, correlation_id=request.correlation_id
+            )
+            return self._not_accountable(phase="settle", provider=provider, exc=exc)
         await self._safe_put(
             organization_id,
             key,
@@ -183,6 +237,29 @@ class InferenceCoordinator:
         record_inference_attempt(outcome=ExecutionOutcome.EXECUTED.value)
         return InferenceExecutionResult(
             outcome=ExecutionOutcome.EXECUTED, response=response, cost=record
+        )
+
+    @staticmethod
+    def _not_accountable(
+        *, phase: str, provider: ProviderDescriptor, exc: Exception
+    ) -> InferenceExecutionResult:
+        """One exit for both accounting-defect paths, so neither can leak what the other hides.
+
+        ``phase`` and the exception's *type* go to the operator's log; the caller receives a bare
+        outcome and a fixed token. A price-table gap is deployment configuration, and naming it in
+        a response would tell an untrusted caller which models this deployment cannot price.
+        """
+        _logger.error(
+            "inference_not_accountable",
+            phase=phase,
+            provider=provider.name,
+            model=provider.model,
+            reason=type(exc).__name__,
+        )
+        record_inference_attempt(outcome=ExecutionOutcome.NOT_ACCOUNTABLE.value)
+        return InferenceExecutionResult(
+            outcome=ExecutionOutcome.NOT_ACCOUNTABLE,
+            response=ProviderResponse(ok=False, error=NOT_ACCOUNTABLE_ERROR),
         )
 
     async def _safe_get(self, organization_id: UUID, key: CacheKey) -> CachedResponse | None:

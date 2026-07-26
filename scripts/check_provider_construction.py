@@ -14,6 +14,14 @@ built its own would also choose its own provider account. And the **catalog** jo
 the first time: a component that builds its own ``ProviderCatalog`` chooses its own set of routable
 providers, which is choosing the routing outcome by another route.
 
+## Phase 5 M1: the streaming executor joins the same fence
+
+``StreamingProviderExecutor`` holds the *streaming* provider client, which in a configured
+deployment is the same credentialed HTTP adapter ``OpenAiCompatibleProviderClient`` is. A component
+that built its own would therefore pick its own provider account exactly as it could before - and
+would additionally own an open connection nobody else can close. Same invariant, one more class,
+no new script.
+
 ## Slice 19: the exemption is per CLASS, not per FILE
 
 ``IMPLEMENTATIONS`` used to be a tuple of filenames, which exempted each of those files from
@@ -37,7 +45,9 @@ TARGETS = frozenset(
         "InMemoryProviderClient",
         "FakeProviderClient",
         "OpenAiCompatibleProviderClient",
+        "UnconfiguredProviderClient",
         "ProviderExecutor",
+        "StreamingProviderExecutor",
         "InMemoryProviderCatalog",
         "SqlProviderCatalog",
     }
@@ -48,7 +58,9 @@ IMPLEMENTATIONS = {
     "providers/in_memory_client.py": "InMemoryProviderClient",
     "providers/fake_client.py": "FakeProviderClient",
     "providers/openai_compatible_client.py": "OpenAiCompatibleProviderClient",
+    "providers/unconfigured_client.py": "UnconfiguredProviderClient",
     "providers/provider_executor.py": "ProviderExecutor",
+    "providers/streaming_executor.py": "StreamingProviderExecutor",
     "routing/catalog.py": "InMemoryProviderCatalog",
     "catalog/sql_provider_catalog.py": "SqlProviderCatalog",
 }

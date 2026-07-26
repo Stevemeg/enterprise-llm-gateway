@@ -97,13 +97,5 @@ async def test_missing_tenant_context_transports_nothing_and_does_not_block() ->
     assert ROUTING_EXECUTION_KEY not in result.annotations
 
 
-async def test_after_response_and_on_error_are_inert() -> None:
-    """The stage adds no post-response or error behaviour in this slice."""
-    stage = _stage()
-    context = _context()
-    assert (await stage.after_response(context)).action is StageAction.CONTINUE
-    assert (await stage.on_error(context, RuntimeError("x"))).action is StageAction.CONTINUE
-
-
 def test_stage_exposes_a_stable_name() -> None:
     assert _stage().name == "agent_routing"

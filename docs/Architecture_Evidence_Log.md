@@ -2515,3 +2515,295 @@ selection each break the end-to-end adaptive-routing tests.
 **No action against ADR-0016** (frozen, byte-unchanged). **No new ADR.** No schema change. In-memory
 strategy with one deterministic implementation; per-org `routing_policy` configuration and the
 ML/bandit strategy recorded as deferred.
+
+
+---
+
+## Phase 5 Milestone 1 — Streaming inference
+
+| | |
+|---|---|
+| Type | **Capability** (consumes existing seams; introduces one capability-owned seam) |
+| Baseline | `main` @ `863ad64`, tag `v1.21.1-phase4-closeout` |
+| Limitation resolved | A client could not receive incremental tokens; a large completion blocked the request path for its whole duration (Phase-4 review 4.1, BLOCKER) |
+| Validation | **Gate 1 + Gate 2: 854 passed, 0 skipped, 98% coverage**, import-linter 44 kept / 0 broken, runtime role `app_rw` / `rolsuper=False` / `rolbypassrls=False` |
+
+### Pre-registered experiment vs. observed result
+
+| | |
+|---|---|
+| **Prediction** (written before implementation) | Streaming is expressible as an **additive streaming method/result on `ProviderClient`** plus a delivery change; Tier-1 (`RoutingDecision`, `PipelineStage`) untouched. |
+| **Falsification condition** | Settlement or caching cannot be preserved without changing a Tier-1 contract. |
+| **Observed** | **Tier-1 half confirmed, `ProviderClient` half FALSIFIED.** Tier 1 is byte-identical. But the prediction that the change belonged *on `ProviderClient`* was wrong, and the design analysis said so before any code was written. |
+
+**Why the `ProviderClient` half was falsified.** `ProviderClient` is a `Protocol`, so adding
+`stream` makes every implementation lacking it stop satisfying the seam - including the two that
+exist purely to validate the non-streaming shape under Rule 4, neither of which has a consumer that
+wants to stream. Rule 5's third test ("why does the change not belong in the consumer instead")
+resolved to a third answer the rule does not enumerate: *it does not belong in that protocol at
+all*. Streaming is a **new capability-owned seam** (`StreamingProviderClient`, `ports/streaming.py`)
+born under Rule 2 - protocol, implementation, CI enforcement - not the growth of an existing one.
+The prediction was too eager to reuse a port, and recording that is the point of pre-registering it.
+
+### Rule 5 determination
+
+| Protocol | Result |
+|---|---|
+| Tier-1 (`RoutingDecision`, `RoutingExecution`, `PipelineStage`, `BaseAgent`) | **NOT TRIGGERED.** Byte-identical against `863ad64`. A stream is how one already-routed call is delivered; it is not a routing, admission or agent concept. |
+| `ProviderClient` (capability-owned) | **NOT TRIGGERED.** Unchanged - see above. |
+| `ExecutionOutcome`, `ResponseCachePort`, `BudgetLedgerPort`, `CircuitBreaker` | **NOT TRIGGERED by M1.** The streamed path reuses all four unchanged, which is the strongest evidence the Phase-4 seams were the right shape. |
+| `StreamingProviderClient` (new) | **Rule 2 birth**, capability-owned, no ADR (same footing as `PermissionResolver`, `ProviderClient`, `PricingPort`, `CircuitBreaker`, `RoutingStrategy`). |
+
+### The commit boundary
+
+**A stream is committed the moment its first `StreamChunk` is handed to the delivery layer.**
+Before it, a failure is an ordinary refusal with a status code (`StreamSession.opened is False`);
+after it, the only honest ending is a terminal `event: error` inside an already-200 response.
+
+Enforced **structurally, not by a runtime flag**: `gateway.application.streaming` cannot import
+`gateway.application.reflection` (import-linter), so there is no retry loop whose condition could
+be got wrong. The stricter rule ("never replay") was chosen over the weaker one `API_Streaming.md`
+permits ("replay only before the first byte") for a concrete reason: `ReflectiveExecutor` retries
+**the same provider**, never a different one, so a pre-first-chunk retry is not the *failover* the
+API contract describes - it is the same call again. Pre-first-chunk failover needs a rerouting
+owner, which does not exist; **deferred with the reason recorded**.
+
+### Semantics established
+
+| Question | Answer |
+|---|---|
+| Cancellation - client disconnect | Starlette closes the response generator, which closes ours; the hold is **released** and the upstream call **aborted** (`aclose` propagated to the adapter). |
+| Cancellation - task cancelled while awaiting the next chunk | The cancellation is delivered at the generator's yield point, its finalizer runs, the hold is **released**. |
+| Abandoned without closing | The hold **leaks** - asserted as a *negative* test, not hoped for. Reconciliation (M2) reclaims it. |
+| Accounting | Reserve strictly before the provider stream opens; denial means zero provider calls; settle exactly once on a completed stream; release on every other ending. |
+| Provider ends with no usage | **Released, not settled, and the stream ends with a terminal error.** Usage is never reconstructed from the text produced - an estimate is a routing input, not a charge. The adapter sends `stream_options.include_usage` so this stays a genuine provider defect. |
+| Cache | Hit served as a single chunk with no provider call, no reservation, no settlement. Write reachable from exactly one place: after a terminal `StreamCompleted` that settled. A non-text entry is treated as a miss. |
+| Deduplication | **Deliberately absent.** `RequestDeduplicator` shares one `Task` *result*; two callers cannot share one iterator without one stealing the other's chunks. The ledger's reservation idempotency remains the backstop. |
+| Evaluation | **Not run for streams.** Evaluation observes a *completed* inference; `serve_stream` returns while the stream is open. Recorded as a limitation rather than approximated. |
+
+### Guard evaluation
+
+| Guard | Classification | Deliberate-failure proof |
+|---|---|---|
+| RoutingDecision construction (Guard L) | **REUSED** | Planted a `RoutingDecision(...)` in `streaming_coordinator.py` → exit 1 → restored → exit 0 |
+| Routing-engine guard (AgentRuntime reachability) | **REUSED** | Planted an `AgentRuntime` reference in the streaming coordinator → exit 1 → restored → exit 0 |
+| `check_execution_construction.py` | **EXTENDED** (`StreamingCoordinator`) | Constructed one in `inference_service.py` → exit 1 → restored → exit 0 |
+| `check_provider_construction.py` | **EXTENDED** (`StreamingProviderExecutor`) | Constructed one in the streaming coordinator → exit 1 → restored → exit 0 |
+| "streamed inference cannot retry, route, admit or authorize" | **NEW** (the commit boundary) | Imported `RetryPolicy` into the coordinator → 43 kept / 1 broken → restored → 44 kept |
+| "HTTP delivery holds no infrastructure adapter" | **NEW** | Imported `OpenAiCompatibleProviderClient` into the route → 43 kept / 1 broken → restored → 44 kept |
+| "HTTP delivery ... only through InferenceService" | **EXTENDED** (`application.streaming`) | Imported `StreamSession` from the coordinator into the route → 43 kept / 1 broken → restored → 44 kept |
+
+No new AST guard: every new construction subject fell inside an existing script's invariant, so the
+scripts were extended rather than duplicated under a new name.
+
+### Assumptions falsified
+
+1. **"Streaming should extend `ProviderClient`."** See above - the pre-registered prediction.
+2. **"A commit boundary needs a runtime flag."** An import contract is stronger: there is no
+   condition to get wrong because there is no reachable retry.
+3. **"A stream can reuse the deduplicator."** It cannot; a result and an iterator are different
+   things, and the coalescer's own design note already implied it.
+
+### Decision
+
+**No action against ADR-0016** (frozen, byte-unchanged). No new ADR. No schema change. **M1 itself produced no Tier-1 diff** - but the published state does, because ADR-0020 was accepted and applied before publication (see the Tier-1 contraction record below). M1's contribution to that decision was evidential: it was the strongest available test for a consumer, and it found none.
+
+---
+
+## Phase 5 Milestone 2 — Serving correctness & debt closure
+
+| | |
+|---|---|
+| Type | **Capability** (correctness + removal; one capability-owned Rule 5 event) |
+| Validation | **Gate 1 + Gate 2: 883 passed, 0 skipped, 98% coverage**, import-linter 44 kept / 0 broken, Alembic at `0007_rbac_seed_audit_chain` (**unchanged - no migration**), runtime role `app_rw` / `rolsuper=False` / `rolbypassrls=False`, exit 0 |
+
+### Pre-registered experiment vs. observed result
+
+| | |
+|---|---|
+| **Prediction** | The fake-client default and the reservation leak are closable **without any Tier-1 change**; the stage protocol can be honestly narrowed to `before_request`. |
+| **Falsification condition** | A real consumer for `after_response`/`on_error` emerges during the work. |
+| **Observed** | **Not falsified - and the narrowing was NOT performed.** M1 was the strongest test available (streaming is the biggest new consumer since MCP) and produced no consumer for either. But both vacuous items are **Tier-1 surface**, so removing them is a governance act, not a cleanup: the milestone **stopped** and wrote [ADR-0020](adr/0020-narrowing-proven-vacuous-tier-1-surface.md) (**Proposed - not applied**) per GP-2. |
+
+### Issue-by-issue classification
+
+| # | Issue | Classification | Outcome |
+|---|---|---|---|
+| 1 | Fake `InMemoryProviderClient` production fallback | **REPLACE + FAIL CLOSED** | New `UnconfiguredProviderClient` refuses every call (no content, no usage, non-retryable). The synthesizing client needs `GATEWAY_ALLOW_FAKE_PROVIDER_CLIENT=true`, which the settings validator **forbids in production**. |
+| 2 | Reservation expiry / reconciliation | **WIRE** | `BudgetLedgerPort.reconcile_expired` + `ReservationReconciler`, called by `ReservationService.reserve`. **No migration.** |
+| 3 | Unpriced model → generic 500 | **FAIL CLOSED (typed)** | New `ExecutionOutcome.NOT_ACCOUNTABLE` → **503 `availability_error` / `accounting_unavailable`, `retryable: false`**. |
+| 4 | `PipelineStage.after_response` / `on_error` | **DEFER WITH EVIDENCE (Tier-1 governance stop)** | Vacuity re-verified; removal proposed in ADR-0020, **no code changed**. |
+| 5 | Dead `BudgetEnforcer` / `BudgetPort` / `InMemoryBudgetStore` | **REMOVE** | Deleted. Capability-owned, not Tier-1; GP-1 clause 1 evidence. `UnsupportedCurrencyError` moved to `ports/ledger.py`, its only remaining raiser. |
+| 6 | Latent `selected_model` | **DEFER WITH EVIDENCE (Tier-1 governance stop)** | Confirmed no writer; `runtime.py:125` is the sole (read) reference. Removal proposed in ADR-0020, **no code changed**. |
+
+### Why reconciliation needed no migration
+
+`budget_reservation.created_at` already exists (migration 0006) and `reservation_status` already
+carries `expired` (migration 0001). Staleness is **age**, so an `expires_at` column would always
+equal `created_at + ttl` for one deployment-wide TTL - derived data, whose stored copy can disagree
+with the rule (Rule 3). A *per-request* expiry would not be derived, but nothing sets a per-request
+timeout, so the column would have a writer of one constant and no reader that varied.
+
+`expired` becoming writable exposed a **latent defect**: `reserve`'s idempotent-replay branch
+excluded only `released`, so an `expired` row would have replayed as `RESERVED` while holding
+nothing - the identical phantom-hold defect Slice 11 found for `released`. Fixed in both ledger
+implementations. `settle` against an `expired` row now books the spend **without** returning the
+hold a second time (which would drive `org_budget.reserved` past its zero floor).
+
+### Rule 5 / governance determinations
+
+| Subject | Determination |
+|---|---|
+| `ExecutionOutcome.NOT_ACCOUNTABLE` | **Rule 5 event, capability-owned.** Consumer: the HTTP route, which must pick a status and had no way to express the condition. Delivery cannot import `application.accounting` (contract), so it structurally cannot classify it itself. Additive; no ADR. |
+| `BudgetLedgerPort.reconcile_expired` | **Rule 5 event, capability-owned.** Consumer: `ReservationReconciler`. `release` needs a `correlation_id` and the whole problem is that nobody knows the ids a crashed process was serving. Additive; no ADR. |
+| Removal of `BudgetEnforcer`/`BudgetPort`/`InMemoryBudgetStore` | **No ADR.** Capability-owned; reverses no accepted decision (ADR-0017's decision stands). GP-1 clause 1: a completed phase exposed the limitation. |
+| Narrowing `PipelineStage`; removing `RoutingDecision.selected_model` | **STOPPED. ADR-0020 written, Proposed, not applied.** Tier-1 surface; GP-2. |
+
+### Operational honesty about scheduling
+
+There is **no scheduler in this system and M2 did not invent one.** The reconciler is a plain
+callable whose production consumer is `ReservationService.reserve`, running **for the tenant about
+to reserve**. Three consequences, stated rather than hidden:
+
+* tenant-scoped, therefore **RLS-safe by construction** - no cross-tenant sweep, so no new
+  `SECURITY DEFINER` and no ADR-0019 exception;
+* **it cannot rot** - it runs on every reservation rather than waiting for a cron job nobody built;
+* **it costs one extra indexed statement per reservation**, and a tenant that stops sending traffic
+  keeps its leaked holds until it sends another request. When a scheduled worker acquires an owner
+  (M4/M5) it calls exactly this service and nothing else changes.
+
+### Guard evaluation
+
+| Guard | Classification |
+|---|---|
+| `check_provider_construction.py` | **EXTENDED** (`UnconfiguredProviderClient`) |
+| `check_accounting_construction.py` | **EXTENDED** (`ReservationReconciler`); shrunk by the two deleted classes |
+| "provider client implementations are mutually independent" | **EXTENDED** (fourth implementation) |
+| Metric cardinality guard + enum/allowlist pairing test | **REUSED** - caught `NOT_ACCOUNTABLE` automatically |
+
+### Assumptions falsified
+
+1. **"Reservation expiry needs a schema change."** It does not; the schema already carried both the
+   timestamp and the enum member.
+2. **"The `expired` status was inert."** It was unreachable, and the moment reconciliation could
+   write it, three pre-existing branches (`reserve` replay, `settle`, `release`) were wrong.
+3. **"Debt closure is mechanical."** Two of the six items turned out to be governance decisions
+   that a milestone is not entitled to take alone.
+
+### Decision
+
+**No action against ADR-0016** (frozen, byte-unchanged). No schema change, no migration.
+ADR-0020 was written here as **Proposed** (the GP-2 stop), then **accepted by explicit decision** and applied before publication - so the published state carries a deliberate Tier-1 contraction, recorded in full below.
+
+
+---
+
+## Phase 5 — Tier-1 contraction (ADR-0020, accepted and applied)
+
+**This is an explicit Tier-1 evolution. The published state is NOT Tier-1 zero-diff.** It is
+recorded here as a first-class architectural change rather than folded into a milestone summary,
+because a *contraction* of a frozen tier is exactly the kind of change that must be impossible to
+find by accident later.
+
+### Authorization
+
+[ADR-0020](adr/0020-narrowing-proven-vacuous-tier-1-surface.md), **Accepted 2026-07-26** by
+explicit decision of the repository owner. It was written during M2 as *Proposed* and the milestone
+**stopped** rather than applying it, per GP-2 ("no rule may be weakened or reinterpreted inside a
+milestone"). ADR-0016 is untouched and byte-frozen (`sha256 2735cdfa…f777c3`); ADR-0020 changes the
+*shape of two seams ADR-0016 names*, not any rule ADR-0016 states.
+
+### Previous Tier-1 shape
+
+```python
+# ports/pipeline.py — invariant 5
+class PipelineStage(Protocol):
+    @property
+    def name(self) -> str: ...
+    async def before_request(self, context: StageContext) -> StageResult: ...
+    async def after_response(self, context: StageContext) -> StageResult: ...      # removed
+    async def on_error(self, context: StageContext, error: Exception) -> StageResult: ...  # removed
+
+# domain/routing/models.py — invariant 3
+class RoutingDecision:
+    ...
+    selected_provider: str | None = None
+    selected_model: str | None = None     # removed
+```
+
+### Exact Tier-1 diff against `863ad64`
+
+Three deleted declarations, plus explanatory docstring. **No signature changed, no member renamed,
+nothing added.**
+
+```diff
+--- backend/src/gateway/application/ports/pipeline.py
+-    async def after_response(self, context: StageContext) -> StageResult: ...
+-    async def on_error(self, context: StageContext, error: Exception) -> StageResult: ...
+--- backend/src/gateway/domain/routing/models.py
+-    selected_model: str | None = None
+```
+
+Also removed, as obsolete *solely* because of the above: the four inert implementations
+(`AuthorizationStage`, `PolicyStage`, `AgentRoutingStage`, `NoOpPipelineStage`),
+`AgentContext.selected_model`, the read at `runtime.py:125`, and four tests that asserted the
+inertness of never-invoked methods.
+
+### Evidence that each surface was vacuous
+
+| Surface | Call sites / writers | Consumers checked |
+|---|---|---|
+| `PipelineStage.after_response` | **0 invocations.** `RequestPipeline` references only `stage.name` and `stage.before_request`. All four implementations returned inert `CONTINUE`. | The runner; all 4 stages; evaluation (needs outcome+response+usage, which a `StageContext` cannot carry); streaming (`serve_stream` returns while the stream is open, so there is no completed response to hand a hook); audit; metrics. |
+| `PipelineStage.on_error` | **0 invocations**, same. | Same set, plus the error path: `RequestPipeline` converts a raising stage into a `BLOCK` itself and never consults the stage. |
+| `RoutingDecision.selected_model` | **0 writers.** Sole reference was a *read* at `runtime.py:125`, so it evaluated to `None` on every decision ever produced. | The routing engine (resolves the descriptor from `selected_provider`, the **name**); pricing; cache key; `CostRecord`; `SettlementDetail`; `cost_ledger`; metrics; audit. `RoutingDecision` is **never serialized or persisted**, so no external contract depended on its shape. |
+
+### Why no information was erased
+
+Every consumer that needs the model already reads it from `RoutingExecution.provider.model`
+(`ProviderDescriptor`) — pricing (twice), the cache key, the cached entry, `CostRecord.model`, and
+`SettlementDetail.model`, which is what lands durably in `cost_ledger.model`. The removed field
+carried a `None`, not a fact. **`docs/API_Examples.md` still shows an aspirational
+`x_gateway.selected_model` response field**; that response shape is not implemented (the live
+endpoint returns no `x_gateway` object at all), and when it is, the value comes from the
+descriptor. Flagged rather than quietly deleted.
+
+### Why this reduces speculative architecture rather than changing runtime semantics
+
+Nothing that ever executed stopped executing: the removed methods had no call sites and the removed
+field had no writer, so no code path, status code, audit record, metric, or persisted row differs.
+What changed is what the types *claim*. A reader of the old `PipelineStage` would reasonably
+conclude responses pass back through the chain; a reader of the old `RoutingDecision` would
+reasonably conclude the model is part of the explanation. Both were false, and both would have
+shaped the next design.
+
+The contraction has exactly **one** observable consequence, and it is a reduction in obligation: a
+stage implementing only `before_request` now satisfies the protocol, where before
+`runtime_checkable` `isinstance` rejected it. Verified empirically — `False` against the old shape,
+`True` against the new.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `RequestPipeline` behaviour unchanged | ✅ all of `test_request_pipeline.py` passes **with no behavioural test modified** |
+| BLOCK still stops the chain | ✅ `test_block_still_stops_the_chain_and_later_stages_never_run` (+ pre-existing) |
+| CONTINUE still advances | ✅ `test_continue_still_advances_through_the_whole_chain_in_order` |
+| Stage ordering unchanged | ✅ `test_stage_ordering_is_still_the_declared_order` |
+| Authentication / authorization unchanged | ✅ `test_rbac_authorization.py`, `test_inference_endpoint.py`, `test_route_auth_coverage.py` all pass unmodified except the deleted inertness test |
+| `RoutingDecision` single construction site | ✅ guard PASS; mutated → exit 1 → restored → exit 0 |
+| Routing outcomes / explanation semantics unchanged | ✅ `test_a_decision_is_still_explainable_and_still_names_its_provider`, `test_routing_engine.py`, `test_adaptive_routing.py` |
+| Nothing reads or writes `selected_model` | ✅ repo-wide grep clean; `test_constructing_a_decision_with_selected_model_is_now_a_type_error` |
+| No dead `after_response`/`on_error` references | ✅ repo-wide grep clean (only the ADR-0020 rationale prose remains) |
+
+### Guard changes and proofs
+
+| Check | Change | Proof |
+|---|---|---|
+| `tests/unit/test_phase4_seams.py` required-surface map | **MODIFIED** — it literally encoded `("name","before_request","after_response","on_error")`, i.e. the old Tier-1 shape | re-added `after_response` to the map → **FAIL** (`missing after_response`) → restored → **PASS** |
+| `test_tier1_contraction_adr_0020.py` (new pin) | **NEW** | re-added `after_response` to the protocol → 3 failures → restored → 14 pass; re-added `selected_model` → 2 failures → restored → 14 pass |
+| RoutingDecision construction guard | **REUSED, unchanged** | mutated `engine.py` → exit 1 → restored → exit 0 |
+| Pipeline construction guard | **REUSED, unchanged** | mutated `inference_service.py` → exit 1 → restored → exit 0 |
+| All other 12 AST guards + 44 import contracts | **UNCHANGED and PASS** | no guard was weakened |
+
+**No `scripts/*.py` AST guard encoded the removed surfaces** (verified by grep), so none required
+modification.

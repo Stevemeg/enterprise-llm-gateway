@@ -35,6 +35,8 @@ traceability, as mandated by the project workflow.
 | [0016](0016-enterprise-ai-os-architecture.md) | Evolution to an Enterprise AI Operating System | Proposed | (architecture) |
 | [0017](0017-postgres-transactional-budget-reservation.md) | PostgreSQL-transactional reserve/commit as the interim hard-budget mechanism | Accepted | (scopes ADR-0004's mechanism, does not reverse it) |
 | [0018](0018-exact-match-response-cache-and-request-deduplication.md) | Exact-match response caching and process-local request deduplication | Accepted | (scopes ADR-0006's mechanism, does not reverse it) |
+| [0019](0019-api-key-credential-bootstrap-lookup.md) | API-key credential bootstrap lookup (SECURITY DEFINER) | Accepted | (RLS bootstrap) |
+| [0020](0020-narrowing-proven-vacuous-tier-1-surface.md) | Narrowing proven-vacuous Tier-1 surface | Accepted | (Tier-1 contraction; authorizes removing `PipelineStage.after_response`/`on_error` and `RoutingDecision.selected_model`) |
 
 All nine Phase-1 architecture-blocking questions are resolved by the ADRs marked in **bold**. A
 tabular cross-reference of every decision is in

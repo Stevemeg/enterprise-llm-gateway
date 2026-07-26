@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from uuid import uuid4
 
 import pytest
@@ -10,16 +11,17 @@ from gateway.adapters.cache.in_memory_response_cache import InMemoryResponseCach
 from gateway.adapters.ledger.in_memory_budget_ledger import InMemoryBudgetLedger
 from gateway.adapters.pipeline.authorization_stage import AuthorizationStage
 from gateway.adapters.pipeline.policy_stage import PolicyStage
+from gateway.adapters.providers.in_memory_client import InMemoryProviderClient
 from gateway.adapters.providers.openai_compatible_client import OpenAiCompatibleProviderClient
-from gateway.application.accounting.budget_enforcer import BudgetEnforcer
+from gateway.adapters.providers.unconfigured_client import UnconfiguredProviderClient
 from gateway.application.accounting.cost_accountant import CostAccountant
+from gateway.application.accounting.reservation_reconciler import ReservationReconciler
 from gateway.application.accounting.reservation_service import ReservationService
 from gateway.application.evaluation.runner import EvaluationRunner
 from gateway.application.execution.deduplicator import RequestDeduplicator
 from gateway.application.execution.inference_coordinator import InferenceCoordinator
 from gateway.application.pipeline.runner import RequestPipeline
 from gateway.application.ports.authorization import PermissionResolver
-from gateway.application.ports.budget import BudgetPort
 from gateway.application.ports.cache import ResponseCachePort
 from gateway.application.ports.evaluation import Evaluator
 from gateway.application.ports.ledger import BudgetLedgerPort
@@ -36,6 +38,7 @@ from gateway.config.container import Container
 from gateway.config.settings import (
     AuthSettings,
     DatabaseSettings,
+    Environment,
     ProviderConnectionSettings,
     Settings,
 )
@@ -80,12 +83,53 @@ def _settings_with_provider(**connection: object) -> Settings:
     )
 
 
+def _settings_without_providers(*, allow_fake_provider_client: bool = False) -> Settings:
+    return Settings(
+        database=DatabaseSettings(url="sqlite+aiosqlite:///:memory:"),
+        auth=AuthSettings(allow_insecure_generated_keys=True),
+        allow_fake_provider_client=allow_fake_provider_client,
+    )
+
+
 def test_a_configured_provider_selects_the_real_http_client() -> None:
     """With a resolvable connection the composition root wires the OpenAI-compatible adapter, not
-    the in-memory stub - Slice 19 realizing ADR-0003."""
+    the in-memory stub - Slice 19 realizing ADR-0003. Phase 5 M1: the *same instance* also serves
+    the streaming port, so a deployment never opens two connection pools to one provider."""
     settings = _settings_with_provider(base_url="https://api.example.test", api_key_ref="k")
     container = Container.create(settings, secrets_resolver=_StubSecrets({"k": "sk-secret"}))
     assert isinstance(container.provider_client, OpenAiCompatibleProviderClient)
+    assert container.streaming_provider_client is container.provider_client
+
+
+def test_an_unconfigured_deployment_fails_closed_instead_of_fabricating_inference() -> None:
+    """Phase 5 M2, the headline. With no provider connections the composition root used to wire
+    ``InMemoryProviderClient``, which "always succeeds" and synthesizes usage - so a production
+    deployment with a seeded catalog and no connections served invented answers and booked real
+    spend for them. The fallback must now refuse."""
+    settings = _settings_without_providers()
+    container = Container.create(settings, secrets_resolver=_StubSecrets({}))
+    assert isinstance(container.provider_client, UnconfiguredProviderClient)
+    assert container.streaming_provider_client is container.provider_client
+
+
+def test_the_synthesizing_client_requires_an_explicit_opt_in() -> None:
+    """It is still available - development and the integration suite need it - but only to a
+    deployment that asked for it in as many words."""
+    settings = _settings_without_providers(allow_fake_provider_client=True)
+    container = Container.create(settings, secrets_resolver=_StubSecrets({}))
+    assert isinstance(container.provider_client, InMemoryProviderClient)
+
+
+def test_production_may_not_opt_into_the_synthesizing_client() -> None:
+    """Fail-fast at settings construction, the same shape as the generated-signing-key guard: a
+    production process that could fabricate inference must not be constructible at all."""
+    with pytest.raises(ValueError, match="ALLOW_FAKE_PROVIDER_CLIENT"):
+        Settings(
+            environment=Environment.PRODUCTION,
+            log_json=True,
+            database=DatabaseSettings(url="sqlite+aiosqlite:///:memory:"),
+            allow_fake_provider_client=True,
+        )
 
 
 def test_a_provider_without_a_base_url_fails_fast() -> None:
@@ -107,9 +151,26 @@ def test_a_provider_whose_credential_cannot_be_resolved_fails_fast() -> None:
 def test_container_wires_accounting(test_settings: Settings) -> None:
     container = Container.create(test_settings)
     assert isinstance(container.pricing_port, PricingPort)
-    assert isinstance(container.budget_port, BudgetPort)
     assert isinstance(container.cost_accountant, CostAccountant)
-    assert isinstance(container.budget_enforcer, BudgetEnforcer)
+    assert isinstance(container.reservation_reconciler, ReservationReconciler)
+
+
+def test_the_superseded_slice_8_budget_layer_is_gone(test_settings: Settings) -> None:
+    """Phase 5 M2 regression proof. ``BudgetEnforcer``/``BudgetPort``/``InMemoryBudgetStore`` were
+    constructed here and called by nothing; deleting them must break no serving path. If any of
+    these modules comes back, it needs a consumer and this test needs a reason to change.
+    """
+    for module in (
+        "gateway.application.accounting.budget_enforcer",
+        "gateway.application.ports.budget",
+        "gateway.adapters.budget.in_memory_budget_store",
+    ):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(module)
+
+    container = Container.create(test_settings)
+    assert not hasattr(container, "budget_port")
+    assert not hasattr(container, "budget_enforcer")
 
 
 def test_container_wires_budget_ledger(test_settings: Settings) -> None:

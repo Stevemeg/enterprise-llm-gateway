@@ -24,12 +24,11 @@ TARGETS = frozenset(
     {
         "StaticPriceTable",
         "SqlPriceTable",
-        "InMemoryBudgetStore",
         "CostAccountant",
-        "BudgetEnforcer",
         "SqlBudgetLedger",
         "InMemoryBudgetLedger",
         "ReservationService",
+        "ReservationReconciler",
     }
 )
 ALLOWED = ("gateway/config/container.py",)
@@ -39,12 +38,11 @@ ALLOWED = ("gateway/config/container.py",)
 IMPLEMENTATIONS = {
     "pricing/static_price_table.py": "StaticPriceTable",
     "pricing/sql_price_table.py": "SqlPriceTable",
-    "budget/in_memory_budget_store.py": "InMemoryBudgetStore",
     "accounting/cost_accountant.py": "CostAccountant",
-    "accounting/budget_enforcer.py": "BudgetEnforcer",
     "ledger/sql_budget_ledger.py": "SqlBudgetLedger",
     "ledger/in_memory_budget_ledger.py": "InMemoryBudgetLedger",
     "accounting/reservation_service.py": "ReservationService",
+    "accounting/reservation_reconciler.py": "ReservationReconciler",
 }
 
 

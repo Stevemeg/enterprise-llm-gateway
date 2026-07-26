@@ -158,9 +158,19 @@ class Settings(BaseSettings):
     log_json: bool = True
     database: DatabaseSettings = DatabaseSettings()
     auth: AuthSettings = AuthSettings()
-    # Empty by default: a deployment with no provider connections keeps the in-memory client, the
-    # same "nothing configured yet" posture as the empty catalog and price list.
     providers: dict[str, ProviderConnectionSettings] = {}
+    # Phase 5 M2. With no provider connections configured, the gateway refuses provider calls
+    # (UnconfiguredProviderClient) rather than echoing the prompt back as a successful inference
+    # and booking spend for it. Local development and the integration suite opt back into the
+    # synthesizing in-memory client explicitly, which is what makes it visible; production may
+    # not, and the validator below enforces that the same way it does for generated signing keys.
+    allow_fake_provider_client: bool = False
+    # Phase 5 M2. How long a budget hold may legitimately stay reserved before reconciliation
+    # reclaims it. An UPPER BOUND on request duration, not a cleanup interval: setting it below
+    # the longest real request would reclaim live holds and let a tenant overspend. Default 15
+    # minutes, far beyond the 30s provider timeout x 3 reflection attempts this gateway can
+    # currently produce (see application/accounting/reservation_reconciler.py).
+    reservation_ttl_seconds: int = Field(default=900, gt=0)
 
     @model_validator(mode="after")
     def _enforce_production_invariants(self) -> Settings:
@@ -185,6 +195,13 @@ class Settings(BaseSettings):
                     "GATEWAY_AUTH__ALLOW_INSECURE_GENERATED_KEYS must be false in production: "
                     "generated per-process keys invalidate tokens on restart and break replicas "
                     "(AUTH-01)."
+                )
+            if self.allow_fake_provider_client:
+                raise ValueError(
+                    "GATEWAY_ALLOW_FAKE_PROVIDER_CLIENT must be false in production: the "
+                    "in-memory client fabricates a successful response and synthesizes usage, so "
+                    "a production deployment would serve invented answers and book real spend "
+                    "for inferences that never happened."
                 )
         return self
 

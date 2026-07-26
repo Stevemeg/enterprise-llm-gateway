@@ -22,9 +22,3 @@ class NoOpPipelineStage:
 
     async def before_request(self, context: StageContext) -> StageResult:
         return StageResult()
-
-    async def after_response(self, context: StageContext) -> StageResult:
-        return StageResult()
-
-    async def on_error(self, context: StageContext, error: Exception) -> StageResult:
-        return StageResult()

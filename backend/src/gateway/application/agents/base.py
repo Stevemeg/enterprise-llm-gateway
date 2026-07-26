@@ -37,5 +37,4 @@ class AgentContext:
     cost: CostDecision | None = None
     health: HealthDecision | None = None
     selected_provider: str | None = None
-    selected_model: str | None = None
     confidence: float | None = None

@@ -7,9 +7,10 @@ now routes, executes, is priced against the effective-dated ``price_table``, set
 budget, and returns **200**. The change in that one status code is the slice's headline, proven end
 to end through the real ``Container`` against real PostgreSQL.
 
-The provider client here is still ``InMemoryProviderClient``: the container selects the real HTTP
-adapter only when connections are configured, and wiring a live provider into an automated test
-would spend real credits. The real adapter's own behaviour is covered exhaustively by
+The provider client here is ``InMemoryProviderClient``, selected by the explicit
+``allow_fake_provider_client`` opt-in (Phase 5 M2 - without it an unconfigured deployment fails
+closed instead of fabricating inference). Wiring a live provider into an automated test would
+spend real credits. The real adapter's own behaviour is covered exhaustively by
 ``tests/unit/test_openai_compatible_client.py`` against a scripted ``httpx`` transport. What this
 test proves is the *composition* - durable catalog + durable pricing + the existing execute/settle
 path - not the SDK.
@@ -47,6 +48,12 @@ async def container() -> AsyncIterator[Container]:
     settings = Settings(
         database=DatabaseSettings(url=PG_URL),
         auth=AuthSettings(allow_insecure_generated_keys=True),
+        # Phase 5 M2: the synthesizing client is no longer the default for a deployment with no
+        # provider connections - that default fabricated inference and booked spend for it. This
+        # suite genuinely wants the fake (wiring a live provider would spend real credits), so it
+        # asks for it in as many words. That is the opt-in working as designed, and it is why
+        # ``test_container.py`` can assert the *absence* of the flag fails closed.
+        allow_fake_provider_client=True,
     )
     built = Container.create(settings)
     try:
@@ -160,11 +167,12 @@ async def test_an_unpriced_model_fails_closed_rather_than_serving_free(
     request fails closed - it is not served, and no spend is booked.
 
     The safety counterpart to the headline: adding a provider without a price cannot open a hole
-    through which calls are served at zero cost. The request currently surfaces as a generic 500
-    (no provider detail reaches the client - the message is server-side only); mapping that
-    configuration defect to a tailored fail-closed 5xx is recorded as known debt, because doing it
-    without either importing accounting into delivery (contract-forbidden) or reversing Slice 8's
-    invariant would be out of this slice's scope.
+    through which calls are served at zero cost.
+
+    Phase 5 M2 closed the debt this test used to record. It surfaced as a **generic 500**, which
+    told neither the caller nor the operator anything; it is now a typed, fail-closed **503
+    ``accounting_unavailable``** carrying no provider, model or pricing detail. The defect is
+    still a defect - it is simply reported as one.
     """
     org = uuid4()
     secret = await _seed_routable_tenant(container, org, priced=False)
@@ -182,7 +190,12 @@ async def test_an_unpriced_model_fails_closed_rather_than_serving_free(
     async with AsyncClient(transport=transport, base_url="http://test") as http:
         response = await http.post(_PATH, json=_BODY, headers={"Authorization": f"Bearer {secret}"})
 
-    assert response.status_code != 200
-    assert response.status_code >= 500  # fail closed, not served
+    assert response.status_code == 503, response.text
+    body = response.json()["error"]
+    assert body["type"] == "availability_error"
+    assert body["code"] == "accounting_unavailable"
+    # Retrying cannot help until an operator adds a price row, so the client is not told to.
+    assert body["retryable"] is False
     assert "inhouse" not in response.text, "the provider name must not reach the client"
+    assert "price" not in body["message"].lower(), "pricing configuration must not be disclosed"
     assert await _cost_rows(container, org) == 0

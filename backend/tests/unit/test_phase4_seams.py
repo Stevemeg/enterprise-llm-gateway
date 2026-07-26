@@ -52,7 +52,7 @@ def test_skeleton_agent_satisfies_the_base_agent_protocol() -> None:
 def test_validation_implementations_expose_their_required_surface(implementation: object) -> None:
     """Every Rule-4 implementation must expose the methods its seam declares."""
     required = {
-        "NoOpPipelineStage": ("name", "before_request", "after_response", "on_error"),
+        "NoOpPipelineStage": ("name", "before_request"),
         "NullMcpGateway": ("discover", "execute", "health"),
         "InMemoryToolRegistry": ("register", "get", "discover", "permitted"),
         "BaseAgentSkeleton": ("name", "prepare", "contribute", "dispose"),
@@ -85,13 +85,9 @@ async def test_noop_stage_always_continues() -> None:
     stage = NoOpPipelineStage()
     context = StageContext(correlation_id="c-1")
     assert stage.name == "noop"
-    for result in (
-        await stage.before_request(context),
-        await stage.after_response(context),
-        await stage.on_error(context, RuntimeError("boom")),
-    ):
-        assert result.action is StageAction.CONTINUE
-        assert result.blocked is False
+    result = await stage.before_request(context)
+    assert result.action is StageAction.CONTINUE
+    assert result.blocked is False
 
 
 def test_stage_result_supports_continue_annotate_and_block() -> None:

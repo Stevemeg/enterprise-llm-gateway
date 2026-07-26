@@ -12,6 +12,8 @@ never leak" is the adapter's whole contract.
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -23,6 +25,13 @@ from gateway.application.ports.providers import (
     InferenceRequest,
     ProviderErrorCategory,
     ProviderResponse,
+    ProviderUsage,
+)
+from gateway.application.ports.streaming import (
+    ProviderStreamEvent,
+    StreamChunk,
+    StreamCompleted,
+    StreamFailed,
 )
 from gateway.application.routing.catalog import ProviderDescriptor
 
@@ -249,3 +258,159 @@ async def test_the_timeout_is_the_connections_value_not_the_httpx_default() -> N
     timeout = seen["timeout"]
     assert isinstance(timeout, dict)
     assert timeout["read"] == 1.5
+
+
+# ------------------------------------------------------------------ streaming (Phase 5 M1)
+
+
+def _sse(*frames: str) -> bytes:
+    """An SSE body as a provider would write it, framed exactly as the wire format specifies."""
+    return "".join(f"data: {frame}\n\n" for frame in frames).encode()
+
+
+async def stream(
+    handler: object, *, connections: dict[str, ProviderConnection] | None = None
+) -> list[ProviderStreamEvent]:
+    client = client_returning(handler, connections=connections)
+    return [event async for event in client.stream(PROVIDER, REQUEST)]
+
+
+def _chunk(text: str) -> str:
+    return json.dumps({"choices": [{"delta": {"content": text}}]})
+
+
+_USAGE_FRAME = json.dumps({"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 7}})
+
+
+async def test_a_streamed_call_asks_for_usage_explicitly() -> None:
+    """Without ``stream_options.include_usage`` an OpenAI-compatible server reports no usage at
+    all for a streamed call, and this adapter refuses to invent any - so asking is what keeps the
+    call accountable rather than free."""
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, content=_sse(_chunk("hi"), _USAGE_FRAME, "[DONE]"))
+
+    await stream(handler)
+
+    assert seen["stream"] is True
+    assert seen["stream_options"] == {"include_usage": True}
+
+
+async def test_a_streamed_call_yields_chunks_then_a_completion_carrying_usage() -> None:
+    events = await stream(
+        lambda _req: httpx.Response(
+            200, content=_sse(_chunk("hi "), _chunk("there"), _USAGE_FRAME, "[DONE]")
+        )
+    )
+
+    assert [e.content for e in events if isinstance(e, StreamChunk)] == ["hi ", "there"]
+    terminal = events[-1]
+    assert isinstance(terminal, StreamCompleted)
+    assert terminal.usage == ProviderUsage(prompt_tokens=11, completion_tokens=7)
+
+
+async def test_a_streamed_call_that_reports_no_usage_completes_with_none() -> None:
+    """Never a fabricated zero: "the provider said nothing" and "the provider said zero" are
+    different facts, and only the consumer may decide what the first one costs."""
+    events = await stream(lambda _req: httpx.Response(200, content=_sse(_chunk("hi"), "[DONE]")))
+
+    terminal = events[-1]
+    assert isinstance(terminal, StreamCompleted)
+    assert terminal.usage is None
+
+
+async def test_role_only_and_empty_frames_are_skipped_not_streamed_as_blanks() -> None:
+    opening = json.dumps({"choices": [{"delta": {"role": "assistant"}}]})
+    events = await stream(
+        lambda _req: httpx.Response(200, content=_sse(opening, _chunk("x"), "[DONE]"))
+    )
+
+    assert [e.content for e in events if isinstance(e, StreamChunk)] == ["x"]
+
+
+async def test_an_http_error_before_the_stream_starts_is_a_classified_failure() -> None:
+    events = await stream(
+        lambda _req: httpx.Response(429, json={"error": {"message": "UPSTREAM DETAIL"}})
+    )
+
+    assert len(events) == 1
+    failure = events[0]
+    assert isinstance(failure, StreamFailed)
+    assert failure.error_category is ProviderErrorCategory.RATE_LIMITED
+    assert "UPSTREAM DETAIL" not in (failure.error or "")
+
+
+async def test_a_malformed_frame_ends_the_stream_instead_of_being_skipped() -> None:
+    """Dropping a frame out of the middle of an answer the client will concatenate and believe is
+    worse than ending the stream and saying so."""
+    events = await stream(
+        lambda _req: httpx.Response(200, content=_sse(_chunk("good"), "{not json", "[DONE]"))
+    )
+
+    assert [e.content for e in events if isinstance(e, StreamChunk)] == ["good"]
+    failure = events[-1]
+    assert isinstance(failure, StreamFailed)
+    assert failure.error_category is ProviderErrorCategory.SERVER_ERROR
+
+
+async def test_a_non_object_frame_ends_the_stream() -> None:
+    events = await stream(lambda _req: httpx.Response(200, content=_sse("[1, 2, 3]")))
+
+    assert isinstance(events[-1], StreamFailed)
+
+
+async def test_a_stream_truncated_before_done_emits_no_terminal_event() -> None:
+    """The consumer must not be able to mistake a truncated stream for a completed one, so the
+    adapter deliberately says nothing rather than saying "done"."""
+    events = await stream(lambda _req: httpx.Response(200, content=_sse(_chunk("half"))))
+
+    assert [e.content for e in events if isinstance(e, StreamChunk)] == ["half"]
+    assert not any(isinstance(e, StreamCompleted | StreamFailed) for e in events)
+
+
+async def test_a_streamed_timeout_is_a_retryable_category_and_leaks_no_url() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out reading https://api.example.test/v1", request=request)
+
+    events = await stream(handler)
+
+    failure = events[-1]
+    assert isinstance(failure, StreamFailed)
+    assert failure.error_category is ProviderErrorCategory.TIMEOUT
+    assert "api.example.test" not in (failure.error or "")
+
+
+async def test_a_streamed_transport_error_is_a_server_error_and_leaks_no_url() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("cannot reach https://api.example.test/v1", request=request)
+
+    events = await stream(handler)
+
+    failure = events[-1]
+    assert isinstance(failure, StreamFailed)
+    assert failure.error_category is ProviderErrorCategory.SERVER_ERROR
+    assert "api.example.test" not in (failure.error or "")
+
+
+async def test_streaming_an_unconfigured_provider_fails_closed_without_a_call() -> None:
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
+        nonlocal called
+        called = True
+        return httpx.Response(200)
+
+    events = await stream(handler, connections={})
+
+    assert called is False
+    failure = events[0]
+    assert isinstance(failure, StreamFailed)
+    assert failure.error_category is ProviderErrorCategory.AUTHENTICATION
+
+
+async def test_a_streamed_call_never_puts_the_api_key_in_an_event() -> None:
+    events = await stream(lambda _req: httpx.Response(500, text="boom"))
+
+    assert all("sk-secret-value" not in str(event) for event in events)
