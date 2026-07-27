@@ -1,0 +1,84 @@
+name: CI
+
+# Runs the repository's canonical validation script - the same one used locally - against real
+# PostgreSQL and Redis. It deliberately does NOT define its own weaker check list: every gate is
+# whatever scripts/validate.sh enforces today, so CI cannot drift from local validation.
+#
+# Gate 2 (integration against real backing services) runs in full. The infrastructure comes from
+# the repository's own docker-compose.dev.yml rather than from GitHub `services:` containers,
+# because the compose file mounts backend/docker/initdb, which creates the least-privilege `app_rw`
+# LOGIN role. Without that role the ADR-0014 runtime-role gate could not run, and Gate 2 would be
+# a weaker imitation of itself.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Gate 1 + Gate 2
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      # Ephemeral, CI-local credentials. These mirror docker-compose.dev.yml exactly and can only
+      # ever reach the containers started in this job on localhost. No secret is required, and the
+      # workflow must never need one.
+      #
+      # Runtime/DDL split (ADR-0014): the application and tests connect as the least-privilege
+      # app_rw role so RLS is genuinely enforced; migrations run as the schema owner.
+      GATEWAY_DATABASE__URL: postgresql+asyncpg://app_rw:app_rw@localhost:5432/gateway
+      GATEWAY_MIGRATION_DATABASE__URL: postgresql+asyncpg://gateway:gateway@localhost:5432/gateway
+      GATEWAY_TEST_REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install uv (provisions Python 3.13 per pyproject.toml)
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Start PostgreSQL (pgvector) and Redis
+        run: docker compose -f docker-compose.dev.yml up -d
+
+      - name: Wait for services to report healthy
+        run: |
+          for attempt in $(seq 1 60); do
+            pg=$(docker inspect --format '{{.State.Health.Status}}' \
+              "$(docker compose -f docker-compose.dev.yml ps -q postgres)" 2>/dev/null || echo starting)
+            rd=$(docker inspect --format '{{.State.Health.Status}}' \
+              "$(docker compose -f docker-compose.dev.yml ps -q redis)" 2>/dev/null || echo starting)
+            echo "attempt ${attempt}: postgres=${pg} redis=${rd}"
+            if [ "${pg}" = "healthy" ] && [ "${rd}" = "healthy" ]; then
+              echo "services healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "services did not become healthy in time"
+          docker compose -f docker-compose.dev.yml logs
+          exit 1
+
+      # The canonical gate. Enforces ruff, ruff format, mypy --strict, 47 import-linter contracts,
+      # 17 structural guards, validation parity, the migration guardrail, alembic upgrade head, the
+      # NOSUPERUSER/NOBYPASSRLS runtime-role check, pytest with coverage, and a hard zero-skipped
+      # rule. Exit 2 means Gate 2 did not run, which this workflow treats as failure.
+      - name: Run canonical validation (scripts/validate.sh)
+        run: bash scripts/validate.sh
+
+      - name: Tear down services
+        if: always()
+        run: docker compose -f docker-compose.dev.yml down -v

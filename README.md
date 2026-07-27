@@ -28,28 +28,16 @@ than by convention.
 
 ---
 
-## Contents
-
-- [What this is](#what-this-is) · [Why it exists](#why-it-exists)
-- [Capabilities](#capabilities)
-- [Architecture](#architecture) · [Request lifecycle](#request-lifecycle) · [Routing](#routing--provider-execution) · [Cost & budget](#cost--budget-enforcement)
-- [Security & tenant isolation](#security--tenant-isolation) · [Reliability](#reliability) · [Observability](#observability)
-- [Project structure](#project-structure) · [Technology stack](#technology-stack)
-- [Quick start](#quick-start) · [API](#api)
-- [Validation & engineering quality](#validation--engineering-quality)
-- [Architecture decisions](#architecture-decisions) · [Development history](#development-history)
-- [Known limitations](#known-limitations--deliberate-deferrals) · [What this demonstrates](#what-this-demonstrates)
-
 ## What this is
 
 An HTTP gateway that sits between applications and LLM providers and owns the questions a
 provider SDK does not answer: **who is calling, whether they may, which provider should serve it,
 whether the budget allows it, what it actually cost, and what to do when the provider fails.**
 
-It is **enterprise-oriented, not production-deployed** — there is no cloud deployment, no CI
-pipeline and no live provider account in this repository. What it does have is a complete serving
-runtime, validated against real PostgreSQL and real Redis, with architectural boundaries the build
-refuses to let you cross.
+It is **enterprise-oriented, not production-deployed** — there is no cloud deployment and no live
+provider account in this repository. What it does have is a complete serving runtime, validated
+against real PostgreSQL and real Redis, with architectural boundaries the build refuses to let
+you cross.
 
 ## Why it exists
 
@@ -64,40 +52,6 @@ being about prompts:
 
 This is the layer that answers them, with tenant isolation enforced by the database rather than by
 application code remembering to filter.
-
-## Capabilities
-
-Status is deliberately granular. *Distributed* means shared across replicas; *replica-local* means
-each process keeps its own copy.
-
-| Capability | Implementation | Status |
-|---|---|---|
-| **Provider abstraction** | `ProviderClient` / `StreamingProviderClient` ports | Implemented |
-| **Provider execution** | Real `httpx` calls to any OpenAI-compatible `/chat/completions` endpoint | Implemented — no vendor SDKs; fails closed when unconfigured |
-| **Explainable routing** | 5-agent runtime → typed `RoutingDecision` carrying its reasoning trace | Implemented |
-| **Adaptive routing** | `HealthTieredRoutingStrategy` — healthy preferred over recovering, open circuits excluded | Implemented |
-| **Circuit breaking** | Three-state breaker per `(tenant, provider)` | Implemented — **replica-local** |
-| **Hard budget enforcement** | Reserve → commit in PostgreSQL, row-locked, idempotent | Implemented — **persistent** |
-| **Cost accounting** | `Decimal` money, effective-dated pricing, settled on real token counts | Implemented — **persistent** (`cost_ledger`) |
-| **Reservation reconciliation** | TTL sweep with `FOR UPDATE SKIP LOCKED` | Implemented — **persistent** |
-| **Response caching** | Exact-match, tenant-scoped, TTL | Implemented — **persistent**, exact-match only |
-| **Reflection / retry** | Bounded retry through the whole coordinated path | Implemented |
-| **Streaming** | Server-Sent Events with a structurally enforced commit boundary | Implemented |
-| **Authentication** | API keys + JWT, JWKS publication, signing-key rotation | Implemented |
-| **Authorization** | Fail-closed RBAC, permission declared per endpoint | Implemented |
-| **Tenant isolation** | `ENABLE` + `FORCE` RLS on 34 tables, non-superuser runtime role | Implemented — **enforced by PostgreSQL** |
-| **Policy** | `LocalPolicyEngine` as a pipeline stage | Implemented — local/deterministic |
-| **Ingress protection** | Per-tenant token bucket + request-size cap | Implemented |
-| **Distributed rate limiting** | Redis token bucket, atomic Lua, server-side clock | Implemented — **distributed** |
-| **Evaluation** | Two deterministic evaluators, observational | Implemented — non-streaming only |
-| **Observability** | 16 Prometheus series, structured logs, hash-chained audit | Implemented |
-| **Request deduplication** | `asyncio` single-flight coalescing | Implemented — **replica-local** |
-
-> **On provider integration.** The adapter speaks the OpenAI-compatible wire protocol over `httpx`,
-> so it reaches OpenAI, Azure OpenAI, vLLM, Together, Groq or a local runtime once a base URL and
-> key are configured. There are **no vendor SDK dependencies** and no native Anthropic/Bedrock/Vertex
-> clients. With nothing configured the gateway refuses provider calls rather than fabricating a
-> response.
 
 ## Architecture
 
@@ -135,7 +89,7 @@ flowchart TB
     B402 --> OBS
     CB -.->|health feeds routing| P3
 
-    PG[("PostgreSQL — RLS FORCE on 34 tables<br/>budgets · cost ledger · cache · pricing · RBAC · audit")]
+    PG[("PostgreSQL — RLS FORCE on every tenant table<br/>budgets · cost ledger · cache · pricing · RBAC · audit")]
     RD[("Redis<br/>shared rate-limit buckets")]
     RES -.-> PG
     CACHE -.-> PG
@@ -147,6 +101,40 @@ flowchart TB
 Layering is enforced by **47 import-linter contracts**, so this diagram cannot silently drift from
 the code: delivery cannot reach a provider client, the rate limiter cannot reach the budget ledger,
 and a streamed request cannot reach the retry loop.
+
+## Capabilities
+
+Status is deliberately granular. *Distributed* means shared across replicas; *replica-local* means
+each process keeps its own copy.
+
+| Capability | Implementation | Status |
+|---|---|---|
+| **Provider abstraction** | `ProviderClient` / `StreamingProviderClient` ports | Implemented |
+| **Provider execution** | Real `httpx` calls to any OpenAI-compatible `/chat/completions` endpoint | Implemented — no vendor SDKs; fails closed when unconfigured |
+| **Explainable routing** | 5-agent runtime → typed `RoutingDecision` carrying its reasoning trace | Implemented |
+| **Adaptive routing** | `HealthTieredRoutingStrategy` — healthy preferred over recovering, open circuits excluded | Implemented |
+| **Circuit breaking** | Three-state breaker per `(tenant, provider)` | Implemented — **replica-local** |
+| **Hard budget enforcement** | Reserve → commit in PostgreSQL, row-locked, idempotent | Implemented — **persistent** |
+| **Cost accounting** | `Decimal` money, effective-dated pricing, settled on real token counts | Implemented — **persistent** (`cost_ledger`) |
+| **Reservation reconciliation** | TTL sweep with `FOR UPDATE SKIP LOCKED` | Implemented — **persistent** |
+| **Response caching** | Exact-match, tenant-scoped, TTL | Implemented — **persistent**, exact-match only |
+| **Reflection / retry** | Bounded retry through the whole coordinated path | Implemented |
+| **Streaming** | Server-Sent Events with a structurally enforced commit boundary | Implemented |
+| **Authentication** | API keys + JWT, JWKS publication, signing-key rotation | Implemented |
+| **Authorization** | Fail-closed RBAC, permission declared per endpoint | Implemented |
+| **Tenant isolation** | `ENABLE` + `FORCE` RLS on every tenant-scoped table and partition (40 tables + 5 partitions today), non-superuser runtime role | Implemented — **enforced by PostgreSQL** |
+| **Policy** | `LocalPolicyEngine` as a pipeline stage | Implemented — local/deterministic |
+| **Ingress protection** | Per-tenant token bucket + request-size cap | Implemented |
+| **Distributed rate limiting** | Redis token bucket, atomic Lua, server-side clock | Implemented — **distributed** |
+| **Evaluation** | Two deterministic evaluators, observational | Implemented — non-streaming only |
+| **Observability** | 16 Prometheus series, structured logs, hash-chained audit | Implemented |
+| **Request deduplication** | `asyncio` single-flight coalescing | Implemented — **replica-local** |
+
+> **On provider integration.** The adapter speaks the OpenAI-compatible wire protocol over `httpx`,
+> so it reaches OpenAI, Azure OpenAI, vLLM, Together, Groq or a local runtime once a base URL and
+> key are configured. There are **no vendor SDK dependencies** and no native Anthropic/Bedrock/Vertex
+> clients. With nothing configured the gateway refuses provider calls rather than fabricating a
+> response.
 
 ## Request lifecycle
 
@@ -268,9 +256,10 @@ API key / JWT → fail-closed RBAC → PostgreSQL `FORCE` RLS → restricted run
   place; nothing downstream may derive tenancy from a header or body.
 - **Authorization fails closed.** An endpoint must declare the permission it needs, and an unwired
   RBAC backend denies everything rather than allowing it.
-- **Isolation is the database's job.** 34 tenant tables carry `ENABLE` + `FORCE` row-level security,
-  and validation asserts at runtime that the application's role is `NOSUPERUSER` / `NOBYPASSRLS` — a
-  superuser connection would silently defeat every policy, so the gate checks rather than assumes.
+- **Isolation is the database's job.** Every tenant-scoped table carries `ENABLE` + `FORCE`
+  row-level security, and validation asserts at runtime that the application's role is
+  `NOSUPERUSER` / `NOBYPASSRLS` — a superuser connection would silently defeat every policy,
+  so the gate checks rather than assumes.
   Migrations run as a separate owner role; the application cannot execute DDL.
 - **Secrets are resolved by reference**, never inlined — the resolver maps `gateway/jwt/signing-key`
   to an environment variable and logs only the reference.
@@ -452,9 +441,15 @@ Every guard has been proven to fail on a deliberate violation, because a check t
 worse than no check.
 
 Validation is **three-state** — `PASS` / `FAIL` / `INCOMPLETE` — so a run that could not reach
-PostgreSQL reports as unverified rather than green. One guard checks that the two validation
-entrypoints stay in step; another checks that no production module is silently excluded from the
-repository by a `.gitignore` rule.
+PostgreSQL reports as unverified rather than green.
+
+GitHub Actions runs [`scripts/validate.sh`](scripts/validate.sh) itself against Dockerised
+PostgreSQL and Redis started from this repository's own `docker-compose.dev.yml`. CI defines no
+separate, weaker check list: whatever the local gate enforces is what CI enforces, including the
+zero-skipped rule and the `NOSUPERUSER`/`NOBYPASSRLS` runtime-role check.
+
+One guard checks that the two validation entrypoints stay in step; another checks that no
+production module is silently excluded from the repository by a `.gitignore` rule.
 
 ## Architecture decisions
 
@@ -476,10 +471,13 @@ The last two are the ones worth reading: they record what was *deleted* and what
 | Phase | Focus | Status |
 |---|---|---|
 | Foundation | Requirements, architecture, database design, API contracts | Complete |
-| Phase 4 | Enterprise AI gateway architecture — agent runtime, routing, provider execution, cost accounting, budget ledger, caching, reflection, evaluation, policy, RBAC, observability, adaptive routing | **Complete** — [final review](docs/Phase4_Final_Architecture_Review.md) |
+| Phase 4 | Enterprise AI gateway architecture | **Complete** — [final review](docs/Phase4_Final_Architecture_Review.md) |
 | Phase 5 M1–M2 | Streaming inference; serving correctness and debt closure | **Delivered** |
 | Phase 5 M3–M4 | Ingress protection; distributed runtime state | **Delivered** |
 | Phase 5 M5 | Operational readiness (tracing, deployment, DR) | **Evaluated and formally not justified** — [plan](docs/Phase5_Master_Execution_Plan.md) |
+
+Phase 4 delivered the agent runtime, routing, provider execution, cost accounting, budget
+ledger, caching, reflection, evaluation, policy, RBAC, observability and adaptive routing.
 
 M5 was a conditional milestone. It was assessed against the repository rather than assumed, and
 recorded as not justified: tracing has no second hop or replica to trace, the migration story and
@@ -498,8 +496,8 @@ repository cannot produce. Not building it was the finding.
 - **Caching is exact-match** — no semantic or near-duplicate matching, and no embedding pipeline.
 - **Evaluation is deterministic and observational** — no LLM judge; results are not persisted.
 - **Streaming** has no evaluation, deduplication, or pre-first-chunk failover.
-- **No distributed tracing, no CI pipeline, no cloud deployment** — validation runs locally through
-  `scripts/validate.sh` / `.ps1`.
+- **No distributed tracing and no cloud deployment** — the gateway is run and validated locally,
+  and in CI, against Dockerised PostgreSQL and Redis.
 - **Deferred by decision, with triggers recorded:** distributed circuit health, semantic/vector
   cache, OPA policy, ML/bandit routing, enterprise memory, benchmark service.
 
@@ -515,7 +513,7 @@ architecture as something to execute rather than describe.
 
 ## License
 
-Licensing has not been finalized. No `LICENSE` file is currently provided.
+Released under the [MIT License](LICENSE).
 
 ---
 
