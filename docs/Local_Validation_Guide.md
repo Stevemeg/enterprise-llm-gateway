@@ -31,6 +31,10 @@ cp backend/.env.example backend/.env        # non-secret local config
 # (WSL/Git-Bash) make scripts executable:
 chmod +x scripts/*.sh
 ```
+`.env` holds **application settings only**. `Settings` rejects unknown `GATEWAY_*` keys
+(`extra="forbid"`), so tooling variables - `GATEWAY_MIGRATION_DATABASE__URL` (§4) and
+`GATEWAY_TEST_REDIS_URL` - are **exported in the shell**, never set in `.env`. They are commented
+out in `.env.example` for that reason.
 
 ## 3. Required services (PostgreSQL + Redis)
 ```bash
@@ -53,7 +57,7 @@ export GATEWAY_MIGRATION_DATABASE__URL="postgresql+asyncpg://gateway:gateway@loc
 
 # run migrations as the owner (the app_rw role cannot run DDL — by design):
 GATEWAY_DATABASE__URL="$GATEWAY_MIGRATION_DATABASE__URL" uv run alembic upgrade head
-GATEWAY_DATABASE__URL="$GATEWAY_MIGRATION_DATABASE__URL" uv run alembic current  # head = 0003_database_roles
+GATEWAY_DATABASE__URL="$GATEWAY_MIGRATION_DATABASE__URL" uv run alembic current  # head = 0007_rbac_seed_audit_chain
 ```
 The `app_rw` LOGIN role is created once at cluster init by `backend/docker/initdb`; migration
 `0003` then grants it least privilege. If you recreate the DB, use `docker compose ... down -v`.
