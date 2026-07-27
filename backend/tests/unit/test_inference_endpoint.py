@@ -199,6 +199,11 @@ class Harness:
         with_auth: bool = True,
         stream_events: list[ProviderStreamEvent] | None = None,
         unpriced: bool = False,
+        # Phase 5 M3. Both default to "absent", so every pre-M3 test in this module keeps
+        # exercising the exact chain it always did and a regression here cannot hide behind a
+        # newly-added layer. tests/unit/test_ingress_protection.py turns them on.
+        rate_limiter: Any | None = None,
+        max_body_bytes: int | None = None,
     ) -> None:
         clock = FixedClock()
         self.client = FakeProviderClient(
@@ -264,6 +269,8 @@ class Harness:
             authenticator=StubAuthenticator() if with_auth else None,
             audit_sink=LoggingAuthAuditSink() if with_auth else None,
             inference_service=service,
+            rate_limiter=rate_limiter,
+            max_request_bytes=max_body_bytes,
         )
         self.http = TestClient(self.app)
 

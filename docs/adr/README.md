@@ -37,6 +37,7 @@ traceability, as mandated by the project workflow.
 | [0018](0018-exact-match-response-cache-and-request-deduplication.md) | Exact-match response caching and process-local request deduplication | Accepted | (scopes ADR-0006's mechanism, does not reverse it) |
 | [0019](0019-api-key-credential-bootstrap-lookup.md) | API-key credential bootstrap lookup (SECURITY DEFINER) | Accepted | (RLS bootstrap) |
 | [0020](0020-narrowing-proven-vacuous-tier-1-surface.md) | Narrowing proven-vacuous Tier-1 surface | Accepted | (Tier-1 contraction; authorizes removing `PipelineStage.after_response`/`on_error` and `RoutingDecision.selected_model`) |
+| [0021](0021-distributed-runtime-state-scope.md) | Distributed runtime state — what is shared now, and what stops at a Rule-5 gate | Accepted | (First real Redis consumer; shares rate limiting behind the unchanged port, **stops** on the circuit breaker and deduplicator, and reverses M3's fail-closed choice to degraded-closed for this control) |
 
 All nine Phase-1 architecture-blocking questions are resolved by the ADRs marked in **bold**. A
 tabular cross-reference of every decision is in

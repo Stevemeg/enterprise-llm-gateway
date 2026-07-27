@@ -138,6 +138,73 @@ class ProviderConnectionSettings(BaseModel):
     timeout_seconds: float = Field(default=30.0, gt=0)
 
 
+class IngressSettings(BaseModel):
+    """Ingress protection at the delivery boundary (Phase 5 M3, FR-064/065).
+
+    These are the **default platform limits** ``docs/API_Rate_Limiting.md`` §2 names: "Default
+    platform limits apply if no policy is set, protecting shared infra (NFR-SEC08)." The
+    per-organization / per-project / per-key ``rate_limit_policy`` hierarchy that section also
+    describes is *not* implemented, and deliberately so: it is configured through ``POST
+    /rate-limits``, an admin API that does not exist, so a policy reader would be a table with no
+    writer and a seam with no consumer. Each tenant still gets its **own** bucket - only the
+    bucket's size is deployment-wide until something can vary it.
+
+    Defaults are conservative but not obstructive: 10 rps sustained with a burst of 20 is far above
+    any interactive use and far below what it takes to saturate a provider connection pool. They
+    are limits an operator is expected to raise deliberately, not values tuned against a benchmark
+    this project has not run - stated plainly rather than presented as measured.
+    """
+
+    model_config = {"frozen": True}
+
+    requests_per_second: float = Field(default=10.0, gt=0)
+    burst: int = Field(default=20, ge=1)
+    #: 1 MiB. Comfortably larger than any prompt an interactive caller sends, and small enough that
+    #: buffering one is not a memory event. A deployment serving long documents raises it knowingly.
+    max_request_bytes: int = Field(default=1_048_576, ge=1)
+
+
+class RedisSettings(BaseModel):
+    """Shared runtime state (Phase 5 M4, ADR-0021). **Optional by design.**
+
+    With ``url`` empty the composition root wires the in-process limiter exactly as M3 did, so a
+    single-node deployment - the only shape this repository can currently deploy - acquires no Redis
+    dependency it did not ask for. The same posture ``rls_enabled`` takes for Sql* vs InMemory*.
+
+    ``key_prefix`` exists so two deployments pointed at one Redis (a shared dev box, a staging
+    cluster) cannot silently share buckets and throttle each other.
+
+    There is no password field: the credential belongs **in** the URL, which is where redis-py
+    expects it, and ``safe_url`` is what gets logged. A separate secret reference would be the
+    ADR-0011 shape, and is the right change the moment anything other than a local container is
+    connected to - recorded rather than pre-built.
+    """
+
+    model_config = {"frozen": True}
+
+    url: str = ""
+    key_prefix: str = "gateway"
+    #: Kept short on purpose: the limiter sits in front of every request, so a slow Redis must
+    #: degrade quickly rather than add its own latency to the path it exists to protect.
+    timeout_seconds: float = Field(default=0.25, gt=0)
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.url)
+
+    @property
+    def safe_url(self) -> str:
+        """URL with any password redacted - safe to log (NFR-SEC03)."""
+        if not self.url:
+            return ""
+        scheme, _, rest = self.url.partition("://")
+        if "@" not in rest:
+            return self.url
+        credentials, _, host = rest.rpartition("@")
+        user, _, password = credentials.partition(":")
+        return f"{scheme}://{user}:***@{host}" if password else f"{scheme}://{user}@{host}"
+
+
 class Settings(BaseSettings):
     """Immutable, validated process configuration."""
 
@@ -171,6 +238,10 @@ class Settings(BaseSettings):
     # minutes, far beyond the 30s provider timeout x 3 reflection attempts this gateway can
     # currently produce (see application/accounting/reservation_reconciler.py).
     reservation_ttl_seconds: int = Field(default=900, gt=0)
+    # Phase 5 M3. Per-tenant ingress rate limiting and request-size limits.
+    ingress: IngressSettings = IngressSettings()
+    # Phase 5 M4 (ADR-0021). Shared runtime state; unset means single-node, in-process.
+    redis: RedisSettings = RedisSettings()
 
     @model_validator(mode="after")
     def _enforce_production_invariants(self) -> Settings:

@@ -1,6 +1,7 @@
 # Phase 5 — Master Execution Plan (Proposed)
 
-**Status:** In progress — **M1 and M2 delivered** (2026-07-26); M3-M5 not started
+**Status:** **M1-M4 delivered** (M1/M2 2026-07-26; M3/M4 2026-07-27). **M5 evaluated and NOT
+JUSTIFIED** — Phase 5 closes without it; see the evidence log's M5 gate section.
 **Created:** 2026-07-25 · **Baseline:** `main` @ `d5d3bc2` · tag `v1.21.0-phase4-slices20-21`
 **Implementation baseline for M1/M2:** `main` @ `863ad64` · tag `v1.21.1-phase4-closeout`
 **Subordinate to** accepted ADRs and source. ADR-0016 remains **frozen**; nothing here amends it.
@@ -34,9 +35,9 @@ proven in the Phase-4 review, not a hypothetical.
 |---|---|---|---|---|
 | P5-M1 | Streaming inference | Review §4.1 (BLOCKER) | — | **Delivered** |
 | P5-M2 | Serving correctness & debt closure | §4.2, §4.3, §4.6 + D1/D2/D3 | M1 | **Delivered — all 6 items resolved.** 4 in-milestone; 2 via [ADR-0020](adr/0020-narrowing-proven-vacuous-tier-1-surface.md), written as the GP-2 stop, then **accepted and applied** before publication |
-| P5-M3 | Ingress protection | §4.5 (rate limit, size limits) | M2 | Not started |
-| P5-M4 | Distributed runtime state | §4.8 (cross-replica) + eventing | M1–M3 | Not started |
-| P5-M5 *(conditional)* | Operational readiness | §4.7 (OTel), deploy, DR | M1–M4 | Not started |
+| P5-M3 | Ingress protection | §4.5 (rate limit, size limits) | M2 | **Delivered.** Prediction CONFIRMED: a capability-owned `RateLimiterPort` + two middlewares, no Tier-1 diff, no ADR |
+| P5-M4 | Distributed runtime state | §4.8 (cross-replica) + eventing | M1–M3 | **Delivered, prediction SPLIT.** Shared rate limiting on Redis behind the **unchanged** M3 port; the circuit breaker and deduplicator **FALSIFIED** it (sync port / no port) and stopped at a Rule-5 gate — [ADR-0021](adr/0021-distributed-runtime-state-scope.md) |
+| P5-M5 *(conditional)* | Operational readiness | §4.7 (OTel), deploy, DR | M1–M4 | **NOT JUSTIFIED — not implemented.** Tracing has no second hop or replica to trace; manifests are out of scope; the migration story and config validation already exist; a DR runbook would document a deployment shape that does not exist |
 
 ---
 

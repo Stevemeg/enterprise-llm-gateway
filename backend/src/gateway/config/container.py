@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from gateway.adapters.audit.composite_sink import CompositeAuthAuditSink
@@ -41,6 +42,11 @@ from gateway.adapters.providers.openai_compatible_client import (
     ProviderConnection,
 )
 from gateway.adapters.providers.unconfigured_client import UnconfiguredProviderClient
+from gateway.adapters.ratelimit.client import create_redis_client
+from gateway.adapters.ratelimit.degraded import DegradedRateLimiter
+from gateway.adapters.ratelimit.health import SharedStateHealthCheck
+from gateway.adapters.ratelimit.in_memory_token_bucket import InMemoryTokenBucketRateLimiter
+from gateway.adapters.ratelimit.redis_token_bucket import RedisTokenBucketRateLimiter
 from gateway.adapters.secrets.env_resolver import EnvSecretsResolver
 from gateway.adapters.security.jwt import JwtService
 from gateway.adapters.security.key_provider import KeyProvider
@@ -74,6 +80,7 @@ from gateway.application.ports.ledger import BudgetLedgerPort
 from gateway.application.ports.policy import PolicyEnginePort
 from gateway.application.ports.pricing import PricingPort
 from gateway.application.ports.providers import ProviderClient
+from gateway.application.ports.rate_limit import RateLimiterPort, RateLimitPolicy
 from gateway.application.ports.routing import RoutingEngine
 from gateway.application.ports.routing_strategy import RoutingStrategy
 from gateway.application.ports.secrets import SecretNotFoundError, SecretsResolver
@@ -230,6 +237,11 @@ class Container:
     authorization_stage: AuthorizationStage
     request_pipeline: RequestPipeline
     inference_service: InferenceService
+    rate_limiter: RateLimiterPort
+    #: Phase 5 M4. ``None`` when no shared store is configured - the single-node profile.
+    #: Held so ``dispose`` can close the pool: a connection pool nobody owns is a leak on
+    #: every reload, and the engine has been disposed here since Slice 1 for the same reason.
+    redis_client: Redis | None
 
     @classmethod
     def create(
@@ -493,8 +505,50 @@ class Container:
             request_pipeline, reflective_executor, evaluation_runner, streaming_coordinator
         )
 
+        # --- ingress protection (Phase 5 M3) ---------------------------------------------
+        # One limiter for the process, built here and nowhere else (a construction guard enforces
+        # it): a component that made its own would count a fraction of the traffic and let the
+        # rest through, with every test still green. Delivery receives it through the
+        # RateLimiterPort and never learns that a token bucket is what answers.
+        #
+        #
+        # Phase 5 M4 (ADR-0021): THE ONE-LINE SWAP, and the evidence for the milestone's central
+        # claim. With Redis configured the shared bucket replaces the local one and *nothing else
+        # changes* - not the port, not the middleware, not the delivery layer, not a test of
+        # either. Where that claim proved false (the circuit breaker's synchronous port, the
+        # deduplicator's absent one) M4 stopped and ADR-0021 records why.
+        #
+        # Without Redis the in-process bucket remains, and each replica then enforces the limit
+        # independently: N replicas admit up to N times the configured rate. An honest single-node
+        # bound, not a distributed guarantee.
+        policy = RateLimitPolicy(
+            requests_per_second=settings.ingress.requests_per_second,
+            burst=settings.ingress.burst,
+        )
+        local_limiter = InMemoryTokenBucketRateLimiter(clock, policy)
+        redis_client: Redis | None = None
+        rate_limiter: RateLimiterPort = local_limiter
+        if settings.redis.is_configured:
+            redis_client = create_redis_client(
+                url=settings.redis.url, timeout_seconds=settings.redis.timeout_seconds
+            )
+            # Degraded-closed on outage (ADR-0021 decision 4): the local bucket still enforces the
+            # same policy, so a Redis blip costs the *sharing*, not the limit - and never the
+            # budget, which is Postgres-backed and stays fail-closed.
+            rate_limiter = DegradedRateLimiter(
+                RedisTokenBucketRateLimiter(
+                    redis_client, policy, key_prefix=settings.redis.key_prefix
+                ),
+                local_limiter,
+            )
+
         health = HealthRegistry(version=settings.service_version, clock=clock)
         health.register("database", DatabaseHealthCheck(engine))
+        # Phase 5 M4: a dependency this process has must appear on the surface operators read.
+        # Registered only when Redis is configured - a single-node deployment has no shared state,
+        # so a check reporting on one would be describing a component that does not exist.
+        if isinstance(rate_limiter, DegradedRateLimiter):
+            health.register("shared_rate_limit_state", SharedStateHealthCheck(rate_limiter))
 
         get_logger("bootstrap").info(
             "container_initialised",
@@ -505,6 +559,10 @@ class Container:
             rls_enabled=rls_enabled,
             oidc_configured=auth.oidc.is_configured,
             signing_kid=key_provider.current.kid,
+            # Phase 5 M4: whether this process shares rate-limit state, and with what.
+            # safe_url, never url: a Redis credential must not reach the log.
+            shared_rate_limit_state=settings.redis.is_configured,
+            redis=settings.redis.safe_url,
         )
         return cls(
             settings=settings,
@@ -544,8 +602,19 @@ class Container:
             authorization_stage=authorization_stage,
             request_pipeline=request_pipeline,
             inference_service=inference_service,
+            rate_limiter=rate_limiter,
+            redis_client=redis_client,
         )
 
     async def dispose(self) -> None:
-        """Release owned resources (connection pool). Called on app shutdown."""
-        await self.engine.dispose()
+        """Release owned resources (connection pools). Called on app shutdown.
+
+        Phase 5 M4: the Redis pool is closed too, and its failure is not allowed to prevent the
+        database pool from closing - shutdown must release everything it can rather than stopping
+        at the first resource that objects.
+        """
+        try:
+            if self.redis_client is not None:
+                await self.redis_client.aclose()
+        finally:
+            await self.engine.dispose()

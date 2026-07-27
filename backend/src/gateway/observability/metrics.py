@@ -145,6 +145,19 @@ _RESERVATION_OUTCOMES: Final = frozenset({"reserved", "exceeded", "unavailable"}
 #: label reuses the existing ``outcome`` name, so no new label name is introduced.
 _CIRCUIT_TRANSITIONS: Final = frozenset({"opened", "closed", "half_opened"})
 
+# --- Phase 5 M3: ingress protection ----------------------------------------------------------
+#: Which ingress control decided. Two values, fixed in this module - not configuration-bounded and
+#: certainly not request-supplied.
+INGRESS_RATE_LIMIT: Final = "rate_limit"
+INGRESS_BODY_SIZE: Final = "body_size"
+_INGRESS_CONTROLS: Final = frozenset({INGRESS_RATE_LIMIT, INGRESS_BODY_SIZE})
+#: What it decided. ``unavailable`` is a third state on purpose: a control that could not answer is
+#: not the same event as one that said no, and an operator must be able to alert on it separately.
+INGRESS_ALLOWED: Final = "allowed"
+INGRESS_DENIED: Final = "denied"
+INGRESS_UNAVAILABLE: Final = "unavailable"
+_INGRESS_OUTCOMES: Final = frozenset({INGRESS_ALLOWED, INGRESS_DENIED, INGRESS_UNAVAILABLE})
+
 
 admission_stage_decisions = Counter(
     "gateway_admission_stage_decisions_total",
@@ -219,6 +232,12 @@ provider_circuit_transitions = Counter(
     "gateway_provider_circuit_transitions_total",
     "Circuit-breaker state transitions per provider; outcome=opened is a provider being excluded.",
     labelnames=("provider", "outcome"),
+)
+
+ingress_decisions = Counter(
+    "gateway_ingress_decisions_total",
+    "Ingress-protection verdicts by control; outcome=denied is a refused request.",
+    labelnames=("control", "outcome"),
 )
 
 
@@ -316,6 +335,26 @@ def record_budget_reservation(*, outcome: str) -> None:
     _record(
         "budget_reservation",
         lambda: budget_reservations.labels(outcome=_bounded(outcome, _RESERVATION_OUTCOMES)).inc(),
+    )
+
+
+def record_ingress_decision(*, control: str, outcome: str) -> None:
+    """One ingress-protection verdict (Phase 5 M3).
+
+    **Deliberately not labelled by scope**, which is a documented deviation from
+    ``docs/API_Rate_Limiting.md`` §7 ("metrics allow/deny per scope"). The scope here is the
+    organization, and a tenant id as a label value makes the series count grow with the customer
+    base - unbounded in exactly the way the cardinality guard exists to prevent, and it puts tenant
+    identity into an endpoint scraped by shared infrastructure (NFR-SEC03). The plan's M3 objective
+    requires ingress protection to be cardinality-bounded, and where the two texts pull apart the
+    bound wins. Per-tenant attribution belongs in the tenant-scoped audit log, not in Prometheus.
+    """
+    _record(
+        "ingress_decision",
+        lambda: ingress_decisions.labels(
+            control=_bounded(control, _INGRESS_CONTROLS),
+            outcome=_bounded(outcome, _INGRESS_OUTCOMES),
+        ).inc(),
     )
 
 

@@ -889,3 +889,33 @@ strict clean (236 files), import-linter 34 kept / 0 broken.** Alembic head uncha
 | Typed accounting refusal | `application/ports/execution.py`, `application/execution/inference_coordinator.py` | `NOT_ACCOUNTABLE`; 503 `accounting_unavailable` at the route |
 | **Removed** | `application/accounting/budget_enforcer.py`, `application/ports/budget.py`, `adapters/budget/` | Superseded by `ReservationService`/`BudgetLedgerPort`; no consumer in all of Phase 4 |
 | **Tier-1 contraction (applied)** | [ADR-0020](adr/0020-narrowing-proven-vacuous-tier-1-surface.md) | `PipelineStage.after_response`/`on_error` and `RoutingDecision.selected_model` **removed** - **Accepted and applied**. Zero call sites, zero writers; pinned by `tests/unit/test_tier1_contraction_adr_0020.py` |
+
+## Phase 5 M3 - Ingress protection
+
+| Concern | Where | Notes |
+|---|---|---|
+| The seam | `application/ports/rate_limit.py` | `RateLimiterPort` (capability-owned), `RateLimitPolicy`, `RateLimitDecision`, `RateLimiterUnavailableError`. `async` at birth - `API_Rate_Limiting.md` §4 decides a Redis token bucket, and the sync `CircuitBreaker` port is the cautionary precedent |
+| First implementation (Rule 4) | `adapters/ratelimit/in_memory_token_bucket.py` | Per-organization token bucket; injected `Clock`; backwards clock steps cannot mint tokens |
+| Rate-limit enforcement | `delivery/http/middleware/rate_limit.py` | Inside authentication (needs the verified tenant), outside the router (must precede RBAC, routing, reservation, provider). 429 + `Retry-After` + `RateLimit`; 503 fail-closed when the limiter cannot answer |
+| Body-size enforcement | `delivery/http/middleware/body_limit.py` | Raw ASGI. Declared `Content-Length` over the cap → 413 with zero body reads; no usable length → bounded read-and-replay. Raising from `receive` was tried and **does not work**: FastAPI converts any body-read exception into its own 400 |
+| Chain order | `delivery/http/app.py`, `config/bootstrap.py` | `RequestContext → RequestSizeLimit → Authentication → RateLimit → routes`. Optional in `build_http_app`, **unconditional** in `create_app` |
+| Limits | `config/settings.py` | `IngressSettings`: 10 rps / burst 20 / 1 MiB. A limit that would refuse every request fails at startup |
+| Observability | `observability/metrics.py` | `gateway_ingress_decisions_total{control,outcome}`. **No scope label** - a documented deviation from `API_Rate_Limiting.md` §7 |
+| Enforcement (new) | `scripts/check_ingress_construction.py`, `pyproject.toml` | "rate limiters count and reach no capability"; "ingress rate limiting is consumed only at the delivery boundary" |
+| Enforcement (extended) | `pyproject.toml`, `scripts/check_metric_cardinality.py` | "HTTP delivery holds no infrastructure adapter" + `adapters.ratelimit`; `control` label and `ingress_decisions` metric |
+| Not built, with reasons | — | Per-tenant `rate_limit_policy` (no admin API to write it); concurrency caps (no consumer); IP limiting for unauthenticated traffic (`X-Forwarded-For` is forgeable without trusted-proxy config; the edge owns it per `System_Context.md`) |
+
+## Phase 5 M4 - Distributed runtime state ([ADR-0021](adr/0021-distributed-runtime-state-scope.md))
+
+| Concern | Where | Notes |
+|---|---|---|
+| Second implementation (Rule 4) | `adapters/ratelimit/redis_token_bucket.py` | Atomic Lua refill-and-take; server-side `TIME` so replicas share one clock; TTL'd, tenant-scoped, payload-free keys |
+| Connection lifetime | `adapters/ratelimit/client.py`, `config/container.py` | Primitives in, `Redis` out (adapters may not import `config`); pool held by the container and closed in `dispose` |
+| Fail mode | `adapters/ratelimit/degraded.py` | Degraded-**closed**: the local bucket enforces the same policy. Separate from the Redis adapter so the policy can be superseded without touching the integration |
+| Operational visibility | `adapters/ratelimit/health.py`, `application/ports/health.py`, `delivery/http/ops/health.py` | `CheckResult` now carries a `HealthState`, giving the previously **unproducible** `DEGRADED` its first producer; registry aggregates worst-wins; a degraded gateway stays *ready* |
+| Configuration | `config/settings.py` | `RedisSettings`; **optional** - unset means the M3 single-node wiring. `safe_url` redacts the credential before it can be logged |
+| **The one-line swap** | `config/container.py` | With Redis configured the shared bucket replaces the local one and *nothing else changes* - port, middleware and delivery are byte-unchanged |
+| Enforcement (new) | `pyproject.toml` | "the Redis client is an adapter concern" |
+| Enforcement (extended) | `scripts/check_ingress_construction.py` | `RedisTokenBucketRateLimiter`, `DegradedRateLimiter`, `create_redis_client` |
+| Gate 2 | `scripts/validate.sh`, `scripts/validate.ps1` | Postgres configured but no Redis → **FAIL**, so the shared-state tests cannot silently skip |
+| **Stopped at a Rule-5 gate** | [ADR-0021](adr/0021-distributed-runtime-state-scope.md) | Distributed **circuit breaking** (the port is synchronous) and distributed **deduplication** (there is no port, and `coalesce`'s generic `T` is not transportable). Both recorded with evidence and a supersession path; neither applied |

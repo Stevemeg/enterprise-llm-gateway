@@ -67,6 +67,7 @@ ALLOWED_LABEL_NAMES = frozenset(
         "provider",  # Slice 16: catalog-bounded provider name
         "verdict",  # Slice 16: RetryVerdict
         "evaluator",  # Slice 16: wired evaluator chain
+        "control",  # Phase 5 M3: which ingress control decided; two values fixed in metrics.py
     }
 )
 
@@ -137,6 +138,7 @@ GUARDED_METRICS = frozenset(
         "evaluations",
         "budget_reservations",
         "provider_circuit_transitions",  # Slice 20
+        "ingress_decisions",  # Phase 5 M3
     }
 )
 

@@ -17,6 +17,7 @@ dependencies = [
     "pyjwt>=2.9",
     "cryptography>=43",
     "httpx>=0.27",          # OIDC: JWKS fetch + token exchange (adapter layer only)
+    "redis>=5.2",           # ADR-0021: shared ingress rate limiting (adapter layer only)
 ]
 
 [dependency-groups]
@@ -771,6 +772,11 @@ allow_indirect_imports = true
 #   - adapters.pricing / adapters.catalog -> the route cannot price a call or choose what is routable
 # NOT forbidden: adapters.security and adapters.audit, which the authentication middleware is
 # constructed from upstream and which are already fenced by their own contracts.
+# Phase 5 M3 EXTENDS this rather than adding a parallel contract: adapters.ratelimit is one more
+# infrastructure adapter the delivery layer must not hold. The rate-limit middleware sees only
+# RateLimiterPort, so a shared-store limiter replaces the in-process one without delivery noticing
+# - and, more immediately, the middleware cannot construct a private bucket that would count a
+# fraction of the traffic while every test stayed green.
 name = "HTTP delivery holds no infrastructure adapter"
 type = "forbidden"
 source_modules = ["gateway.delivery"]
@@ -782,6 +788,7 @@ forbidden_modules = [
     "gateway.adapters.health",
     "gateway.adapters.pricing",
     "gateway.adapters.catalog",
+    "gateway.adapters.ratelimit",
 ]
 
 [[tool.importlinter.contracts]]
@@ -812,3 +819,84 @@ forbidden_modules = [
     "gateway.application.ports.authorization",
     "gateway.application.evaluation",
 ]
+
+[[tool.importlinter.contracts]]
+# Phase 5 M3 Guard 1 - a rate limiter COUNTS and decides admission by volume; it decides nothing
+# else. Same shape and same reasoning as the Slice-20 circuit-breaker contract, because it is the
+# same category of component: shared, injected runtime state that a capability must never be able
+# to reach around. One forbidden target per claim:
+#   - application.routing.engine / agents -> the limiter cannot route or reach AgentRuntime
+#   - application.providers / execution / streaming -> it cannot invoke a provider or run the
+#     cache/reserve/execute/settle sequence; it refuses BEFORE all of that, from outside
+#   - application.accounting / ports.ledger -> it cannot author cost or move budget. This one is
+#     load-bearing: "rate limit is checked before budget reservation" (API_Rate_Limiting.md 1)
+#     is only meaningful if the limiter cannot itself reserve
+#   - application.pipeline / serving / authorization -> it cannot admit, serve or authorize; a
+#     limiter that could authorize would be a second, unaudited access-control decision
+name = "rate limiters count and reach no capability"
+type = "forbidden"
+source_modules = ["gateway.adapters.ratelimit"]
+forbidden_modules = [
+    "gateway.application.routing.engine",
+    "gateway.application.agents",
+    "gateway.application.providers",
+    "gateway.application.execution",
+    "gateway.application.streaming",
+    "gateway.application.accounting",
+    "gateway.application.ports.ledger",
+    "gateway.application.pipeline",
+    "gateway.application.serving",
+    "gateway.application.authorization",
+]
+
+[[tool.importlinter.contracts]]
+# Phase 5 M3 Guard 2 - ingress protection is consumed at the DELIVERY BOUNDARY and nowhere else.
+# The inverse direction of Guard 1, and the one that keeps the ordering claim checkable: if a
+# capability could consult the limiter, this system would have two enforcement points, "rate limit
+# runs before budget reservation" would depend on which one fired, and a request could be counted
+# twice or - worse - counted only on a path some future caller does not take.
+# gateway.delivery and gateway.config are deliberately absent from the sources: the middleware is
+# the consumer and the composition root is the builder. Everything that serves a request is here.
+name = "ingress rate limiting is consumed only at the delivery boundary"
+type = "forbidden"
+source_modules = [
+    "gateway.application.serving",
+    "gateway.application.pipeline",
+    "gateway.application.execution",
+    "gateway.application.streaming",
+    "gateway.application.reflection",
+    "gateway.application.evaluation",
+    "gateway.application.accounting",
+    "gateway.application.routing",
+    "gateway.application.agents",
+    "gateway.application.providers",
+]
+forbidden_modules = [
+    "gateway.application.ports.rate_limit",
+    "gateway.adapters.ratelimit",
+]
+
+[[tool.importlinter.contracts]]
+# Phase 5 M4 Guard 1 (ADR-0021) - the Redis client is an ADAPTER concern. ADR-0005 chose Redis
+# behind a port precisely so producers and consumers would not bind to it, and this milestone is
+# its first real consumer, which is exactly when that intent is easiest to lose: the rate-limit
+# middleware is two files away from the client and "just check Redis here" is one import.
+#   - application / domain -> a capability that imported redis would have chosen an infrastructure
+#     backend for a decision the port exists to keep abstract (the application-layer contract
+#     already forbids it; this restates the claim for domain and pins it where the others live)
+#   - delivery -> the middleware sees RateLimiterPort and must not learn what answers it, or the
+#     in-process/shared substitution stops being invisible to it
+#   - observability / shared -> both are leaves; a Redis import in either would make a
+#     cross-cutting module carry an infrastructure dependency
+# gateway.config is deliberately absent: the composition root owns the pool and annotates the
+# field it holds, exactly as it already does with sqlalchemy's AsyncEngine.
+name = "the Redis client is an adapter concern"
+type = "forbidden"
+source_modules = [
+    "gateway.application",
+    "gateway.domain",
+    "gateway.delivery",
+    "gateway.observability",
+    "gateway.shared",
+]
+forbidden_modules = ["redis"]

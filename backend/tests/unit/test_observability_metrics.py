@@ -567,6 +567,7 @@ def test_metrics_module_declares_no_label_outside_the_guarded_allowlist() -> Non
         metrics.evaluations,
         metrics.budget_reservations,
         metrics.provider_circuit_transitions,
+        metrics.ingress_decisions,
     ):
         for name in metric._labelnames:
             assert name in {
@@ -579,7 +580,36 @@ def test_metrics_module_declares_no_label_outside_the_guarded_allowlist() -> Non
                 "provider",
                 "verdict",
                 "evaluator",
+                "control",
             }
+
+
+def test_the_ingress_metric_carries_no_tenant_dimension() -> None:
+    """Phase 5 M3, and a deliberate deviation from ``API_Rate_Limiting.md`` §7 ("metrics per
+    scope"). The scope is the organization; labelling by it would grow the series count with the
+    customer base and put tenant identity on a shared scrape endpoint. Pinned so a later edit
+    adding "just one" scope label has to argue with this test."""
+    assert metrics.ingress_decisions._labelnames == ("control", "outcome")
+
+
+def test_every_ingress_constant_the_middlewares_use_is_inside_its_allowlist() -> None:
+    """The pairing check the enum-based metrics get for free. These vocabularies are module
+    constants rather than a ``StrEnum``, so nothing else would catch a value that had drifted out
+    of its allowlist and started reporting as ``unknown``."""
+    assert {metrics.INGRESS_RATE_LIMIT, metrics.INGRESS_BODY_SIZE} <= metrics._INGRESS_CONTROLS
+    assert {
+        metrics.INGRESS_ALLOWED,
+        metrics.INGRESS_DENIED,
+        metrics.INGRESS_UNAVAILABLE,
+    } <= metrics._INGRESS_OUTCOMES
+
+
+def test_an_out_of_vocabulary_ingress_control_collapses_to_unknown() -> None:
+    before = counter_value(metrics.ingress_decisions, control=UNKNOWN, outcome="denied")
+
+    metrics.record_ingress_decision(control="something_invented", outcome="denied")
+
+    assert counter_value(metrics.ingress_decisions, control=UNKNOWN, outcome="denied") == before + 1
 
 
 def test_configuration_bounded_labels_are_documented_as_such() -> None:

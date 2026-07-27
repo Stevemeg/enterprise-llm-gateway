@@ -19,6 +19,26 @@ test rather than left to a comment.
 
 Both middlewares remain optional so tests and non-auth deployments can build the app without an
 authenticator, matching the existing treatment of ``key_provider``.
+
+## Phase 5 M3: the chain becomes four layers, and each position is forced
+
+Outermost to innermost, with the constraint that fixes each one:
+
+1. ``RequestContextMiddleware`` - must be first so every response below it, including the two new
+   refusals, carries an ``X-Request-Id`` and appears in the access log.
+2. ``RequestSizeLimitMiddleware`` - needs no identity, and authentication is not free (the API-key
+   path performs a database lookup). Reading a multi-gigabyte body in order to *then* discover it
+   is unauthenticated would be strictly worse than refusing it on arrival, so the cheaper,
+   identity-independent gate goes first.
+3. ``AuthenticationMiddleware`` - establishes the verified tenant.
+4. ``RateLimitMiddleware`` - **must** be inside authentication, because its key is
+   ``request.state.auth.organization_id`` and nothing else is trustworthy; and **must** be outside
+   the router, because everything it protects (RBAC's query, the agent chain, the reservation, the
+   provider call) lives in the route.
+
+Positions 2 and 4 are therefore not interchangeable and not a matter of taste: swapping them would
+either rate-limit on an identity that does not exist yet, or buffer an unbounded body before
+finding out whether the caller is anyone. ``test_app.py`` pins the resulting order.
 """
 
 from __future__ import annotations
@@ -30,9 +50,12 @@ from fastapi import FastAPI
 
 from gateway.application.ports.auth import AuthAuditSink, Authenticator
 from gateway.application.ports.jwks import JwksPublisher
+from gateway.application.ports.rate_limit import RateLimiterPort
 from gateway.application.serving.inference_service import InferenceService
 from gateway.delivery.http.api.inference import build_inference_router
 from gateway.delivery.http.middleware.authentication import AuthenticationMiddleware
+from gateway.delivery.http.middleware.body_limit import RequestSizeLimitMiddleware
+from gateway.delivery.http.middleware.rate_limit import RateLimitMiddleware
 from gateway.delivery.http.middleware.request_context import RequestContextMiddleware
 from gateway.delivery.http.ops.health import HealthRegistry
 from gateway.delivery.http.ops.jwks import build_jwks_router
@@ -48,6 +71,8 @@ def build_http_app(
     authenticator: Authenticator | None = None,
     audit_sink: AuthAuditSink | None = None,
     inference_service: InferenceService | None = None,
+    rate_limiter: RateLimiterPort | None = None,
+    max_request_bytes: int | None = None,
     on_shutdown: Callable[[], Awaitable[None]] | None = None,
 ) -> FastAPI:
     """Construct the ASGI app with the middleware pipeline, ops routes, and lifespan."""
@@ -65,10 +90,20 @@ def build_http_app(
         openapi_url="/openapi.json",
         lifespan=lifespan,
     )
-    # Added FIRST so it ends up INNER: request context must already be established when
-    # authentication runs (see the module docstring).
+    # Added in reverse order of execution: the LAST one added is the outermost and runs first
+    # (see the module docstring for why each position is forced).
+    #
+    # Innermost. Added before authentication so it runs *after* it and can read the verified
+    # tenant off request.state. Optional so a deployment or test without a limiter keeps the
+    # pre-M3 chain rather than being handed a fabricated one.
+    if rate_limiter is not None:
+        app.add_middleware(RateLimitMiddleware, limiter=rate_limiter)
     if authenticator is not None and audit_sink is not None:
         app.add_middleware(AuthenticationMiddleware, authenticator=authenticator, audit=audit_sink)
+    # Outside authentication: identity-independent, and refusing here avoids a database lookup
+    # for a body that was never going to be accepted.
+    if max_request_bytes is not None:
+        app.add_middleware(RequestSizeLimitMiddleware, max_bytes=max_request_bytes)
     # Added LAST so it is outermost and runs first.
     app.add_middleware(RequestContextMiddleware)
 

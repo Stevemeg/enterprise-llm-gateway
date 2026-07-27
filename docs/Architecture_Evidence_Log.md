@@ -2807,3 +2807,245 @@ stage implementing only `before_request` now satisfies the protocol, where befor
 
 **No `scripts/*.py` AST guard encoded the removed surfaces** (verified by grep), so none required
 modification.
+
+---
+
+## Phase 5 — Milestone 3: Ingress protection
+
+**Milestone type: Capability.** It consumes existing seams and introduces one capability-owned
+port. **No action against ADR-0016** (frozen, byte-unchanged). **No new ADR** — see the Rule-5
+determination below. No schema change, no migration, **no Tier-1 diff**.
+
+### Pre-registered experiment, and its result
+
+| | |
+|---|---|
+| *Prediction* (plan §P5-M3) | "a `RateLimiterPort` with a single-node implementation satisfies the requirement and needs no Tier-1 change; cross-node sharing is a *separate* consumer" |
+| *Falsification* | "if correctness demands cross-node counting from day one, the single-node implementation is insufficient and M3 must merge into M4" |
+| **Result** | **CONFIRMED.** The port was born, the middleware consumed it, and cross-node sharing stayed a separate consumer — which M4 then became, behind this port unchanged. |
+
+### Rule-5 determination (issued before implementation)
+
+| Protocol | Determination |
+|---|---|
+| Tier-1 invariants 1–5 | **NOT TRIGGERED.** Counting a tenant's requests changes nothing about `McpGatewayPort`, `ToolRegistryPort`, `RoutingDecision`, `BaseAgent` or `PipelineStage`. Verified by diff: all five files are byte-unchanged. |
+| `RateLimiterPort` (new) | **Rule 2 birth, capability-owned, no ADR** — the same footing as `PermissionResolver` (Slice 5), `ProviderClient` (Slice 7), `PricingPort` (Slice 8), `CircuitBreaker` (Slice 20), `RoutingStrategy` (Slice 21) and `StreamingProviderClient` (M1), none of which shipped an ADR. Rule 2's ADR requirement governs the birth of a *Tier-1* seam; this is not one. |
+| Existing capability ports | **NOT TRIGGERED.** No field was added to any of them. The limiter needs only `organization_id`, which `AuthenticationContext` already published. |
+| ADR requirement | **None.** The plan pre-declared that only *choosing fail-open* or *requiring a shared store* would force one; M3 does neither. |
+
+### Abuse paths that existed, and what now bounds each
+
+| Path | Before | After |
+|---|---|---|
+| Unbounded request volume per tenant | Nothing. Budget bounded *spend*, not load: one request costs ~5 database round-trips plus a provider call, so a tenant with a large budget could saturate the pool | Per-tenant token bucket above the router |
+| Unbounded request body | `prompt` had `min_length=1` and no maximum. The body is buffered by FastAPI, measured by the policy engine, SHA-256'd into the cache key and shipped upstream | 1 MiB default cap, enforced before parsing |
+| Unauthenticated flood | Reached the authenticator, which performs a database lookup for an API key | Unchanged, and deliberately so — see the limitation below |
+| Streaming resource hold | A stream holds a reservation, a provider connection and an SSE connection | Counted as one request at initiation (`API_Rate_Limiting.md` §5); no concurrency cap (not required by the plan, and Rule 5 forbids building one with no consumer) |
+
+### Decisions with their reasons
+
+- **Two middlewares, not one.** Body size is identity-independent and must run before the body is
+  read; rate limiting needs a verified tenant. Different constraints force different positions, so
+  merging them would have put one of them in the wrong place.
+- **Chain order is forced, and pinned.** `RequestContext → RequestSizeLimit → Authentication →
+  RateLimit → routes`. Swapping positions 2 and 4 would either key the limiter on an identity that
+  does not exist yet, or buffer an unbounded body before learning whether the caller is anyone.
+  `test_app.py::test_the_process_runs_all_four_middlewares_in_the_forced_order` pins it against the
+  chain `create_app` actually builds, not against `build_http_app`'s source.
+- **The limit key is `AuthenticationContext.organization_id` and nothing else.** A caller-supplied
+  tenant hint would let anyone spend a competitor's allowance or mint unlimited fresh buckets.
+  Proven with a hostile `X-Organization-Id`.
+- **Fail-closed on limiter outage, chosen not defaulted.** ADR-0009's bias is that protective
+  controls fail closed; the plan's M3 objective says "fail-closed"; and an in-process limiter has
+  no network dependency to flake, so the availability cost was ~zero. Recorded with the condition
+  for revisiting it — which M4 then met (ADR-0021 decision 4).
+- **No per-tenant policy table.** `API_Rate_Limiting.md` §2's org/project/key hierarchy is
+  configured through `POST /rate-limits`, an admin API that does not exist. A policy reader would
+  be a table with no writer. Each tenant gets its own bucket; only the *size* is deployment-wide.
+- **The metric carries no scope label.** A deliberate, documented deviation from §7's "allow/deny
+  per scope": the scope is the organization, and a tenant id as a label value grows the series
+  count with the customer base and puts tenant identity on a shared scrape endpoint.
+
+### Known limitation, recorded rather than closed
+
+**Unauthenticated traffic is not rate limited.** Without `request.state.auth` there is no
+trustworthy key. IP-based limiting was rejected with a reason: `request.client.host` is the proxy
+behind any proxy, and `X-Forwarded-For` is forgeable without a trusted-proxy chain this deployment
+has no configuration for — so it would let an attacker both evade the limit and deny others.
+`System_Context.md` already assigns "TLS, WAF, rate limit, DDoS" to the Z0→Z1 edge. The in-process
+cost of such a request is bounded: it reaches the authenticator and is refused 401.
+
+### Guard classification and proofs
+
+| Guard / contract | Classification | Deliberate-failure proof |
+|---|---|---|
+| `check_ingress_construction.py` | **NEW** | limiter constructed in the middleware → exit 1 naming `middleware/rate_limit.py`; adapter constructed in `inference_service.py` → exit 1 naming it. Restored (SHA-256 identical) → exit 0 |
+| "rate limiters count and reach no capability" | **NEW** contract | `adapters.ratelimit` imports `application.accounting` → BROKEN → restored → 46 kept |
+| "ingress rate limiting is consumed only at the delivery boundary" | **NEW** contract | `inference_coordinator.py` imports `ports.rate_limit` → BROKEN → restored → 46 kept |
+| "HTTP delivery holds no infrastructure adapter" | **REUSED AND EXTENDED** (+`gateway.adapters.ratelimit`) | the middleware imports the concrete limiter → BROKEN → restored → 46 kept |
+| `check_metric_cardinality.py` | **REUSED AND EXTENDED** (`control` label, `ingress_decisions` metric) | it *failed first, unprompted*, when the label was added — the guard doing its job before it was told to. Then: `control` removed from the allowlist → exit 1; `.labels()` called outside `metrics.py` → exit 1; an `organization` label added → exit 1 (forbidden substring). All restored → exit 0 |
+| Circuit-breaker construction guard | **NOT EXTENDED, with a reason** | Its subject is provider-health feedback. A reader asking "who may build the rate limiter" has no reason to open it, and broadening it to "shared runtime state" would have made its message vaguer for both. Recorded rather than silently reused |
+| All other guards and contracts | **REUSED UNCHANGED and PASS** | none weakened |
+
+**8 deliberate-failure proofs for M3**, each with byte-identical restoration verified by SHA-256.
+
+---
+
+## Phase 5 — Milestone 4: Distributed runtime state
+
+**Milestone type: Capability + one governance stop.** **No action against ADR-0016** (frozen,
+byte-unchanged). **One new ADR: [ADR-0021](adr/0021-distributed-runtime-state-scope.md)**, which is
+both the GP-2 stop and the record of what was built. No schema change, no migration, **no Tier-1
+diff**.
+
+### Pre-registered experiment, and its result
+
+| | |
+|---|---|
+| *Prediction* (plan §P5-M4) | "a shared store implements shared circuit/dedup **behind the existing ports with no Tier-1 change** — the Phase-4 seams were the right shape"; "*Expected result:* one-line composition-root swap; multi-node tests green; **ports byte-stable**" |
+| *Falsification* | "if the `CircuitBreaker`/deduplicator ports cannot express distributed semantics without interface changes, the Phase-4 abstraction was wrong (the review's stated top risk realized)" |
+| **Result** | **SPLIT, and the falsification fired for two of three.** |
+
+| State | Seam | Verdict |
+|---|---|---|
+| Rate limiter (M3) | `RateLimiterPort` — `async def acquire(...) -> RateLimitDecision` | **PREDICTION CONFIRMED.** One-line swap; the port, the decision type, the middleware and the whole delivery layer are byte-unchanged, and **no test of any of them was modified** |
+| Circuit breaker | `CircuitBreaker` — `def observe`, `def assess` | **FALSIFIED.** Both methods are synchronous by an explicit documented decision. Sharing state needs I/O; synchronous I/O in the event loop blocks every concurrent request |
+| Deduplicator | *none* | **FALSIFIED, more severely.** There is no port at all. `InferenceCoordinator` names the concrete class; `coalesce(..., operation: Callable[[], Awaitable[T]]) -> T` is generic in an unbounded `T` and its `operation` is a closure over process-bound objects — not transportable at any price |
+
+**Two documentation corrections this produced.** (1) The plan lists `RequestDeduplicator` under M4's
+"seams consumed"; **it is not a seam** — Rule 4's "additional implementations" was never available
+for it. (2) ADR-0018 states "`redis` is a declared dependency used by nothing"; at the M1+M2
+baseline `redis` appeared **only** as a forbidden module in an import-linter contract and was
+absent from `[project.dependencies]` and from the venv. M4 therefore *adds* a production
+dependency rather than activating a dormant one, and ADR-0021 weighs it on those terms.
+
+The background-refresh workaround for the breaker was evaluated, not dismissed, and rejected on
+three specific grounds: consecutive-failure counters do not merge, so it shares the verdict but not
+the evidence; each node's cooldown elapses independently, so N nodes admit N probes where the design
+would claim one; and it needs a background-task supervisor the runtime does not have. See ADR-0021.
+
+### Rule-5 determination (issued before implementation)
+
+| Protocol | Determination |
+|---|---|
+| Tier-1 invariants 1–5 | **NOT TRIGGERED.** All five byte-unchanged. |
+| `RateLimiterPort` | **NOT TRIGGERED, and that is the milestone's result.** The shared implementation conforms to the M3 port unmodified — proven structurally by `test_the_redis_limiter_satisfies_the_unmodified_m3_port`. |
+| `CircuitBreaker` | **WOULD BE TRIGGERED → STOPPED.** The plan pre-declared "any port change is a Rule-5 stop", and GP-2 forbids taking it inside the milestone. Not applied; recorded in ADR-0021 with the supersession path. |
+| `RequestDeduplicator` | **WOULD BE TRIGGERED → STOPPED.** Needs a port that does not exist plus transportable leader/follower semantics — a redesign of the concept, not a second implementation. |
+| `CheckResult` (health) | **Rule 5 event, capability-owned.** Consumer: the Redis health check, which *cannot be implemented correctly* without it — see the M5 gate below. |
+
+### What was built
+
+- `RedisTokenBucketRateLimiter` — refill-and-take as **one atomic Lua script** per key. Split into
+  GET/SET it is a lost-update race that admits more than the limit precisely under load. Time comes
+  from Redis `TIME` inside the script, so one clock governs every replica and a single skewed node
+  cannot mint tokens. Keys are `{prefix}:rl:{organization_id}`, TTL'd to the bucket's full-refill
+  time so an idle tenant's key removes itself — no sweeper, no unbounded keyspace.
+- `DegradedRateLimiter` — ADR-0021 decision 4, kept **separate from the Redis adapter** so the fail
+  mode can be superseded without touching the integration, and so the adapter can never fabricate
+  an answer it did not receive.
+- Redis is **optional**: unset `GATEWAY_REDIS__URL` keeps the exact M3 wiring, so the single-node
+  profile acquires no dependency it did not ask for.
+
+### Fail mode: M3's fail-closed reversed to degraded-closed, for this control only
+
+M3 pre-registered the trigger — "the day it is not [in-process] (a shared store, M4) is the day the
+trade-off is genuinely different and must be re-decided". With a network dependency in the path,
+failing closed converts a Redis blip into a total gateway outage. `API_Rate_Limiting.md` §4 already
+decided for a "conservative default cap … while not blocking all traffic on a soft control. Hard
+*budget* remains fail-closed."
+
+**It is degraded-closed, not fail-open**, and the distinction is the justification: the local bucket
+enforces the *same policy*, so the effective ceiling during an outage is N × the configured rate for
+N replicas — bounded and stateable, not unlimited; the **financial** control is untouched and stays
+fail-closed against the PostgreSQL ledger; and it is metered, logged on transition, and surfaced as
+a `DEGRADED` component on `/healthz`.
+
+### Proof against the real backend
+
+18 integration tests against **real Redis 7.4**, each using limiters with **separate objects and
+separate connection pools** — because two objects sharing one in-memory fake is exactly how a
+"distributed" claim is faked. Including a deliberate **control test**
+(`test_two_objects_sharing_one_dict_would_not_have_passed`) that shows two *in-process* limiters
+yield 2 × burst, so "shared" is a measured difference rather than a word.
+
+| Property | Evidence |
+|---|---|
+| Cross-instance visibility | burst spent on replica A → replica B refused; 4 replicas × burst 5 → exactly 5 allowed |
+| Atomicity under concurrency | 40 concurrent acquires across 8 replicas, burst 6 → exactly 6 |
+| Tenant isolation | noisy tenant exhausted on A → quiet tenant still allowed on B; concurrent two-tenant traffic uncontaminated |
+| Key safety | exact key set asserted; every stored value parses as a number (no prompt, credential, principal or correlation id) |
+| Namespacing | two prefixes over one Redis do not share buckets |
+| Expiry | TTL present; a tenant returning after expiry starts full rather than denied |
+| Recovery | survives `SCRIPT FLUSH` (EVALSHA → EVAL fallback) |
+| Outage | unreachable Redis raises `RateLimiterUnavailableError`, never a denial; degrades to a still-limiting local bucket; writes nothing to the shared store; returns to shared once healthy |
+| Port parity (Rule 4) | both implementations produce the same verdict sequence and the same denial contract |
+
+**Gate 2 now requires Redis.** A run with Postgres but no Redis is not a lesser pass — it is a run
+in which the shared-state tests could not execute. `validate.sh`/`.ps1` fail before pytest if no
+Redis URL is set, which keeps the 0-skipped rule honest instead of letting the distributed claim
+disappear behind a skip. **Proven** by unsetting the variable: `FAIL - Gate 2 requires Redis`.
+
+### Guard classification and proofs
+
+| Guard / contract | Classification | Deliberate-failure proof |
+|---|---|---|
+| `check_ingress_construction.py` | **REUSED AND EXTENDED** (+`RedisTokenBucketRateLimiter`, `DegradedRateLimiter`, `create_redis_client`) | each constructed outside the composition root → exit 1 naming the offender; restored → exit 0. Extended rather than duplicated: these are *more rate limiters*, the same test that made Slice 9 extend the accounting guard |
+| "the Redis client is an adapter concern" | **NEW** contract | the middleware imports `redis.asyncio` → BROKEN → restored → 47 kept |
+| Circuit-breaker construction + isolation contracts | **REUSED UNCHANGED and PASS** | the plan asked to "prove the *old* guard still holds for the *new* subject"; there is no new subject, because M4 stopped |
+| All other guards and contracts | **REUSED UNCHANGED and PASS** | none weakened |
+
+**4 deliberate-failure proofs for M4**, each with byte-identical restoration verified by SHA-256.
+**12 across M3 + M4.**
+
+---
+
+## Phase 5 — Milestone 5 gate: **NOT JUSTIFIED**
+
+Evaluated after M3 and M4 were green, against the repository rather than the plan's aspiration.
+
+**Exact plan language.** "*Objective.* OpenTelemetry tracing, deployment manifests,
+migration-on-deploy story, config validation surfacing, and a disaster-recovery runbook."
+"*Why conditional.* Only worth doing once the runtime semantics (M1–M4) are settled."
+
+| Plan item | Real operator need? | Already satisfied? | Verdict |
+|---|---|---|---|
+| **OpenTelemetry tracing** | The review's own trigger was "needed the moment there is **more than one hop or replica**". There is neither: one process, one provider call, and no multi-replica deployment exists | Prometheus (14 series), structured logs with `request_id` bound across the whole path, hash-chained audit | **NOT JUSTIFIED.** Span trees over a single-hop path add sophistication, not a closed gap |
+| **Deployment manifests** | — | `docker-compose.dev.yml` for local | **OUT OF SCOPE BY INSTRUCTION** (Kubernetes/Terraform/cloud deployment explicitly excluded) |
+| **Migration-on-deploy story** | Yes | Already exists: ADR-0014 runtime/DDL split, `GATEWAY_MIGRATION_DATABASE__URL`, `alembic upgrade head` in both validation scripts, documented in `.env.example` and the local validation guide | **ALREADY SATISFIED** |
+| **Config validation surfacing** | Yes | `Settings` production validators fail fast; `_build_provider_connections` fails startup on an unresolvable credential; M3 added ingress bounds (a limit that would refuse every request fails at boot); M4 added Redis settings with a redacting `safe_url` | **ALREADY SATISFIED** |
+| **Disaster-recovery runbook** | Yes, *for a deployment that exists* | No | **NOT JUSTIFIED.** It would document a deployment shape this repository cannot produce — the plan's own reason for rejecting alternative D ("a runbook written now documents a runtime about to change") |
+
+**Determination: NOT JUSTIFIED. M5 is not implemented, and Phase 5 closes without it.** Every
+remaining item is either already satisfied, excluded by instruction, or waiting on a multi-replica
+deployment that does not exist — which is GP-1's definition of a deferral rather than a milestone.
+
+### One gap the gate evaluation *did* surface — and it belongs to M4
+
+Evaluating "config validation surfacing" against the real ops endpoints found a defect **this
+session created**: M4 added a second infrastructure dependency and `/healthz` listed one. An
+operator reading the surface built for exactly that question would see "database: ok" while the
+deployment quietly enforced per-replica limits.
+
+Underneath it, a pre-existing vacuity: **`HealthState.DEGRADED` had existed since the ops endpoints
+were built and had never been produced by anything.** `CheckResult` carried `healthy: bool`, so the
+registry could only map to OK or DOWN — the third state was *unproducible*.
+
+That made the Redis check impossible to write correctly, which is precisely Rule 5's test:
+
+- `DOWN` would be actively harmful — `/readyz` answers 503, an orchestrator evicts the replica, and
+  ADR-0021's deliberate degradation becomes the outage it chose degraded-closed to avoid.
+- `OK` would hide a dependency failure from the surface operators check first.
+
+So `CheckResult` now carries a `HealthState` with `ok`/`degraded`/`down` constructors (two booleans
+for three states was rejected — Rule 3), the registry aggregates worst-wins with an explicit rank,
+`HealthReport.is_ready` remains `status is not DOWN` so a degraded gateway stays ready, and
+`SharedStateHealthCheck` reports the limiter's *actual request-path experience* rather than a ping
+(a Redis that accepts connections but fails `EVAL` passes a ping and fails every limiter call).
+The check is registered **only** when Redis is configured — a check describing a component that does
+not exist would be worse than none. `CheckResult.healthy` was removed rather than kept as a
+misleadingly-named shim: it had no production reader.
+
+**Classified as M4 completeness, not as M5.** M4 created the dependency, so M4 owns making it
+observable. Recorded here rather than folded silently into the milestone above, because it was found
+*after* M4 was validated and the final validation was re-run on the changed bytes.

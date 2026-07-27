@@ -51,6 +51,9 @@ uv run python ../scripts/check_resolver_construction.py src/gateway || fail "Res
 step "Circuit-breaker construction guard (only the composition root may build one)"
 uv run python ../scripts/check_circuit_breaker_construction.py src/gateway || fail "Circuit-breaker construction guard failed (ADR-0016 Slice 20)."
 
+step "Ingress construction guard (only the composition root may build a rate limiter)"
+uv run python ../scripts/check_ingress_construction.py src/gateway || fail "Ingress construction guard failed (Phase 5 M3)."
+
 step "Routing engine guard (construction + sole AgentRuntime caller)"
 uv run python ../scripts/check_routing_engine.py src/gateway || fail "Routing engine guard failed (ADR-0016 invariants 2-3)."
 
@@ -90,6 +93,14 @@ if [[ "${GATEWAY_DATABASE__URL:-}" == postgresql* ]]; then
 
   step "Gate: runtime role must be NOSUPERUSER + NOBYPASSRLS (ADR-0014)"
   uv run python ../scripts/check_runtime_role.py || fail "Bypass-containment gate failed (ADR-0014)."
+
+  # Phase 5 M4 (ADR-0021). Gate 2 means "every real backing service", so a run with Postgres but
+  # without Redis is not a lesser pass - it is a run in which the shared-state tests could not
+  # execute. Requiring the URL here keeps the 0-skipped rule honest instead of letting the
+  # distributed claim go unverified behind a skip.
+  if [[ -z "${GATEWAY_TEST_REDIS_URL:-}${GATEWAY_REDIS__URL:-}" ]]; then
+    fail "Gate 2 requires Redis (ADR-0021). Set GATEWAY_TEST_REDIS_URL or GATEWAY_REDIS__URL - see docker-compose.dev.yml."
+  fi
 else
   step "No Postgres configured; repo layer validated against SQLite in tests"
 fi

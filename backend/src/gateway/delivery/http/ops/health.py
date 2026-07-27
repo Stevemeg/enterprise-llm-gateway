@@ -12,6 +12,20 @@ from dataclasses import dataclass
 from gateway.application.ports.health import CheckFn, HealthState
 from gateway.shared.clock import Clock
 
+#: Worst-wins ordering for aggregating component states (Phase 5 M4). One DOWN dependency makes
+#: the process DOWN; a DEGRADED one makes it DEGRADED, which is still *ready* - see
+#: ``HealthReport.is_ready``. Written as an explicit rank rather than relying on enum order, which
+#: is declaration order and would silently change if a member were inserted.
+_SEVERITY: dict[HealthState, int] = {
+    HealthState.OK: 0,
+    HealthState.DEGRADED: 1,
+    HealthState.DOWN: 2,
+}
+
+
+def _worst(current: HealthState, candidate: HealthState) -> HealthState:
+    return candidate if _SEVERITY[candidate] > _SEVERITY[current] else current
+
 
 @dataclass(frozen=True, slots=True)
 class ComponentHealth:
@@ -55,10 +69,8 @@ class HealthRegistry:
                 components.append(ComponentHealth(name, HealthState.DOWN, f"check raised: {exc!s}"))
                 overall = HealthState.DOWN
                 continue
-            state = HealthState.OK if result.healthy else HealthState.DOWN
-            if state is HealthState.DOWN:
-                overall = HealthState.DOWN
-            components.append(ComponentHealth(name, state, result.detail))
+            overall = _worst(overall, result.state)
+            components.append(ComponentHealth(name, result.state, result.detail))
         return HealthReport(
             status=overall,
             version=self._version,

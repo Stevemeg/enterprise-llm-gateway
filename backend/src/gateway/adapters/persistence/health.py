@@ -23,5 +23,7 @@ class DatabaseHealthCheck:
             async with self._engine.connect() as connection:
                 await connection.execute(text("SELECT 1"))
         except Exception as exc:  # report, never crash health reporting
-            return CheckResult(healthy=False, detail=f"database unreachable: {exc!s}")
-        return CheckResult(healthy=True, detail="ok")
+            # DOWN, not degraded: PostgreSQL is the system of record and every write path needs
+            # it (ADR-0009 row 15). There is no reduced service to fall back to.
+            return CheckResult.down(f"database unreachable: {exc!s}")
+        return CheckResult.ok()
