@@ -36,6 +36,9 @@ uv run python ../scripts/check_powershell_encoding.py ../scripts || fail "PowerS
 step "validation parity guard (validate.sh and validate.ps1 must match)"
 uv run python ../scripts/check_validation_parity.py ../scripts || fail "Validation scripts have drifted."
 
+step "Source-tracked guard (no production source silently excluded by .gitignore)"
+uv run python ../scripts/check_source_tracked.py .. || fail "Production source is missing from the repository."
+
 step "RoutingDecision construction guard (only AgentRuntime may build one)"
 uv run python ../scripts/check_routing_decision_construction.py src/gateway || fail "RoutingDecision construction guard failed (ADR-0016 invariant 3)."
 

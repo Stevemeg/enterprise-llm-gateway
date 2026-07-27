@@ -32,6 +32,10 @@ Write-Host "==> validation parity guard (validate.sh and validate.ps1 must match
 uv run python ..\scripts\check_validation_parity.py ..\scripts
 if ($LASTEXITCODE -ne 0) { throw "Validation scripts have drifted." }
 
+Write-Host "==> Source-tracked guard (no production source silently excluded by .gitignore)"
+uv run python ..\scripts\check_source_tracked.py ..
+if ($LASTEXITCODE -ne 0) { throw "Production source is missing from the repository." }
+
 Write-Host "==> RoutingDecision construction guard (only AgentRuntime may build one)"
 uv run python ..\scripts\check_routing_decision_construction.py src\gateway
 if ($LASTEXITCODE -ne 0) { throw "RoutingDecision construction guard failed (ADR-0016 invariant 3)." }
