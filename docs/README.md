@@ -4,7 +4,7 @@ Single source of truth for the **Enterprise LLM Gateway & Cost Router**. All doc
 under `/docs`; architecture diagrams under `/docs/architecture`; ADRs under `/docs/adr`; API specs
 under `/docs/api`.
 
-## Phase 1 — Discovery & Requirements (current)
+## Phase 1 — Discovery & Requirements
 
 | Document | Purpose |
 |----------|---------|
@@ -23,7 +23,7 @@ under `/docs/api`.
 | [Glossary.md](Glossary.md) | Shared terminology. |
 | [Traceability_Matrix.md](Traceability_Matrix.md) | Persona → Story → FR/NFR → Acceptance mapping. |
 
-## Phase 2 — Architecture (current)
+## Phase 2 — Architecture
 
 | Document | Purpose |
 |----------|---------|
@@ -39,7 +39,7 @@ under `/docs/api`.
 | [architecture/data-flow/](architecture/data-flow/) | Data-flow diagrams + data classification. |
 | [architecture/security/](architecture/security/) | Trust boundaries + STRIDE threat model. |
 
-## Phase 3 — Database Architecture (current)
+## Phase 3 — Database Architecture
 
 | Document | Purpose |
 |----------|---------|
@@ -57,7 +57,7 @@ under `/docs/api`.
 | [Database_Dependency_Map.md](Database_Dependency_Map.md) | Every table → ADRs/FR/NFR/subsystem/parents/children/APIs/modules/retention/RLS/audit. |
 | [Query_Performance_Guide.md](Query_Performance_Guide.md) | Query patterns, hot/cold, R/W ratios, pagination, vector/join strategy, transactions, locking, pooling. |
 
-## Phase 4 — API Contracts & Developer Platform (current)
+## Phase 4 — API Contracts & Developer Platform
 
 | Document | Purpose |
 |----------|---------|
@@ -79,7 +79,7 @@ under `/docs/api`.
 | [API_Testing_Strategy.md](API_Testing_Strategy.md) | Contract/conformance/security/load test plan. |
 | [API_Implementation_Map.md](API_Implementation_Map.md) | Endpoints → ADR/FR/NFR/tables/modules/tests/obs. |
 
-## Phase 5 pre-work — Backend governance (current)
+## Phase 5 — Backend governance & implementation
 
 | Document | Purpose |
 |----------|---------|
@@ -89,11 +89,21 @@ under `/docs/api`.
 | [../backend/CONTRIBUTING.md](../backend/CONTRIBUTING.md) | Workflow, PR checklist, gates. |
 | [../backend/STYLE_GUIDE.md](../backend/STYLE_GUIDE.md) | Coding standards. |
 
-## Later phases (not yet produced)
+## Implementation status
 
-| Phase | Location | Status |
-|-------|----------|--------|
-| 5–15 · Implementation → Hardening | app code + tests + infra | Not started |
+The backend is implemented and validated; see the root [README](../README.md) for the
+capability summary and the honest list of current limitations.
+
+| Area | Location | Status |
+|------|----------|--------|
+| Serving runtime, routing, budgets, caching, streaming, ingress protection | [`backend/src/gateway`](../backend/src/gateway) | Implemented |
+| Unit · integration (real PostgreSQL/Redis) · security tests | [`backend/tests`](../backend/tests) | 986 passing, 0 skipped, 98% coverage |
+| Schema & migrations | [`backend/migrations`](../backend/migrations) | Alembic head `0007_rbac_seed_audit_chain` |
+| Architecture decisions | [`adr/`](adr/) | 22 ADRs |
+| Frontend, Kubernetes/Terraform, CI, distributed tracing | — | Not built |
+
+> [`api/OpenAPI.yaml`](api/OpenAPI.yaml) is an **aspirational** Phase-4 contract covering a much
+> broader control plane than is implemented. The live API is documented in the root README.
 
 ## Conventions
 
@@ -101,4 +111,5 @@ under `/docs/api`.
   deprecate instead.
 - **Priority**: MoSCoW (Must/Should/Could).
 - **Changes** to approved requirements are recorded via ADRs under [`adr/`](adr/).
-- **No application code** is added until the relevant phase is approved.
+- **Evidence over assertion**: architectural claims are backed by import-linter contracts,
+  AST guards and tests rather than by prose.
