@@ -348,7 +348,7 @@ them is a composition-root decision nothing downstream observes.
 Requires [uv](https://docs.astral.sh/uv/) and Docker.
 
 ```bash
-git clone <repo-url> && cd "Enterprise LLM Gateway & Cost Router"
+git clone https://github.com/Stevemeg/enterprise-llm-gateway.git && cd enterprise-llm-gateway
 cp backend/.env.example backend/.env          # application settings only
 docker compose -f docker-compose.dev.yml up -d   # PostgreSQL (pgvector) + Redis
 
