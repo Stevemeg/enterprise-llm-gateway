@@ -7,6 +7,7 @@ enforcement, tenant isolation, resilience and observability, built on a
 ports-and-adapters architecture whose boundaries are enforced by the build rather
 than by convention.
 
+[![CI](https://github.com/Stevemeg/enterprise-llm-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Stevemeg/enterprise-llm-gateway/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.13-3776AB)](backend/pyproject.toml)
 [![FastAPI](https://img.shields.io/badge/API-FastAPI-009688)](backend/src/gateway/delivery/http/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-RLS%20enforced-336791)](backend/migrations/)
