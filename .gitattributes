@@ -1,0 +1,17 @@
+# Line-ending policy.
+#
+# Without this file, each checkout's line endings depend on the contributor's local
+# core.autocrlf setting. That is not a cosmetic difference here: PowerShell 5.1 requires
+# CRLF, and scripts/check_powershell_encoding.py enforces it, so a Linux checkout (LF)
+# failed a guard that a Windows checkout (CRLF) passed on the very same commit.
+#
+# Git always stores text blobs with LF. These rules pin the *working tree* form instead,
+# identically on every platform.
+
+* text=auto
+
+# PowerShell 5.1 needs CRLF (see scripts/check_powershell_encoding.py).
+*.ps1 text eol=crlf
+
+# POSIX shell must never gain CR, or bash fails with "\r: command not found".
+*.sh text eol=lf
