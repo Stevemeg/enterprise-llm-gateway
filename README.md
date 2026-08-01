@@ -293,7 +293,7 @@ synchronous interface — evaluated and deliberately deferred rather than bolted
 16 Prometheus series with runtime-bounded label vocabularies, structured logs correlated by request
 id, and a hash-chained audit trail. Metric labels are constrained by an AST guard: a label that
 could carry a tenant id fails the build, because a metric keyed on tenant is both a cardinality
-explosion and a data leak. Recording is failure-isolated — a broken metric can never change a
+explosion and a data leak. Recording is failure-isolated — a broken metric can never change
 request's outcome.
 
 ## Project structure
